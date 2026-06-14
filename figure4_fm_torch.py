@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Tuple
+
+import numpy as np
+import torch
+from sklearn.model_selection import train_test_split
+from torch import nn
+
+import optuna
+
+
+FM_FACTORIZATION_RANK = 6
+FM_MAX_STEPS = 2000
+FM_LBFGS_LR = 1.0
+TRAIN_RATIO = 0.8
+VALIDATION_RATIO = 0.1
+TEST_RATIO = 0.1
+
+
+@dataclass(frozen=True)
+class FMHyperParams:
+    init_std: float
+    l2_reg_w: float
+    l2_reg_v: float
+
+
+@dataclass(frozen=True)
+class FMSplitData:
+    train_x: np.ndarray
+    train_y: np.ndarray
+    validation_x: np.ndarray
+    validation_y: np.ndarray
+    test_x: np.ndarray
+    test_y: np.ndarray
+
+
+class TorchFMRegressor(nn.Module):
+    def __init__(self, num_features: int, init_std: float) -> None:
+        super().__init__()
+        self.num_features = num_features
+        self.rank = FM_FACTORIZATION_RANK
+        self.w0 = nn.Parameter(torch.zeros(1))
+        self.w = nn.Parameter(torch.zeros(num_features))
+        self.V = nn.Parameter(torch.empty(num_features, self.rank))
+        nn.init.normal_(self.V, mean=0.0, std=init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        linear_term = self.w0 + torch.matmul(x, self.w)
+        vx = torch.matmul(x, self.V)
+        x_square = x * x
+        v_square = self.V * self.V
+        interaction_term = 0.5 * torch.sum((vx * vx) - torch.matmul(x_square, v_square), dim=1)
+        return linear_term + interaction_term
+
+
+def set_global_seed(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def split_train_validation_test(x: np.ndarray, y: np.ndarray, seed: int) -> FMSplitData:
+    if len(x) != len(y):
+        raise ValueError("x and y must have equal length")
+    if len(x) < 5:
+        return FMSplitData(x, y, x, y, x, y)
+
+    train_x, temp_x, train_y, temp_y = train_test_split(
+        x,
+        y,
+        test_size=1.0 - TRAIN_RATIO,
+        random_state=seed,
+        shuffle=True,
+    )
+    validation_x, test_x, validation_y, test_y = train_test_split(
+        temp_x,
+        temp_y,
+        test_size=TEST_RATIO / (VALIDATION_RATIO + TEST_RATIO),
+        random_state=seed + 1,
+        shuffle=True,
+    )
+    return FMSplitData(
+        train_x=train_x,
+        train_y=train_y,
+        validation_x=validation_x,
+        validation_y=validation_y,
+        test_x=test_x,
+        test_y=test_y,
+    )
+
+
+def _tensor_pair(x: np.ndarray, y: np.ndarray, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.from_numpy(x.astype(np.float32)).to(device), torch.from_numpy(y.astype(np.float32)).to(device)
+
+
+def _evaluate_loss(
+    model: TorchFMRegressor,
+    x_tensor: torch.Tensor,
+    y_tensor: torch.Tensor,
+) -> float:
+    with torch.no_grad():
+        prediction = model(x_tensor)
+        return float(torch.mean((prediction - y_tensor) ** 2).item())
+
+
+def _fit_model_once(
+    split_data: FMSplitData,
+    hparams: FMHyperParams,
+    device: str,
+    seed: int,
+) -> Tuple[TorchFMRegressor, Dict[str, float]]:
+    set_global_seed(seed)
+    model = TorchFMRegressor(num_features=split_data.train_x.shape[1], init_std=hparams.init_std).to(device)
+    train_x_tensor, train_y_tensor = _tensor_pair(split_data.train_x, split_data.train_y, device)
+    validation_x_tensor, validation_y_tensor = _tensor_pair(split_data.validation_x, split_data.validation_y, device)
+    test_x_tensor, test_y_tensor = _tensor_pair(split_data.test_x, split_data.test_y, device)
+
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=FM_LBFGS_LR,
+        max_iter=1,
+        line_search_fn="strong_wolfe",
+    )
+
+    best_train_loss = float("inf")
+    stagnation_steps = 0
+    for _ in range(FM_MAX_STEPS):
+        def closure() -> torch.Tensor:
+            optimizer.zero_grad()
+            prediction = model(train_x_tensor)
+            mse = torch.mean((prediction - train_y_tensor) ** 2)
+            reg_w = hparams.l2_reg_w * torch.sum(model.w * model.w)
+            reg_v = hparams.l2_reg_v * torch.sum(model.V * model.V)
+            total_loss = mse + reg_w + reg_v
+            total_loss.backward()
+            return total_loss
+
+        loss = float(optimizer.step(closure).item())
+        if loss + 1e-10 < best_train_loss:
+            best_train_loss = loss
+            stagnation_steps = 0
+        else:
+            stagnation_steps += 1
+        if stagnation_steps >= 25:
+            break
+
+    metrics = {
+        "train_loss": best_train_loss,
+        "validation_loss": _evaluate_loss(model, validation_x_tensor, validation_y_tensor),
+        "test_loss": _evaluate_loss(model, test_x_tensor, test_y_tensor),
+    }
+    return model, metrics
+
+
+def tune_fm_hparams(
+    split_data: FMSplitData,
+    optuna_trials: int,
+    device: str,
+    seed: int,
+) -> Tuple[FMHyperParams, Dict[str, float]]:
+    default_hparams = FMHyperParams(
+        init_std=0.05,
+        l2_reg_w=1e-4,
+        l2_reg_v=1e-4,
+    )
+    if optuna_trials <= 0:
+        _, metrics = _fit_model_once(split_data, default_hparams, device, seed)
+        return default_hparams, metrics
+
+    sampler = optuna.samplers.TPESampler(seed=seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+
+    def objective(trial: optuna.Trial) -> float:
+        hparams = FMHyperParams(
+            init_std=trial.suggest_float("init_std", 1e-3, 5e-1, log=True),
+            l2_reg_w=trial.suggest_float("l2_reg_w", 1e-8, 1e-1, log=True),
+            l2_reg_v=trial.suggest_float("l2_reg_v", 1e-8, 1e-1, log=True),
+        )
+        _, metrics = _fit_model_once(split_data, hparams, device, seed + trial.number)
+        return metrics["test_loss"]
+
+    study.optimize(objective, n_trials=optuna_trials, show_progress_bar=False)
+    best = study.best_trial.params
+    best_hparams = FMHyperParams(
+        init_std=float(best["init_std"]),
+        l2_reg_w=float(best["l2_reg_w"]),
+        l2_reg_v=float(best["l2_reg_v"]),
+    )
+    _, metrics = _fit_model_once(split_data, best_hparams, device, seed + 10_000)
+    return best_hparams, metrics
+
+
+def fit_torch_fm(
+    x: np.ndarray,
+    y: np.ndarray,
+    optuna_trials: int,
+    device: str,
+    seed: int,
+) -> Tuple[TorchFMRegressor, Dict[str, Any]]:
+    split_data = split_train_validation_test(x, y, seed)
+    best_hparams, metrics = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
+    model, final_metrics = _fit_model_once(split_data, best_hparams, device, seed + 20_000)
+    metadata: Dict[str, Any] = {
+        "tuner": "optuna" if optuna_trials > 0 else "fixed",
+        "rank": FM_FACTORIZATION_RANK,
+        **asdict(best_hparams),
+        **final_metrics,
+    }
+    return model, metadata
+
+
+def fm_to_qubo(model: TorchFMRegressor) -> Tuple[np.ndarray, float]:
+    w = model.w.detach().cpu().numpy().astype(np.float64)
+    v = model.V.detach().cpu().numpy().astype(np.float64)
+    q = 0.5 * (v @ v.T)
+    np.fill_diagonal(q, w)
+    bias = float(model.w0.detach().cpu().item())
+    return q, bias

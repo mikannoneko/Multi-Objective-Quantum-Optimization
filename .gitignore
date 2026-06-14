@@ -1,0 +1,40 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+env_*/
+
+# Codex/local workspace metadata
+.codex/
+
+# Temporary outputs
+.tmp_test/
+
+# Figure 4 experiment outputs and checkpoints
+figure4_*output*/
+figure4_*full*/
+figure4_*quick*/
+figure4_compare*/
+figure4_cgfm*/
+figure4_quick_l50/
+
+# Runtime logs and generated plots
+*.log
+*.pid
+*.tmp
+*.png
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
