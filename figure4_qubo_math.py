@@ -27,6 +27,24 @@ class IterationEncoding:
         return len(self.positive_count_by_bit)
 
 
+@dataclass(frozen=True)
+class QuboStats:
+    fm_scale: float
+    system_scale: float
+    one_hot_scale: float
+    system_penalty_weight: float
+    one_hot_penalty_weight: float
+    num_variables: int
+    max_abs: float
+
+
+@dataclass(frozen=True)
+class QuboBuildResult:
+    q: np.ndarray
+    bias: float
+    stats: QuboStats
+
+
 def get_positive_level_values(num_levels: int) -> np.ndarray:
     if num_levels <= 1:
         raise ValueError("num_levels must be greater than 1")
@@ -284,7 +302,7 @@ def build_single_objective_qubo(
     fm_bias: float,
     encoding: IterationEncoding,
     include_system_penalty: bool = True,
-) -> Tuple[np.ndarray, float, Dict[str, float]]:
+) -> QuboBuildResult:
     one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
 
     normalized_fm_q, normalized_fm_bias, fm_scale = normalize_qubo_term(fm_q, fm_bias)
@@ -301,16 +319,16 @@ def build_single_objective_qubo(
         total_bias = total_bias + (SYSTEM_PENALTY_WEIGHT * normalized_system_bias)
         system_penalty_weight = SYSTEM_PENALTY_WEIGHT
 
-    stats = {
-        "fm_scale": fm_scale,
-        "system_scale": system_scale,
-        "one_hot_scale": one_hot_scale,
-        "system_penalty_weight": system_penalty_weight,
-        "one_hot_penalty_weight": ONE_HOT_PENALTY_WEIGHT,
-        "num_variables": float(total_q.shape[0]),
-        "max_abs": float(np.max(np.abs(total_q))),
-    }
-    return total_q, total_bias, stats
+    stats = QuboStats(
+        fm_scale=float(fm_scale),
+        system_scale=float(system_scale),
+        one_hot_scale=float(one_hot_scale),
+        system_penalty_weight=float(system_penalty_weight),
+        one_hot_penalty_weight=float(ONE_HOT_PENALTY_WEIGHT),
+        num_variables=int(total_q.shape[0]),
+        max_abs=float(np.max(np.abs(total_q))),
+    )
+    return QuboBuildResult(q=total_q, bias=float(total_bias), stats=stats)
 
 
 def decode_candidate_bits_to_values(

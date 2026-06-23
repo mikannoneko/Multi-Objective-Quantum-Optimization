@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
-import math
+import logging
 import random
-import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Sequence, Tuple
@@ -12,93 +11,120 @@ from typing import Any, Dict, List, Literal, Sequence, Tuple
 import numpy as np
 
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_batch, sample_single_objective_design
-from figure4_fm_torch import FMHyperParams, TorchFMRegressor, fit_torch_fm, fm_to_qubo
+from figure4_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
+from figure4_fm_torch import fit_torch_fm, fm_to_qubo
+from figure4_outputs import checkpoint_payload, figure4_output_layout, load_checkpoint, write_checkpoint
 from figure4_qubo_math import (
     IterationEncoding,
-    build_one_hot_penalty_matrix,
+    QuboBuildResult,
+    QuboStats,
     build_single_objective_qubo,
-    build_system_penalty_matrix,
-    cgfm_angles_to_composition,
-    cgfm_composition_to_angles,
-    create_cgfm_iteration_encoding,
-    create_iteration_encoding,
-    decode_candidate_bits_to_cgfm_composition,
-    decode_candidate_bits_to_composition,
-    encode_cgfm_rows,
-    encode_single_objective_rows,
-    evaluate_qubo_energy,
     prepare_discrete_composition,
     simulated_annealing_qubo,
     validate_candidate_composition,
 )
+from figure4_settings import (
+    Figure4Setting,
+    SettingStrategy,
+    get_setting_strategy,
+    validate_settings,
+)
 
 
-REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "matplotlib", "neal", "dimod")
-Figure4Setting = Literal["wo_cgfm", "w_cgfm"]
-SUPPORTED_SETTINGS: Tuple[Figure4Setting, ...] = ("wo_cgfm", "w_cgfm")
+TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
+SUMMARY_SCHEMA_VERSION = 2
+TRAINING_BACKEND = "pytorch_fm_lbfgs"
+MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
+CandidateStatus = Literal["accepted", "invalid_replacement", "duplicate_replacement"]
+LOGGER = logging.getLogger(__name__)
 
 
-def ensure_runtime_dependencies() -> None:
-    missing = [name for name in REQUIRED_MODULES if importlib.util.find_spec(name) is None]
+def ensure_training_dependencies() -> None:
+    missing = [name for name in TRAINING_REQUIRED_MODULES if importlib.util.find_spec(name) is None]
     if missing:
         raise ImportError(f"Missing required dependencies: {', '.join(missing)}")
 
 
-@dataclass(frozen=True)
-class ObjectiveSpec:
-    name: str
-    maximize: bool
-
-    def transform_for_training(self, values: np.ndarray) -> np.ndarray:
-        return -values if self.maximize else values
-
-    def initial_best(self) -> float:
-        return -math.inf if self.maximize else math.inf
-
-    def update_best(self, current_best: float, candidate: float) -> float:
-        if self.maximize:
-            return max(current_best, candidate)
-        return min(current_best, candidate)
-
-
-OBJECTIVES: Tuple[ObjectiveSpec, ...] = (
-    ObjectiveSpec("kappa", maximize=True),
-    ObjectiveSpec("E", maximize=True),
-    ObjectiveSpec("rho", maximize=False),
-    ObjectiveSpec("delta_alpha", maximize=False),
-    ObjectiveSpec("delta_T", maximize=False),
-)
-
-
-@dataclass(frozen=True)
-class Figure4Config:
-    num_samples: int = 100
-    iterations: int = 600
-    num_levels: int = 50
-    optuna_trials: int = 20
-    sa_runs: int = 1000
-    sa_sweeps: int = 3000
-    device: str = "cpu"
-
-
 @dataclass
+class TrajectoryState:
+    rows: List[Dict[str, Any]]
+    best_so_far: List[float] = field(default_factory=list)
+    fm_metadata: Dict[str, Any] = field(default_factory=dict)
+    qubo_stats: QuboStats | None = None
+    duplicate_replacements: int = 0
+    invalid_replacements: int = 0
+    random_replacements: int = 0
+    random_replacement_draws: int = 0
+    accepted_sa_candidates: int = 0
+
+    @property
+    def completed_iterations(self) -> int:
+        return len(self.best_so_far)
+
+
+@dataclass(frozen=True)
 class TrajectoryResult:
     objective: str
     setting: str
     seed: int
-    history_best: List[float]
+    best_so_far: List[float]
     final_dataset_size: int
     training_backend: str
-    fm_hparams: Dict[str, Any]
-    qubo_stats: Dict[str, Any] = field(default_factory=dict)
+    fm_metadata: Dict[str, Any]
+    qubo_stats: QuboStats | None = None
     duplicate_replacements: int = 0
     invalid_replacements: int = 0
-    accepted_candidates: int = 0
+    random_replacements: int = 0
+    accepted_sa_candidates: int = 0
     completed_iterations: int = 0
 
 
+@dataclass(frozen=True)
+class CandidateDecision:
+    status: CandidateStatus
+    row: Dict[str, Any]
+    replacement_draws: int = 0
+
+
+@dataclass(frozen=True)
+class TrainingIterationResult:
+    encoding: IterationEncoding
+    candidate_bits: np.ndarray
+    fm_metadata: Dict[str, Any]
+    qubo_stats: QuboStats
+
+
+@dataclass(frozen=True)
+class AggregatedTrajectory:
+    objective: str
+    setting: str
+    best_so_far_mean: List[float]
+    best_so_far_std: List[float]
+    best_so_far_min: List[float]
+    best_so_far_max: List[float]
+    num_trajectories: int
+
+
+@dataclass(frozen=True)
+class Figure4Summary:
+    schema_version: int
+    training_backend: str
+    config: Dict[str, Any]
+    seed_list: List[int]
+    objectives: List[str]
+    available_settings: List[str]
+    trajectories: List[TrajectoryResult]
+    aggregated: Dict[str, AggregatedTrajectory]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def normalized_composition_from_row(row: Dict[str, Any]) -> np.ndarray:
-    return np.array([float(row["f1_norm"]), float(row["f2_norm"]), float(row["f3_norm"]), float(row["f4_norm"])], dtype=np.float64)
+    return np.array(
+        [float(row["f1_norm"]), float(row["f2_norm"]), float(row["f3_norm"]), float(row["f4_norm"])],
+        dtype=np.float64,
+    )
 
 
 def zscore(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
@@ -109,13 +135,13 @@ def zscore(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
     return ((values - mean) / std).astype(np.float32), mean, std
 
 
-def prepare_paper_row(row: Dict[str, Any], num_levels: int) -> Dict[str, Any]:
+def discretize_row_for_figure4(row: Dict[str, Any], num_levels: int) -> Dict[str, Any]:
     discrete_composition = prepare_discrete_composition(normalized_composition_from_row(row), num_levels)
     return build_dataset_row(int(row["sample_id"]), int(row["seed"]), discrete_composition)
 
 
-def prepare_paper_rows(rows: Sequence[Dict[str, Any]], num_levels: int) -> List[Dict[str, Any]]:
-    return [prepare_paper_row(row, num_levels) for row in rows]
+def discretize_rows_for_figure4(rows: Sequence[Dict[str, Any]], num_levels: int) -> List[Dict[str, Any]]:
+    return [discretize_row_for_figure4(row, num_levels) for row in rows]
 
 
 def random_replacement_row(sample_id: int, seed: int, rng: random.Random, num_levels: int) -> Dict[str, Any]:
@@ -128,372 +154,395 @@ def _composition_key(composition: Sequence[float]) -> Tuple[float, float, float,
     return tuple(round(float(value), 10) for value in composition)
 
 
-def _json_ready_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [{key: value for key, value in row.items()} for row in rows]
+def _row_composition_key(row: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    return _composition_key(normalized_composition_from_row(row))
 
 
-def _checkpoint_payload(
-    *,
-    rows: Sequence[Dict[str, Any]],
-    result: TrajectoryResult,
-    config: Figure4Config,
-) -> Dict[str, Any]:
-    payload = asdict(result)
-    payload.update(
-        {
-            "schema_version": 1,
-            "config": asdict(config),
-            "rows": _json_ready_rows(rows),
-        }
-    )
-    return payload
-
-
-def _write_trajectory_checkpoint(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f"{path.name}.tmp")
-    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary_path.replace(path)
-
-
-def _load_trajectory_checkpoint(
-    path: Path,
-    objective: ObjectiveSpec,
-    seed: int,
-    config: Figure4Config,
-    setting: Figure4Setting,
-) -> Dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
-        raise ValueError(f"Unsupported checkpoint schema in {path}")
-    if payload.get("objective") != objective.name or int(payload.get("seed")) != int(seed):
-        raise ValueError(f"Checkpoint metadata does not match requested trajectory: {path}")
-    if payload.get("setting") != setting:
-        raise ValueError(f"Checkpoint setting is not {setting}: {path}")
-    if payload.get("config") != asdict(config):
-        raise ValueError(
-            f"Checkpoint config does not match current config: {path}. "
-            "Use a separate output directory for different run settings."
-        )
-    return payload
-
-
-def _result_from_checkpoint(payload: Dict[str, Any]) -> TrajectoryResult:
-    return TrajectoryResult(
-        objective=str(payload["objective"]),
-        setting=str(payload["setting"]),
-        seed=int(payload["seed"]),
-        history_best=[float(value) for value in payload.get("history_best", [])],
-        final_dataset_size=int(payload.get("final_dataset_size", len(payload.get("rows", [])))),
-        training_backend=str(payload.get("training_backend", "pytorch_fm_lbfgs")),
-        fm_hparams=dict(payload.get("fm_hparams", {})),
-        qubo_stats=dict(payload.get("qubo_stats", {})),
-        duplicate_replacements=int(payload.get("duplicate_replacements", 0)),
-        invalid_replacements=int(payload.get("invalid_replacements", 0)),
-        accepted_candidates=int(payload.get("accepted_candidates", 0)),
-        completed_iterations=int(payload.get("completed_iterations", len(payload.get("history_best", [])))),
+def _state_from_checkpoint(payload: Dict[str, Any]) -> TrajectoryState:
+    raw_state = dict(payload["state"])
+    raw_qubo_stats = raw_state.get("qubo_stats")
+    qubo_stats = QuboStats(**raw_qubo_stats) if raw_qubo_stats is not None else None
+    return TrajectoryState(
+        rows=[dict(row) for row in raw_state.get("rows", [])],
+        best_so_far=[float(value) for value in raw_state.get("best_so_far", [])],
+        fm_metadata=dict(raw_state.get("fm_metadata", {})),
+        qubo_stats=qubo_stats,
+        duplicate_replacements=int(raw_state.get("duplicate_replacements", 0)),
+        invalid_replacements=int(raw_state.get("invalid_replacements", 0)),
+        random_replacements=int(raw_state.get("random_replacements", 0)),
+        random_replacement_draws=int(raw_state.get("random_replacement_draws", 0)),
+        accepted_sa_candidates=int(raw_state.get("accepted_sa_candidates", 0)),
     )
 
 
-def _advance_replacement_rng(rng: random.Random, replacement_count: int) -> None:
-    for _ in range(max(0, replacement_count)):
+def _advance_replacement_rng(rng: random.Random, replacement_draws: int) -> None:
+    for _ in range(max(0, replacement_draws)):
         sample_single_objective_design(rng)
 
 
-def _validate_setting(setting: str) -> Figure4Setting:
-    if setting not in SUPPORTED_SETTINGS:
-        raise ValueError(f"Unsupported setting {setting!r}. Choices: {', '.join(SUPPORTED_SETTINGS)}")
-    return setting  # type: ignore[return-value]
+def _initial_state(initial_rows: Sequence[Dict[str, Any]], config: ExperimentConfig) -> TrajectoryState:
+    return TrajectoryState(rows=discretize_rows_for_figure4(initial_rows, config.num_levels))
 
 
-def _legacy_checkpoint_path(checkpoint_path: Path, setting: Figure4Setting) -> Path | None:
-    if setting != "wo_cgfm":
-        return None
-    prefix = "wo_cgfm_"
-    if not checkpoint_path.name.startswith(prefix):
-        return None
-    return checkpoint_path.with_name(checkpoint_path.name[len(prefix) :])
+def _current_best_value(state: TrajectoryState, objective: ObjectiveSpec) -> float:
+    if state.best_so_far:
+        return state.best_so_far[-1]
+    best_value = objective.initial_best()
+    for row in state.rows:
+        best_value = objective.update_best(best_value, float(row[objective.name]))
+    return best_value
 
 
-def migrate_legacy_checkpoint_if_needed(checkpoint_path: Path, setting: Figure4Setting, resume: bool) -> None:
-    if not resume or checkpoint_path.exists():
-        return
-    legacy_path = _legacy_checkpoint_path(checkpoint_path, setting)
-    if legacy_path is not None and legacy_path.exists():
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(legacy_path, checkpoint_path)
+def _generate_unique_replacement_row(
+    *,
+    sample_id: int,
+    seed: int,
+    rng: random.Random,
+    num_levels: int,
+    seen_compositions: set[Tuple[float, float, float, float]],
+    max_attempts: int = MAX_RANDOM_REPLACEMENT_ATTEMPTS,
+) -> tuple[Dict[str, Any], int]:
+    for attempt in range(1, max_attempts + 1):
+        row = random_replacement_row(sample_id, seed, rng, num_levels)
+        if _row_composition_key(row) not in seen_compositions:
+            return row, attempt
+    raise RuntimeError(f"Unable to generate a novel random replacement after {max_attempts} attempts")
 
 
-def _create_setting_encoding(setting: Figure4Setting, num_levels: int, seed: int) -> IterationEncoding:
-    if setting == "w_cgfm":
-        return create_cgfm_iteration_encoding(num_levels, seed)
-    return create_iteration_encoding(num_levels, seed)
-
-
-def _encode_rows_for_setting(
+def _fit_and_solve_iteration(
+    *,
     rows: Sequence[Dict[str, Any]],
-    encoding: IterationEncoding,
-    setting: Figure4Setting,
-) -> np.ndarray:
-    if setting == "w_cgfm":
-        return encode_cgfm_rows(rows, encoding)
-    return encode_single_objective_rows(rows, encoding)
+    objective: ObjectiveSpec,
+    strategy: SettingStrategy,
+    config: ExperimentConfig,
+    seed: int,
+    iteration: int,
+) -> TrainingIterationResult:
+    encoding = strategy.create_encoding(config.num_levels, seed + iteration)
+    features = strategy.encode_rows(rows, encoding)
+    raw_targets = np.array([float(row[objective.name]) for row in rows], dtype=np.float64)
+    transformed_targets = objective.transform_for_training(raw_targets)
+    scaled_targets, _, _ = zscore(transformed_targets)
+
+    model, fm_metadata = fit_torch_fm(
+        features,
+        scaled_targets,
+        optuna_trials=config.optuna_trials,
+        device=config.device,
+        seed=seed + iteration,
+    )
+    fm_q, fm_bias = fm_to_qubo(model)
+    qubo_result: QuboBuildResult = build_single_objective_qubo(
+        fm_q,
+        fm_bias,
+        encoding,
+        include_system_penalty=strategy.include_system_penalty,
+    )
+    candidate_bits, _ = simulated_annealing_qubo(
+        qubo_result.q,
+        qubo_result.bias,
+        runs=config.sa_runs,
+        sweeps=config.sa_sweeps,
+        seed=seed + (iteration * 9973),
+    )
+    return TrainingIterationResult(
+        encoding=encoding,
+        candidate_bits=candidate_bits,
+        fm_metadata=dict(fm_metadata),
+        qubo_stats=qubo_result.stats,
+    )
 
 
-def _decode_candidate_for_setting(
+def _decide_candidate(
+    *,
     candidate_bits: np.ndarray,
     encoding: IterationEncoding,
+    strategy: SettingStrategy,
+    sample_id: int,
+    seed: int,
+    replacement_rng: random.Random,
+    num_levels: int,
+    seen_compositions: set[Tuple[float, float, float, float]],
+) -> CandidateDecision:
+    candidate_composition = strategy.decode_candidate(candidate_bits, encoding)
+    invalid_candidate = candidate_composition is None or not validate_candidate_composition(candidate_composition)
+    if invalid_candidate:
+        row, draws = _generate_unique_replacement_row(
+            sample_id=sample_id,
+            seed=seed,
+            rng=replacement_rng,
+            num_levels=num_levels,
+            seen_compositions=seen_compositions,
+        )
+        return CandidateDecision(status="invalid_replacement", row=row, replacement_draws=draws)
+
+    if _composition_key(candidate_composition) in seen_compositions:
+        row, draws = _generate_unique_replacement_row(
+            sample_id=sample_id,
+            seed=seed,
+            rng=replacement_rng,
+            num_levels=num_levels,
+            seen_compositions=seen_compositions,
+        )
+        return CandidateDecision(status="duplicate_replacement", row=row, replacement_draws=draws)
+
+    return CandidateDecision(status="accepted", row=build_dataset_row(sample_id, seed, candidate_composition))
+
+
+def _apply_candidate_decision(state: TrajectoryState, decision: CandidateDecision) -> None:
+    if decision.status == "accepted":
+        state.accepted_sa_candidates += 1
+    elif decision.status == "invalid_replacement":
+        state.invalid_replacements += 1
+        state.random_replacements += 1
+        state.random_replacement_draws += decision.replacement_draws
+    elif decision.status == "duplicate_replacement":
+        state.duplicate_replacements += 1
+        state.random_replacements += 1
+        state.random_replacement_draws += decision.replacement_draws
+    else:
+        raise ValueError(f"Unsupported candidate decision status: {decision.status}")
+    state.rows.append(decision.row)
+
+
+def _result_from_state(
+    *,
+    objective: ObjectiveSpec,
     setting: Figure4Setting,
-) -> np.ndarray | None:
-    if setting == "w_cgfm":
-        return decode_candidate_bits_to_cgfm_composition(candidate_bits, encoding)
-    return decode_candidate_bits_to_composition(candidate_bits, encoding)
+    seed: int,
+    state: TrajectoryState,
+) -> TrajectoryResult:
+    return TrajectoryResult(
+        objective=objective.name,
+        setting=setting,
+        seed=int(seed),
+        best_so_far=list(state.best_so_far),
+        final_dataset_size=len(state.rows),
+        training_backend=TRAINING_BACKEND,
+        fm_metadata=dict(state.fm_metadata),
+        qubo_stats=state.qubo_stats,
+        duplicate_replacements=state.duplicate_replacements,
+        invalid_replacements=state.invalid_replacements,
+        random_replacements=state.random_replacements,
+        accepted_sa_candidates=state.accepted_sa_candidates,
+        completed_iterations=state.completed_iterations,
+    )
 
 
 def run_single_trajectory(
     initial_rows: Sequence[Dict[str, Any]],
     objective: ObjectiveSpec,
-    objective_index: int,
     seed: int,
-    config: Figure4Config,
+    config: ExperimentConfig,
     setting: Figure4Setting = "wo_cgfm",
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
 ) -> TrajectoryResult:
-    setting = _validate_setting(setting)
-    del objective_index  # not used in the paper-aligned w/o CGFM path
+    selected_setting = get_setting_strategy(setting).name
+    strategy = get_setting_strategy(selected_setting)
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
-    checkpoint_payload: Dict[str, Any] | None = None
-    if resume and checkpoint is not None and checkpoint.exists():
-        checkpoint_payload = _load_trajectory_checkpoint(checkpoint, objective, seed, config, setting)
-        checkpoint_result = _result_from_checkpoint(checkpoint_payload)
-        if checkpoint_result.completed_iterations >= config.iterations:
-            return checkpoint_result
 
-    if checkpoint_payload is not None:
-        rows = [dict(row) for row in checkpoint_payload.get("rows", [])]
-        history_best = [float(value) for value in checkpoint_payload.get("history_best", [])]
-        duplicate_replacements = int(checkpoint_payload.get("duplicate_replacements", 0))
-        invalid_replacements = int(checkpoint_payload.get("invalid_replacements", 0))
-        accepted_candidates = int(checkpoint_payload.get("accepted_candidates", 0))
-        start_iteration = len(history_best)
-        best_value = history_best[-1] if history_best else objective.initial_best()
-        if not history_best:
-            for row in rows:
-                best_value = objective.update_best(best_value, float(row[objective.name]))
+    if resume and checkpoint is not None and checkpoint.exists():
+        LOGGER.info(
+            "Loading checkpoint setting=%s objective=%s seed=%s path=%s",
+            selected_setting,
+            objective.name,
+            seed,
+            checkpoint,
+        )
+        loaded_checkpoint = load_checkpoint(
+            checkpoint,
+            objective=objective,
+            seed=seed,
+            config=config,
+            setting=selected_setting,
+        )
+        state = _state_from_checkpoint(loaded_checkpoint)
+        if state.completed_iterations >= config.iterations:
+            LOGGER.info(
+                "Skipping completed trajectory setting=%s objective=%s seed=%s completed=%s",
+                selected_setting,
+                objective.name,
+                seed,
+                state.completed_iterations,
+            )
+            return _result_from_state(objective=objective, setting=selected_setting, seed=seed, state=state)
     else:
-        rows = prepare_paper_rows(initial_rows, config.num_levels)
-        history_best = []
-        duplicate_replacements = 0
-        invalid_replacements = 0
-        accepted_candidates = 0
-        start_iteration = 0
-        best_value = objective.initial_best()
-        for row in rows:
-            best_value = objective.update_best(best_value, float(row[objective.name]))
+        state = _initial_state(initial_rows, config)
 
     replacement_rng = random.Random(seed + 17)
-    _advance_replacement_rng(replacement_rng, duplicate_replacements + invalid_replacements)
+    _advance_replacement_rng(replacement_rng, state.random_replacement_draws)
 
-    seen_compositions = {_composition_key(normalized_composition_from_row(row)) for row in rows}
-    last_qubo_stats: Dict[str, Any] = dict(checkpoint_payload.get("qubo_stats", {})) if checkpoint_payload else {}
-    last_hparams: Dict[str, Any] = dict(checkpoint_payload.get("fm_hparams", {})) if checkpoint_payload else {}
-
-    for iteration in range(start_iteration, config.iterations):
-        encoding: IterationEncoding = _create_setting_encoding(setting, config.num_levels, seed + iteration)
-        features = _encode_rows_for_setting(rows, encoding, setting)
-        raw_targets = np.array([float(row[objective.name]) for row in rows], dtype=np.float64)
-        transformed_targets = objective.transform_for_training(raw_targets)
-        scaled_targets, _, _ = zscore(transformed_targets)
-
-        model, fit_metadata = fit_torch_fm(
-            features,
-            scaled_targets,
-            optuna_trials=config.optuna_trials,
-            device=config.device,
-            seed=seed + iteration,
-        )
-        fm_q, fm_bias = fm_to_qubo(model)
-        qubo_q, qubo_bias, qubo_stats = build_single_objective_qubo(
-            fm_q,
-            fm_bias,
-            encoding,
-            include_system_penalty=(setting == "wo_cgfm"),
-        )
-        last_qubo_stats = dict(qubo_stats)
-        last_hparams = dict(fit_metadata)
-
-        candidate_bits, _ = simulated_annealing_qubo(
-            qubo_q,
-            qubo_bias,
-            runs=config.sa_runs,
-            sweeps=config.sa_sweeps,
-            seed=seed + (iteration * 9973),
-        )
-        candidate_composition = _decode_candidate_for_setting(candidate_bits, encoding, setting)
-        invalid_candidate = candidate_composition is None or not validate_candidate_composition(candidate_composition)
-        duplicate_candidate = False
-        if not invalid_candidate:
-            duplicate_candidate = _composition_key(candidate_composition) in seen_compositions
-
-        if invalid_candidate or duplicate_candidate:
-            if invalid_candidate:
-                invalid_replacements += 1
-            else:
-                duplicate_replacements += 1
-            new_row = random_replacement_row(len(rows), seed, replacement_rng, config.num_levels)
-        else:
-            new_row = build_dataset_row(len(rows), seed, candidate_composition)
-            accepted_candidates += 1
-
-        rows.append(new_row)
-        seen_compositions.add(_composition_key(normalized_composition_from_row(new_row)))
-        best_value = objective.update_best(best_value, float(new_row[objective.name]))
-        history_best.append(best_value)
-
-        if checkpoint is not None:
-            partial_result = TrajectoryResult(
-                objective=objective.name,
-                setting=setting,
-                seed=seed,
-                history_best=history_best,
-                final_dataset_size=len(rows),
-                training_backend="pytorch_fm_lbfgs",
-                fm_hparams=last_hparams,
-                qubo_stats=last_qubo_stats,
-                duplicate_replacements=duplicate_replacements,
-                invalid_replacements=invalid_replacements,
-                accepted_candidates=accepted_candidates,
-                completed_iterations=len(history_best),
-            )
-            _write_trajectory_checkpoint(
-                checkpoint,
-                _checkpoint_payload(rows=rows, result=partial_result, config=config),
-            )
-
-    return TrajectoryResult(
-        objective=objective.name,
-        setting=setting,
-        seed=seed,
-        history_best=history_best,
-        final_dataset_size=len(rows),
-        training_backend="pytorch_fm_lbfgs",
-        fm_hparams=last_hparams,
-        qubo_stats=last_qubo_stats,
-        duplicate_replacements=duplicate_replacements,
-        invalid_replacements=invalid_replacements,
-        accepted_candidates=accepted_candidates,
-        completed_iterations=len(history_best),
+    seen_compositions = {_row_composition_key(row) for row in state.rows}
+    best_value = _current_best_value(state, objective)
+    LOGGER.info(
+        "Starting trajectory setting=%s objective=%s seed=%s start_iteration=%s target_iterations=%s rows=%s",
+        selected_setting,
+        objective.name,
+        seed,
+        state.completed_iterations,
+        config.iterations,
+        len(state.rows),
     )
 
+    for iteration in range(state.completed_iterations, config.iterations):
+        iteration_result = _fit_and_solve_iteration(
+            rows=state.rows,
+            objective=objective,
+            strategy=strategy,
+            config=config,
+            seed=int(seed),
+            iteration=iteration,
+        )
+        state.fm_metadata = iteration_result.fm_metadata
+        state.qubo_stats = iteration_result.qubo_stats
 
-def aggregate_trajectory_results(results: Sequence[TrajectoryResult]) -> Dict[str, Dict[str, Any]]:
+        decision = _decide_candidate(
+            candidate_bits=iteration_result.candidate_bits,
+            encoding=iteration_result.encoding,
+            strategy=strategy,
+            sample_id=len(state.rows),
+            seed=int(seed),
+            replacement_rng=replacement_rng,
+            num_levels=config.num_levels,
+            seen_compositions=seen_compositions,
+        )
+        _apply_candidate_decision(state, decision)
+        seen_compositions.add(_row_composition_key(decision.row))
+        best_value = objective.update_best(best_value, float(decision.row[objective.name]))
+        state.best_so_far.append(best_value)
+        LOGGER.info(
+            (
+                "Completed iteration setting=%s objective=%s seed=%s iteration=%s/%s "
+                "decision=%s best_so_far=%.12g rows=%s accepted_sa=%s invalid_repl=%s duplicate_repl=%s"
+            ),
+            selected_setting,
+            objective.name,
+            seed,
+            iteration + 1,
+            config.iterations,
+            decision.status,
+            best_value,
+            len(state.rows),
+            state.accepted_sa_candidates,
+            state.invalid_replacements,
+            state.duplicate_replacements,
+        )
+
+        if checkpoint is not None:
+            write_checkpoint(
+                checkpoint,
+                checkpoint_payload(
+                    objective=objective,
+                    setting=selected_setting,
+                    seed=int(seed),
+                    state=state,
+                    config=config,
+                ),
+            )
+
+    LOGGER.info(
+        "Finished trajectory setting=%s objective=%s seed=%s completed=%s final_rows=%s",
+        selected_setting,
+        objective.name,
+        seed,
+        state.completed_iterations,
+        len(state.rows),
+    )
+    return _result_from_state(objective=objective, setting=selected_setting, seed=seed, state=state)
+
+
+def aggregate_trajectory_results(results: Sequence[TrajectoryResult]) -> Dict[str, AggregatedTrajectory]:
     grouped: Dict[str, List[TrajectoryResult]] = {}
     for result in results:
         key = f"{result.objective}:{result.setting}"
         grouped.setdefault(key, []).append(result)
 
-    aggregated: Dict[str, Dict[str, Any]] = {}
+    aggregated: Dict[str, AggregatedTrajectory] = {}
     for key, trajectories in grouped.items():
-        max_len = max(len(result.history_best) for result in trajectories)
+        max_len = max(len(result.best_so_far) for result in trajectories)
         array = np.full((len(trajectories), max_len), np.nan, dtype=np.float64)
         for idx, result in enumerate(trajectories):
-            array[idx, : len(result.history_best)] = result.history_best
+            array[idx, : len(result.best_so_far)] = result.best_so_far
         objective_name, setting_name = key.split(":", 1)
-        aggregated[key] = {
-            "objective": objective_name,
-            "setting": setting_name,
-            "mean_curve": np.nanmean(array, axis=0).tolist(),
-            "std_curve": np.nanstd(array, axis=0).tolist(),
-            "min_curve": np.nanmin(array, axis=0).tolist(),
-            "max_curve": np.nanmax(array, axis=0).tolist(),
-            "num_trajectories": len(trajectories),
-        }
+        aggregated[key] = AggregatedTrajectory(
+            objective=objective_name,
+            setting=setting_name,
+            best_so_far_mean=np.nanmean(array, axis=0).tolist(),
+            best_so_far_std=np.nanstd(array, axis=0).tolist(),
+            best_so_far_min=np.nanmin(array, axis=0).tolist(),
+            best_so_far_max=np.nanmax(array, axis=0).tolist(),
+            num_trajectories=len(trajectories),
+        )
     return aggregated
 
 
 def run_figure4_experiment(
     seed_list: Sequence[int],
-    config: Figure4Config,
+    config: ExperimentConfig,
     output_dir: str | Path,
     objectives: Sequence[ObjectiveSpec] = OBJECTIVES,
     resume: bool = False,
     settings: Sequence[Figure4Setting] = ("wo_cgfm",),
-) -> Dict[str, Any]:
-    selected_settings = tuple(_validate_setting(setting) for setting in settings)
-    if not selected_settings:
-        raise ValueError("At least one setting is required.")
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    trajectory_path = output_path / "trajectories"
+) -> Figure4Summary:
+    selected_settings = validate_settings(settings)
+    if not seed_list:
+        raise ValueError("seed_list must not be empty")
+    if not objectives:
+        raise ValueError("At least one objective is required")
+
+    output_layout = figure4_output_layout(output_dir)
+    output_layout.root.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(
+        "Starting Figure 4 experiment output=%s seeds=%s objectives=%s settings=%s",
+        output_layout.root,
+        [int(seed) for seed in seed_list],
+        [objective.name for objective in objectives],
+        list(selected_settings),
+    )
     dataset_batch = generate_initial_dataset_batch(seed_list=seed_list, num_samples=config.num_samples)
 
     trajectory_results: List[TrajectoryResult] = []
     for seed in seed_list:
         initial_rows, _ = dataset_batch[int(seed)]
-        for objective_index, objective in enumerate(objectives):
+        for objective in objectives:
             for setting in selected_settings:
-                checkpoint_path = trajectory_path / f"{setting}_{objective.name}_seed_{int(seed)}.json"
-                migrate_legacy_checkpoint_if_needed(checkpoint_path, setting, resume)
+                trajectory_checkpoint_path = output_layout.checkpoint_path(setting, objective.name, int(seed))
                 trajectory_results.append(
                     run_single_trajectory(
                         initial_rows=initial_rows,
                         objective=objective,
-                        objective_index=objective_index,
                         seed=int(seed),
                         config=config,
                         setting=setting,
-                        checkpoint_path=checkpoint_path,
+                        checkpoint_path=trajectory_checkpoint_path,
                         resume=resume,
                     )
                 )
 
-    aggregated = aggregate_trajectory_results(trajectory_results)
-    summary = {
-        "training_backend": "pytorch_fm_lbfgs",
-        "config": asdict(config),
-        "seed_list": [int(seed) for seed in seed_list],
-        "objectives": [objective.name for objective in objectives],
-        "available_settings": list(selected_settings),
-        "trajectories": [asdict(result) for result in trajectory_results],
-        "aggregated": aggregated,
-    }
-    summary_path = output_path / "figure4_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary = Figure4Summary(
+        schema_version=SUMMARY_SCHEMA_VERSION,
+        training_backend=TRAINING_BACKEND,
+        config=config.to_dict(),
+        seed_list=[int(seed) for seed in seed_list],
+        objectives=[objective.name for objective in objectives],
+        available_settings=list(selected_settings),
+        trajectories=trajectory_results,
+        aggregated=aggregate_trajectory_results(trajectory_results),
+    )
+    output_layout.summary_path.write_text(json.dumps(summary.to_dict(), indent=2), encoding="utf-8")
+    LOGGER.info("Wrote Figure 4 summary path=%s", output_layout.summary_path)
     return summary
 
-
-def load_summary(path: str | Path) -> Dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
 __all__ = [
-    "Figure4Config",
-    "Figure4Setting",
-    "FMHyperParams",
-    "OBJECTIVES",
-    "ObjectiveSpec",
-    "TorchFMRegressor",
+    "AggregatedTrajectory",
+    "Figure4Summary",
     "TrajectoryResult",
+    "TrajectoryState",
     "aggregate_trajectory_results",
-    "build_one_hot_penalty_matrix",
-    "build_system_penalty_matrix",
-    "cgfm_angles_to_composition",
-    "cgfm_composition_to_angles",
-    "create_cgfm_iteration_encoding",
-    "create_iteration_encoding",
-    "decode_candidate_bits_to_cgfm_composition",
-    "decode_candidate_bits_to_composition",
-    "encode_cgfm_rows",
-    "encode_single_objective_rows",
-    "ensure_runtime_dependencies",
-    "evaluate_qubo_energy",
-    "fm_to_qubo",
-    "load_summary",
-    "prepare_discrete_composition",
+    "discretize_row_for_figure4",
+    "discretize_rows_for_figure4",
+    "ensure_training_dependencies",
     "run_figure4_experiment",
     "run_single_trajectory",
-    "simulated_annealing_qubo",
-    "SUPPORTED_SETTINGS",
-    "validate_candidate_composition",
 ]

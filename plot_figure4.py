@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
+from typing import Any
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from figure4_pipeline import OBJECTIVES, load_summary
+from figure4_config import OBJECTIVES
+from figure4_outputs import configure_file_logging_path, figure4_output_layout, load_summary
 
 
 SETTING_LABELS = {
@@ -21,11 +25,12 @@ SETTING_COLORS = {
 }
 LOG_OBJECTIVES = {"delta_alpha", "delta_T"}
 LOG_EPSILON = 1e-12
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot the Figure 4 reproduction summary.")
-    parser.add_argument("--summary", type=Path, required=True, help="Path to figure4_summary.json")
+    parser.add_argument("--summary", type=Path, nargs="+", required=True, help="One or more summary files")
     parser.add_argument("--output", type=Path, required=True, help="Path to output PNG")
     return parser.parse_args()
 
@@ -37,10 +42,35 @@ def plot_values(objective_name: str, values: list[float] | np.ndarray) -> np.nda
     return array
 
 
+def _required_curve(stats: dict[str, Any], key: str) -> np.ndarray:
+    if key not in stats:
+        raise KeyError(f"Summary aggregated entry is missing schema v2 field {key!r}")
+    return np.asarray(stats[key], dtype=np.float64)
+
+
+def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for path in summary_paths:
+        summary = load_summary(path)
+        if summary.get("schema_version") != 2:
+            raise ValueError(f"Unsupported Figure 4 summary schema in {path}: expected schema_version 2")
+        aggregated = summary.get("aggregated")
+        if not isinstance(aggregated, dict) or not aggregated:
+            raise ValueError(f"Figure 4 summary has no aggregated results: {path}")
+        for key, value in aggregated.items():
+            if key in merged:
+                raise ValueError(f"Duplicate aggregated key {key!r} while merging {path}")
+            merged[key] = dict(value)
+    return merged
+
+
 def main() -> None:
     args = parse_args()
-    summary = load_summary(args.summary)
-    aggregated = summary["aggregated"]
+    output_layout = figure4_output_layout(args.output.parent)
+    log_path = configure_file_logging_path(output_layout.plot_log_path)
+    LOGGER.info("Starting Figure 4 plot summaries=%s output=%s", [str(path) for path in args.summary], args.output)
+    aggregated = _merge_aggregated(args.summary)
+    skipped_keys: list[str] = []
 
     fig, axes = plt.subplots(2, 3, figsize=(14, 8))
     flat_axes = axes.flatten()
@@ -50,19 +80,20 @@ def main() -> None:
         for setting, color in SETTING_COLORS.items():
             key = f"{objective.name}:{setting}"
             if key not in aggregated:
+                skipped_keys.append(key)
                 continue
             stats = aggregated[key]
-            mean_curve = np.asarray(stats["mean_curve"], dtype=np.float64)
-            std_curve = np.asarray(stats.get("std_curve", np.zeros_like(mean_curve)), dtype=np.float64)
-            min_curve = np.asarray(stats.get("min_curve", mean_curve), dtype=np.float64)
-            max_curve = np.asarray(stats.get("max_curve", mean_curve), dtype=np.float64)
-            x_values = np.arange(1, len(mean_curve) + 1)
+            best_so_far_mean = _required_curve(stats, "best_so_far_mean")
+            best_so_far_std = _required_curve(stats, "best_so_far_std")
+            best_so_far_min = _required_curve(stats, "best_so_far_min")
+            best_so_far_max = _required_curve(stats, "best_so_far_max")
+            x_values = np.arange(1, len(best_so_far_mean) + 1)
 
             label = SETTING_LABELS.get(setting, setting)
             axis.fill_between(
                 x_values,
-                plot_values(objective.name, min_curve),
-                plot_values(objective.name, max_curve),
+                plot_values(objective.name, best_so_far_min),
+                plot_values(objective.name, best_so_far_max),
                 color=color,
                 alpha=0.14,
                 linewidth=0,
@@ -70,8 +101,8 @@ def main() -> None:
             )
             axis.fill_between(
                 x_values,
-                plot_values(objective.name, mean_curve - std_curve),
-                plot_values(objective.name, mean_curve + std_curve),
+                plot_values(objective.name, best_so_far_mean - best_so_far_std),
+                plot_values(objective.name, best_so_far_mean + best_so_far_std),
                 color=color,
                 alpha=0.24,
                 linewidth=0,
@@ -79,12 +110,12 @@ def main() -> None:
             )
             axis.plot(
                 x_values,
-                plot_values(objective.name, mean_curve),
+                plot_values(objective.name, best_so_far_mean),
                 label=label,
                 color=color,
                 linewidth=2,
                 marker="x" if setting == "w_cgfm" else None,
-                markevery=max(1, len(mean_curve) // 12),
+                markevery=max(1, len(best_so_far_mean) // 12),
                 markersize=4,
             )
         axis.set_title(objective.name)
@@ -93,7 +124,7 @@ def main() -> None:
         if objective.name in LOG_OBJECTIVES:
             axis.set_yscale("log")
         axis.grid(True, alpha=0.3)
-        handles, labels = axis.get_legend_handles_labels()
+        handles, _ = axis.get_legend_handles_labels()
         if handles:
             axis.legend()
 
@@ -101,6 +132,12 @@ def main() -> None:
     fig.tight_layout()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=200, bbox_inches="tight")
+    LOGGER.info("Wrote Figure 4 plot output=%s log=%s", args.output, log_path)
+
+    if skipped_keys:
+        message = "Skipped missing summary keys: " + ", ".join(skipped_keys)
+        LOGGER.info(message)
+        print(message)
 
 
 if __name__ == "__main__":
