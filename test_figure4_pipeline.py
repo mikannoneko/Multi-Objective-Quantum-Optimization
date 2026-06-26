@@ -182,9 +182,11 @@ class Figure4PipelineTests(unittest.TestCase):
             "## 输出规则",
             "## 命名与 schema 规则",
             "## 返回类型与调用规则",
-            "## Figure 5 工作流（预留）",
+            "## Figure 5 复现工作流",
         ):
             self.assertIn(heading, content)
+        for figure5_keyword in ("w_ddts", "wo_ddts", "weighted-sum", "Pareto front", "figure5_runner.py"):
+            self.assertIn(figure5_keyword, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
         self.assertFalse((repo_root / legacy_document_name).exists())
 

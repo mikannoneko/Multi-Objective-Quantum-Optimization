@@ -15,6 +15,7 @@ AL_MATRIX_VOLUME_FRACTION = 0.8
 SECONDARY_PHASE_TOTAL_VOLUME_FRACTION = 0.2
 ALPHA_TARGET = 20.0  # ppm/K, paper Sec. 3.1.2
 DEFAULT_NUM_SAMPLES = 100
+DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES = 500
 DEFAULT_TOLERANCE = 1e-12
 MAX_HILL_ITERATIONS = 10_000
 
@@ -86,6 +87,22 @@ def sample_single_objective_design(rng: random.Random) -> Tuple[float, float, fl
     cut_points = sorted(rng.uniform(0.0, 1.0) for _ in range(len(PHASE_ORDER) - 1))
     boundaries = [0.0, *cut_points, 1.0]
     fractions = [boundaries[i + 1] - boundaries[i] for i in range(len(PHASE_ORDER))]
+    rng.shuffle(fractions)
+    return tuple(fractions)  # type: ignore[return-value]
+
+
+def sample_multi_objective_design(rng: random.Random) -> Tuple[float, float, float, float]:
+    """
+    Supplementary S1.4 multi-objective setup: draw fractions step-wise
+    from the remaining simplex volume, then shuffle phase assignment.
+    """
+    remaining = 1.0
+    fractions = []
+    for _ in range(len(PHASE_ORDER) - 1):
+        fraction = rng.uniform(0.0, remaining)
+        fractions.append(fraction)
+        remaining -= fraction
+    fractions.append(remaining)
     rng.shuffle(fractions)
     return tuple(fractions)  # type: ignore[return-value]
 
@@ -266,6 +283,28 @@ def generate_initial_dataset_single_objective(
     return rows, stats
 
 
+def generate_initial_dataset_multi_objective(
+    num_samples: int = DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES,
+    seed: int | None = None,
+    output_path: str | Path | None = None,
+) -> Tuple[List[Dict[str, float | int]], Dict[str, object]]:
+    seed = _validate_seed(seed)
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+
+    rng = random.Random(seed)
+    rows = [
+        build_dataset_row(index, seed, sample_multi_objective_design(rng))
+        for index in range(num_samples)
+    ]
+    stats = compute_dataset_statistics(rows)
+
+    if output_path is not None:
+        write_dataset_csv(rows, output_path)
+
+    return rows, stats
+
+
 def generate_initial_dataset_batch(
     seed_list: Sequence[int],
     num_samples: int = DEFAULT_NUM_SAMPLES,
@@ -273,6 +312,16 @@ def generate_initial_dataset_batch(
     datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
     for seed in seed_list:
         datasets[int(seed)] = generate_initial_dataset_single_objective(num_samples=num_samples, seed=int(seed))
+    return datasets
+
+
+def generate_initial_dataset_multi_objective_batch(
+    seed_list: Sequence[int],
+    num_samples: int = DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES,
+) -> Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]]:
+    datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
+    for seed in seed_list:
+        datasets[int(seed)] = generate_initial_dataset_multi_objective(num_samples=num_samples, seed=int(seed))
     return datasets
 
 
