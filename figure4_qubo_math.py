@@ -1,3 +1,5 @@
+"""Figure 4 的离散编码、CGFM 映射、QUBO 约束和 SA 求解工具。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,6 +18,14 @@ CGFM_ANGLE_MAX = np.pi / 2.0
 
 @dataclass(frozen=True)
 class IterationEncoding:
+    """一次 active-learning 迭代使用的离散编码表。
+
+    每个 block 对应一个可选离散值；count=0 不占用 bit，count=1..num_levels
+    对应 block 内的一个 one-hot bit。`positive_count_by_bit` 会随 seed 打乱，
+    让同一 composition 在不同迭代中对应不同 bit 位置，符合论文中的随机编码思想。
+    CGFM 模式下 `value_scale=pi/2` 且只有三个 block，表示三个角度而不是四个相分数。
+    """
+
     num_levels: int
     positive_count_by_bit: Tuple[np.ndarray, ...]
     bit_index_by_count: Tuple[np.ndarray, ...]
@@ -65,6 +75,7 @@ def create_iteration_encoding(
     positive_count_by_bit = []
     bit_index_by_count = []
     for _ in range(num_blocks):
+        # 只打乱 positive count；count=0 始终由“该 block 没有 active bit”表示。
         shuffled = rng.permutation(counts)
         reverse = np.full(num_levels + 1, -1, dtype=np.int64)
         for bit_idx, count_value in enumerate(shuffled):
@@ -168,6 +179,7 @@ def encode_discrete_values(values: Sequence[float], encoding: IterationEncoding)
     counts = np.clip(counts, 0, encoding.num_levels)
     bit_vector = np.zeros(encoding.num_blocks * encoding.num_levels, dtype=np.float32)
     for block_idx, count_value in enumerate(counts):
+        # 零值不点亮任何 bit，避免为了表示 0 额外增加一个 one-hot 状态。
         if count_value <= 0:
             continue
         bit_idx = int(encoding.bit_index_by_count[block_idx][int(count_value)])
@@ -188,6 +200,12 @@ def cgfm_composition_to_angles(
     phase_permutation: Sequence[int],
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> np.ndarray:
+    """把四相 composition 映射成三个 CGFM 角度。
+
+    这里使用类似 hyperspherical coordinates 的参数化：每个角度决定当前相
+    与剩余 tail fraction 的比例。这样后续只需优化三个角度 block。
+    """
+
     composition_array = np.asarray(composition, dtype=np.float64)
     permutation = np.asarray(phase_permutation, dtype=np.int64)
     if composition_array.shape[0] != 4 or permutation.shape[0] != 4:
@@ -213,6 +231,11 @@ def cgfm_angles_to_composition(
     angles: Sequence[float],
     phase_permutation: Sequence[int],
 ) -> np.ndarray:
+    """把三个 CGFM 角度解码回四相 composition。
+
+    `cos^2/sin^2` 形式保证每一项非负；归一化和反 permutation 后得到原始相顺序。
+    """
+
     angle_array = np.clip(np.asarray(angles, dtype=np.float64), 0.0, CGFM_ANGLE_MAX)
     permutation = np.asarray(phase_permutation, dtype=np.int64)
     if angle_array.shape[0] != 3 or permutation.shape[0] != 4:
@@ -241,6 +264,8 @@ def encode_single_objective_rows(
     rows: Sequence[Dict[str, float | int]],
     encoding: IterationEncoding,
 ) -> np.ndarray:
+    """w/o CGFM 特征：四个 block 直接表示四个 normalized phase fractions。"""
+
     features = np.zeros((len(rows), encoding.num_blocks * encoding.num_levels), dtype=np.float32)
     for row_idx, row in enumerate(rows):
         composition = np.array(
@@ -255,6 +280,8 @@ def encode_cgfm_rows(
     rows: Sequence[Dict[str, float | int]],
     encoding: IterationEncoding,
 ) -> np.ndarray:
+    """w/ CGFM 特征：先把四相 composition 转成三个角度，再做离散 bit 编码。"""
+
     if encoding.num_blocks != 3 or encoding.phase_permutation is None:
         raise ValueError("CGFM encoding requires three blocks and a phase permutation")
     features = np.zeros((len(rows), encoding.num_blocks * encoding.num_levels), dtype=np.float32)
@@ -269,6 +296,12 @@ def encode_cgfm_rows(
 
 
 def build_system_penalty_matrix(encoding: IterationEncoding) -> Tuple[np.ndarray, float]:
+    """约束直接编码下四个相分数的总和接近 1。
+
+    该项只适用于 w/o CGFM 的四 block composition 编码；CGFM 角度解码已经天然满足
+    simplex 总和约束，不应再叠加这个 penalty。
+    """
+
     if encoding.num_blocks != 4 or abs(encoding.value_scale - 1.0) > DEFAULT_TOLERANCE:
         raise ValueError("System penalty is defined only for direct four-fraction encoding")
     alpha = np.concatenate(
@@ -280,6 +313,8 @@ def build_system_penalty_matrix(encoding: IterationEncoding) -> Tuple[np.ndarray
 
 
 def build_one_hot_penalty_matrix(encoding: IterationEncoding) -> Tuple[np.ndarray, float]:
+    """约束每个 block 最多选择一个 positive count。"""
+
     size = encoding.num_blocks * encoding.num_levels
     q = np.zeros((size, size), dtype=np.float64)
     for block_idx in range(encoding.num_blocks):
@@ -303,6 +338,12 @@ def build_single_objective_qubo(
     encoding: IterationEncoding,
     include_system_penalty: bool = True,
 ) -> QuboBuildResult:
+    """合成最终交给 SA 的 QUBO。
+
+    FM 负责学习目标函数；one-hot penalty 保证每个 block 的离散选择合法；
+    system penalty 只在直接四相分数编码时加入，用来惩罚四相总和偏离 1。
+    """
+
     one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
 
     normalized_fm_q, normalized_fm_bias, fm_scale = normalize_qubo_term(fm_q, fm_bias)

@@ -1,3 +1,10 @@
+"""Figure 4 两条流程的策略分发层。
+
+`wo_cgfm` 和 `w_cgfm` 共用同一套 active-learning 主循环；差异集中在
+composition 如何编码成 FM/QUBO 特征、候选 bit vector 如何解码，以及是否需要
+额外的 system penalty 来约束四个相分数总和。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,6 +28,8 @@ SUPPORTED_SETTINGS: tuple[Figure4Setting, ...] = ("wo_cgfm", "w_cgfm")
 
 
 class SettingStrategy(Protocol):
+    """主循环调用的最小策略接口，避免把两条 Figure 4 流程写成两套 pipeline。"""
+
     name: Figure4Setting
     include_system_penalty: bool
 
@@ -36,6 +45,12 @@ class SettingStrategy(Protocol):
 
 @dataclass(frozen=True)
 class WOCGFMStrategy:
+    """w/o CGFM：直接用四个相分数组成 block 编码。
+
+    每个 block 表示一个相的离散分数；候选解可能违反四相总和为 1 的系统约束，
+    因此最终 QUBO 需要叠加 system penalty。
+    """
+
     name: Figure4Setting = "wo_cgfm"
     include_system_penalty: bool = True
 
@@ -51,6 +66,12 @@ class WOCGFMStrategy:
 
 @dataclass(frozen=True)
 class WCGFMStrategy:
+    """w/ CGFM：用三个角度 block 参数化四相 simplex。
+
+    CGFM 解码会把三个角度映射回非负且总和为 1 的四相 composition，因此只保留
+    one-hot penalty，不再加入直接 composition 编码所需的 system penalty。
+    """
+
     name: Figure4Setting = "w_cgfm"
     include_system_penalty: bool = False
 

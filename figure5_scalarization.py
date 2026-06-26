@@ -1,3 +1,10 @@
+"""Figure 5 多目标 scalarization 工具。
+
+当前模块只负责把真实 `kappa/E/rho` 多目标数据构造成单个 FM 训练目标：
+`wo_ddts` 使用 weighted-sum baseline，`w_ddts` 使用 DDTS/Tchebycheff 目标。
+Pareto front、runner、checkpoint 和绘图会在后续 Figure 5 pipeline 中实现。
+"""
+
 from __future__ import annotations
 
 import math
@@ -19,6 +26,8 @@ ScalarizationMethod = Literal["weighted_sum", "ddts"]
 
 @dataclass(frozen=True)
 class ScalarizationResult:
+    """一次 scalarization 的结果和后续 checkpoint 需要的元数据。"""
+
     method: ScalarizationMethod
     setting: Figure5Setting
     objectives: tuple[str, ...]
@@ -28,6 +37,8 @@ class ScalarizationResult:
 
 
 def sample_preference_weights(rng: random.Random, num_objectives: int = 3) -> tuple[float, ...]:
+    """采样非负且总和为 1 的 preference weights。"""
+
     if int(num_objectives) <= 0:
         raise ValueError("num_objectives must be positive")
 
@@ -39,6 +50,8 @@ def sample_preference_weights(rng: random.Random, num_objectives: int = 3) -> tu
 
 
 def validate_preference_weights(weights: Sequence[float], num_objectives: int = 3) -> np.ndarray:
+    """校验并轻微归一化权重，消除浮点求和误差。"""
+
     if len(weights) != int(num_objectives):
         raise ValueError(f"weights must contain {num_objectives} values")
 
@@ -55,6 +68,13 @@ def validate_preference_weights(weights: Sequence[float], num_objectives: int = 
 
 
 def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[float]) -> ScalarizationResult:
+    """构造 w/o DDTS 的 weighted-sum 训练目标。
+
+    Figure 5 的三个目标方向不同：`kappa/E` 越大越好，`rho` 越小越好。这里先把
+    它们统一成最小化值 `[-kappa, -E, rho]`，再逐列 z-score，最后按 preference
+    weights 求和。返回的 target 已经是“越小越好”，后续 FM/QUBO 不应再反号。
+    """
+
     weight_array = validate_preference_weights(weights, num_objectives=len(FIGURE5_OBJECTIVES))
     raw_values = _objective_matrix(rows)
     transformed = _to_minimization_values(raw_values)
@@ -80,6 +100,14 @@ def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Seq
 
 
 def compute_ddts_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[float]) -> ScalarizationResult:
+    """构造 w/ DDTS 的 data-driven Tchebycheff 训练目标。
+
+    Utopian point 使用当前数据集中 `max(kappa), max(E), min(rho)`。每个样本到
+    utopian point 的方向一致距离先按当前数据集 range 归一化，再计算
+    `max(weight * normalized_distance)`。该值越小，表示样本越接近当前 preference
+    下的 utopian 方向。
+    """
+
     weight_array = validate_preference_weights(weights, num_objectives=len(FIGURE5_OBJECTIVES))
     raw_values = _objective_matrix(rows)
     utopian = np.array(
@@ -128,6 +156,8 @@ def scalarize_training_targets(
     weights: Sequence[float],
     setting: Figure5Setting,
 ) -> ScalarizationResult:
+    """按 Figure 5 setting 分发到 weighted-sum 或 DDTS。"""
+
     if setting == "wo_ddts":
         return compute_weighted_sum_targets(rows, weights)
     if setting == "w_ddts":
@@ -136,6 +166,8 @@ def scalarize_training_targets(
 
 
 def _objective_matrix(rows: Sequence[Mapping[str, Any]]) -> np.ndarray:
+    """从 dataset rows 中抽取固定顺序的 `kappa/E/rho` 矩阵。"""
+
     if not rows:
         raise ValueError("rows must not be empty")
 
@@ -152,6 +184,8 @@ def _objective_matrix(rows: Sequence[Mapping[str, Any]]) -> np.ndarray:
 
 
 def _to_minimization_values(raw_values: np.ndarray) -> np.ndarray:
+    """把 mixed-sense objectives 统一成最小化方向。"""
+
     return np.column_stack((-raw_values[:, 0], -raw_values[:, 1], raw_values[:, 2]))
 
 

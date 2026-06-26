@@ -1,3 +1,10 @@
+"""Figure 4 active-learning 主流程。
+
+一条 trajectory 对应固定的 `setting + objective + seed`：从同一个初始数据集出发，
+重复训练 FM、转 QUBO、SA 求解候选、真实物性验证或 random replacement，并记录
+该 objective 的 best-so-far 曲线。
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -47,6 +54,8 @@ def ensure_training_dependencies() -> None:
 
 @dataclass
 class TrajectoryState:
+    """可写入 checkpoint 的运行中状态。"""
+
     rows: List[Dict[str, Any]]
     best_so_far: List[float] = field(default_factory=list)
     fm_metadata: Dict[str, Any] = field(default_factory=dict)
@@ -64,6 +73,8 @@ class TrajectoryState:
 
 @dataclass(frozen=True)
 class TrajectoryResult:
+    """一条完整 trajectory 的对外结果，用于 summary 和跨 seed 聚合。"""
+
     objective: str
     setting: str
     seed: int
@@ -136,6 +147,8 @@ def zscore(values: np.ndarray) -> Tuple[np.ndarray, float, float]:
 
 
 def discretize_row_for_figure4(row: Dict[str, Any], num_levels: int) -> Dict[str, Any]:
+    """把连续初始样本固化到当前 one-hot level 网格上，再重算真实物性。"""
+
     discrete_composition = prepare_discrete_composition(normalized_composition_from_row(row), num_levels)
     return build_dataset_row(int(row["sample_id"]), int(row["seed"]), discrete_composition)
 
@@ -145,6 +158,8 @@ def discretize_rows_for_figure4(rows: Sequence[Dict[str, Any]], num_levels: int)
 
 
 def random_replacement_row(sample_id: int, seed: int, rng: random.Random, num_levels: int) -> Dict[str, Any]:
+    """候选非法或重复时使用的随机替代样本，仍然落到同一离散网格。"""
+
     continuous_design = sample_single_objective_design(rng)
     discrete_composition = prepare_discrete_composition(continuous_design, num_levels)
     return build_dataset_row(sample_id, seed, discrete_composition)
@@ -218,9 +233,12 @@ def _fit_and_solve_iteration(
     seed: int,
     iteration: int,
 ) -> TrainingIterationResult:
+    """完成单轮“当前数据集 -> FM -> QUBO -> SA 候选 bit vector”。"""
+
     encoding = strategy.create_encoding(config.num_levels, seed + iteration)
     features = strategy.encode_rows(rows, encoding)
     raw_targets = np.array([float(row[objective.name]) for row in rows], dtype=np.float64)
+    # 所有 objective 都转换成最小化方向后再 z-score；QUBO/SA 后续也是最小化。
     transformed_targets = objective.transform_for_training(raw_targets)
     scaled_targets, _, _ = zscore(transformed_targets)
 
@@ -264,9 +282,12 @@ def _decide_candidate(
     num_levels: int,
     seen_compositions: set[Tuple[float, float, float, float]],
 ) -> CandidateDecision:
+    """把 SA bit vector 解码为候选 composition，并处理非法或重复候选。"""
+
     candidate_composition = strategy.decode_candidate(candidate_bits, encoding)
     invalid_candidate = candidate_composition is None or not validate_candidate_composition(candidate_composition)
     if invalid_candidate:
+        # 非法解不直接丢弃 iteration，而是用唯一 random replacement 保持数据集增长。
         row, draws = _generate_unique_replacement_row(
             sample_id=sample_id,
             seed=seed,
@@ -277,6 +298,7 @@ def _decide_candidate(
         return CandidateDecision(status="invalid_replacement", row=row, replacement_draws=draws)
 
     if _composition_key(candidate_composition) in seen_compositions:
+        # 重复 composition 也替换，避免 active-learning 数据集里出现同一点。
         row, draws = _generate_unique_replacement_row(
             sample_id=sample_id,
             seed=seed,
@@ -290,6 +312,8 @@ def _decide_candidate(
 
 
 def _apply_candidate_decision(state: TrajectoryState, decision: CandidateDecision) -> None:
+    """更新 replacement/accepted 计数并把最终 row 加入 trajectory 数据集。"""
+
     if decision.status == "accepted":
         state.accepted_sa_candidates += 1
     elif decision.status == "invalid_replacement":
@@ -338,11 +362,14 @@ def run_single_trajectory(
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
 ) -> TrajectoryResult:
+    """运行或恢复一条固定 setting/objective/seed 的 Figure 4 trajectory。"""
+
     selected_setting = get_setting_strategy(setting).name
     strategy = get_setting_strategy(selected_setting)
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
     if resume and checkpoint is not None and checkpoint.exists():
+        # resume 只接受 schema/config/setting/objective/seed 全部匹配的 checkpoint。
         LOGGER.info(
             "Loading checkpoint setting=%s objective=%s seed=%s path=%s",
             selected_setting,
@@ -371,6 +398,7 @@ def run_single_trajectory(
         state = _initial_state(initial_rows, config)
 
     replacement_rng = random.Random(seed + 17)
+    # 恢复运行时跳过已消耗的 replacement 抽样，保证断点续跑和一次性运行一致。
     _advance_replacement_rng(replacement_rng, state.random_replacement_draws)
 
     seen_compositions = {_row_composition_key(row) for row in state.rows}
@@ -409,6 +437,7 @@ def run_single_trajectory(
         )
         _apply_candidate_decision(state, decision)
         seen_compositions.add(_row_composition_key(decision.row))
+        # best_so_far 记录的是论文 Figure 4 曲线：每轮加入新样本后的历史最优。
         best_value = objective.update_best(best_value, float(decision.row[objective.name]))
         state.best_so_far.append(best_value)
         LOGGER.info(
@@ -453,6 +482,8 @@ def run_single_trajectory(
 
 
 def aggregate_trajectory_results(results: Sequence[TrajectoryResult]) -> Dict[str, AggregatedTrajectory]:
+    """按 objective + setting 聚合同一曲线的多 seed 结果。"""
+
     grouped: Dict[str, List[TrajectoryResult]] = {}
     for result in results:
         key = f"{result.objective}:{result.setting}"
@@ -485,6 +516,8 @@ def run_figure4_experiment(
     resume: bool = False,
     settings: Sequence[Figure4Setting] = ("wo_cgfm",),
 ) -> Figure4Summary:
+    """运行 Figure 4 的 seed/objective/setting 笛卡尔积，并写出 schema v2 summary。"""
+
     selected_settings = validate_settings(settings)
     if not seed_list:
         raise ValueError("seed_list must not be empty")
