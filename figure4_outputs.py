@@ -1,3 +1,5 @@
+"""Figure 4 输出布局、checkpoint I/O、summary 读取和日志文件配置。"""
+
 from __future__ import annotations
 
 import json
@@ -7,8 +9,8 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
-    from figure4_config import ExperimentConfig
-    from figure4_settings import Figure4Setting
+    from figure4_experiment_config import ExperimentConfig
+    from figure4_setting_strategies import Figure4Setting
 else:
     ExperimentConfig = Any
     Figure4Setting = str
@@ -43,6 +45,8 @@ class ObjectiveLike(Protocol):
 
 @dataclass(frozen=True)
 class Figure4OutputLayout:
+    """集中定义一个 Figure 4 输出目录下的所有标准路径。"""
+
     root: Path
 
     @property
@@ -96,6 +100,11 @@ def checkpoint_payload(
     state: object,
     config: ExperimentConfig,
 ) -> dict[str, Any]:
+    """构造 schema v2 checkpoint payload。
+
+    checkpoint 绑定 objective、setting、seed 和 config；恢复时这些字段必须一致。
+    """
+
     return {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "objective": objective.name,
@@ -107,6 +116,8 @@ def checkpoint_payload(
 
 
 def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
+    """原子写入 checkpoint，避免长时间运行被中断时留下半截 JSON。"""
+
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f"{output_path.name}.tmp")
@@ -123,6 +134,8 @@ def load_checkpoint(
     config: ExperimentConfig,
     setting: Figure4Setting,
 ) -> dict[str, Any]:
+    """读取并校验 checkpoint 是否属于当前请求的 trajectory。"""
+
     checkpoint = Path(path)
     payload = json.loads(checkpoint.read_text(encoding="utf-8"))
     if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
@@ -146,6 +159,8 @@ def load_summary(path: str | Path) -> dict[str, Any]:
 
 
 def configure_file_logging_path(log_path: str | Path) -> Path:
+    """为 runner/plot 配置单个文件日志 handler。"""
+
     output_path = Path(log_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
@@ -172,6 +187,8 @@ def _looks_like_figure4_output_name(name: str) -> bool:
 
 
 def classify_output_path(path: str | Path) -> OutputCategory:
+    """区分当前受管理输出、历史受保护输出和临时测试输出。"""
+
     parts = _normalized_path_parts(path)
     if any(part in PROTECTED_LEGACY_OUTPUT_NAMES for part in parts):
         return "protected_legacy"

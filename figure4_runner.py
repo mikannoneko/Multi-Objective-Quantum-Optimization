@@ -1,3 +1,9 @@
+"""Figure 4 命令行入口。
+
+Runner 只负责解析 CLI、检查依赖/CUDA、写 manifest 和调用 pipeline；实际 active
+learning 逻辑保留在 `figure4_pipeline.py`。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,10 +15,10 @@ from pathlib import Path
 
 import torch
 
-from figure4_config import OBJECTIVES, SUPPORTED_PRESETS, ObjectiveSpec, RunScale, resolve_experiment_config
+from figure4_experiment_config import OBJECTIVES, SUPPORTED_PRESETS, ObjectiveSpec, RunScale, resolve_experiment_config
 from figure4_outputs import Figure4OutputLayout, configure_file_logging_path, figure4_output_layout
 from figure4_pipeline import ensure_training_dependencies, run_figure4_experiment
-from figure4_settings import SUPPORTED_SETTINGS
+from figure4_setting_strategies import SUPPORTED_SETTINGS
 
 
 LOGGER = logging.getLogger(__name__)
@@ -59,6 +65,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def _selected_objectives(requested_names: list[str] | None) -> tuple[ObjectiveSpec, ...]:
+    """按 canonical `OBJECTIVES` 顺序筛选 CLI 请求的 objective 子集。"""
+
     if not requested_names:
         return OBJECTIVES
     requested = set(requested_names)
@@ -80,6 +88,8 @@ def _write_manifest(
     objective_names: list[str],
     settings: list[str],
 ) -> Path:
+    """记录本次运行命令、解释器、torch/cuda 状态和解析后的配置。"""
+
     manifest = {
         "command": [sys.executable, *sys.argv],
         "preset": args.preset,
@@ -108,11 +118,15 @@ def _write_manifest(
 
 
 def _ensure_requested_device_available(device: str) -> None:
+    """用户显式请求 CUDA 时，训练开始前尽早失败。"""
+
     if device == "cuda" and not torch.cuda.is_available():
         raise EnvironmentError("Requested --device cuda, but torch.cuda.is_available() is false.")
 
 
 def main() -> None:
+    """解析命令行并启动 Figure 4 实验。"""
+
     args = parse_args()
     output_layout = figure4_output_layout(args.output_dir)
     log_path = configure_file_logging_path(output_layout.runner_log_path)

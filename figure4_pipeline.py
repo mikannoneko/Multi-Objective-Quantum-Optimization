@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Literal, Sequence, Tuple
 import numpy as np
 
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_batch, sample_single_objective_design
-from figure4_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
+from figure4_experiment_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
 from figure4_fm_torch import fit_torch_fm, fm_to_qubo
 from figure4_outputs import checkpoint_payload, figure4_output_layout, load_checkpoint, write_checkpoint
 from figure4_qubo_math import (
@@ -30,7 +30,7 @@ from figure4_qubo_math import (
     simulated_annealing_qubo,
     validate_candidate_composition,
 )
-from figure4_settings import (
+from figure4_setting_strategies import (
     Figure4Setting,
     SettingStrategy,
     get_setting_strategy,

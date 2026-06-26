@@ -1,3 +1,5 @@
+"""Figure 4 使用的 PyTorch Factorization Machine 训练和 FM-to-QUBO 转换。"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -21,6 +23,8 @@ TEST_RATIO = 0.1
 
 @dataclass(frozen=True)
 class FMHyperParams:
+    """Optuna 或固定配置选出的 FM 超参数。"""
+
     init_std: float
     l2_reg_w: float
     l2_reg_v: float
@@ -28,6 +32,8 @@ class FMHyperParams:
 
 @dataclass(frozen=True)
 class FMSplitData:
+    """FM 训练、验证、测试划分后的数组集合。"""
+
     train_x: np.ndarray
     train_y: np.ndarray
     validation_x: np.ndarray
@@ -37,6 +43,12 @@ class FMSplitData:
 
 
 class TorchFMRegressor(nn.Module):
+    """二阶 Factorization Machine 回归器。
+
+    `w0 + w*x + interaction(V)` 的形式可以直接展开成二次项，因此训练完成后能被
+    `fm_to_qubo` 转换为 QUBO。
+    """
+
     def __init__(self, num_features: int, init_std: float) -> None:
         super().__init__()
         self.num_features = num_features
@@ -63,6 +75,8 @@ def set_global_seed(seed: int) -> None:
 
 
 def split_train_validation_test(x: np.ndarray, y: np.ndarray, seed: int) -> FMSplitData:
+    """按论文复现流程拆分当前 active-learning 数据集。"""
+
     if len(x) != len(y):
         raise ValueError("x and y must have equal length")
     if len(x) < 5:
@@ -112,6 +126,8 @@ def _fit_model_once(
     device: str,
     seed: int,
 ) -> Tuple[TorchFMRegressor, Dict[str, float]]:
+    """用一组超参数训练一次 FM，并返回 train/validation/test loss。"""
+
     set_global_seed(seed)
     model = TorchFMRegressor(num_features=split_data.train_x.shape[1], init_std=hparams.init_std).to(device)
     train_x_tensor, train_y_tensor = _tensor_pair(split_data.train_x, split_data.train_y, device)
@@ -161,6 +177,8 @@ def tune_fm_hparams(
     device: str,
     seed: int,
 ) -> Tuple[FMHyperParams, Dict[str, float]]:
+    """用 Optuna 选择 FM 超参数；`optuna_trials <= 0` 时走固定默认值。"""
+
     default_hparams = FMHyperParams(
         init_std=0.05,
         l2_reg_w=1e-4,
@@ -200,6 +218,8 @@ def fit_torch_fm(
     device: str,
     seed: int,
 ) -> Tuple[TorchFMRegressor, Dict[str, Any]]:
+    """训练当前迭代的 FM，并返回可写入 checkpoint/summary 的训练 metadata。"""
+
     split_data = split_train_validation_test(x, y, seed)
     best_hparams, metrics = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
     model, final_metrics = _fit_model_once(split_data, best_hparams, device, seed + 20_000)
@@ -213,6 +233,8 @@ def fit_torch_fm(
 
 
 def fm_to_qubo(model: TorchFMRegressor) -> Tuple[np.ndarray, float]:
+    """把训练好的 FM 展开为 QUBO 的二次矩阵和常数项。"""
+
     w = model.w.detach().cpu().numpy().astype(np.float64)
     v = model.V.detach().cpu().numpy().astype(np.float64)
     q = 0.5 * (v @ v.T)

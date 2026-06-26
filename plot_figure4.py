@@ -1,3 +1,5 @@
+"""Figure 4 summary 绘图入口。"""
+
 from __future__ import annotations
 
 import argparse
@@ -11,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from figure4_config import OBJECTIVES
+from figure4_experiment_config import OBJECTIVES
 from figure4_outputs import configure_file_logging_path, figure4_output_layout, load_summary
 
 
@@ -36,6 +38,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def plot_values(objective_name: str, values: list[float] | np.ndarray) -> np.ndarray:
+    """仅在绘图层 clamp log 轴目标，summary JSON 保留真实值。"""
+
     array = np.asarray(values, dtype=np.float64)
     if objective_name in LOG_OBJECTIVES:
         return np.maximum(array, LOG_EPSILON)
@@ -49,6 +53,8 @@ def _required_curve(stats: dict[str, Any], key: str) -> np.ndarray:
 
 
 def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
+    """合并一个或多个 schema v2 summary 的 aggregated 曲线。"""
+
     merged: dict[str, dict[str, Any]] = {}
     for path in summary_paths:
         summary = load_summary(path)
@@ -65,6 +71,8 @@ def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
 
 
 def main() -> None:
+    """绘制 Figure 4 五个 objective 的 w/o CGFM 与 w/ CGFM 曲线。"""
+
     args = parse_args()
     output_layout = figure4_output_layout(args.output.parent)
     log_path = configure_file_logging_path(output_layout.plot_log_path)

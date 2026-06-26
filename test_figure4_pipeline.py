@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_single_objective
-from figure4_config import OBJECTIVES, EncodingConfig, ExperimentConfig, FMConfig, SAConfig, resolve_experiment_config
+from figure4_experiment_config import OBJECTIVES, EncodingConfig, ExperimentConfig, FMConfig, SAConfig, resolve_experiment_config
 from figure4_fm_torch import TorchFMRegressor, fm_to_qubo
 from figure4_outputs import (
     CHECKPOINT_DIR_NAME,
@@ -53,7 +53,7 @@ from figure4_qubo_math import (
     prepare_discrete_composition,
     validate_candidate_composition,
 )
-from figure4_settings import get_setting_strategy
+from figure4_setting_strategies import get_setting_strategy
 
 WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test"
 WORKSPACE_TMP_ROOT.mkdir(exist_ok=True)
@@ -174,17 +174,21 @@ class Figure4PipelineTests(unittest.TestCase):
         document_path = repo_root / "README.md"
         content = document_path.read_text(encoding="utf-8")
         for heading in (
-            "## 项目状态",
-            "## 代码结构",
-            "## Figure 4 算法流程",
-            "## 配置规则",
-            "## Figure 4 运行方法",
-            "## 输出规则",
-            "## 命名与 schema 规则",
-            "## 返回类型与调用规则",
-            "## Figure 5 复现工作流",
+            "## 第一部分：Figure 4 复现",
+            "### Figure 4 开发情况",
+            "### Figure 4 代码结构",
+            "### Figure 4 算法流程",
+            "### Figure 4 配置规则",
+            "### Figure 4 运行方法",
+            "### Figure 4 输出规则",
+            "## 第二部分：Figure 5 复现",
+            "### Figure 5 开发情况",
+            "### Figure 5 当前代码结构",
+            "### Figure 5 实现顺序",
         ):
             self.assertIn(heading, content)
+        for figure4_keyword in ("figure4_experiment_config.py", "figure4_setting_strategies.py"):
+            self.assertIn(figure4_keyword, content)
         for figure5_keyword in ("w_ddts", "wo_ddts", "weighted-sum", "Pareto front", "figure5_runner.py"):
             self.assertIn(figure5_keyword, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
@@ -436,7 +440,7 @@ class Figure4PipelineTests(unittest.TestCase):
             mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
             mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
             mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(4 * config.num_levels), 0.0)),
-            mock.patch("figure4_settings.WOCGFMStrategy.decode_candidate", return_value=duplicate_array),
+            mock.patch("figure4_setting_strategies.WOCGFMStrategy.decode_candidate", return_value=duplicate_array),
         ):
             duplicate_result = run_single_trajectory(rows, OBJECTIVES[0], seed=8, config=config, setting="wo_cgfm")
         self.assertEqual(duplicate_result.invalid_replacements, 0)

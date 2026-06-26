@@ -1,3 +1,9 @@
+"""Figure 4 实验配置和单目标优化方向定义。
+
+该模块只保存与运行规模、训练参数、SA 参数和 objective 方向有关的配置。
+具体的编码策略在 `figure4_setting_strategies.py`，具体运行循环在 `figure4_pipeline.py`。
+"""
+
 from __future__ import annotations
 
 import math
@@ -11,6 +17,12 @@ SUPPORTED_PRESETS: tuple[RunScale, ...] = ("paper", "quick_l50", "test")
 
 @dataclass(frozen=True)
 class ObjectiveSpec:
+    """描述一个 Figure 4 objective 的优化方向。
+
+    FM/QUBO 训练统一按“越小越好”处理，因此最大化目标会在训练前取负号；
+    best-so-far 曲线仍按真实 objective 方向更新。
+    """
+
     name: str
     maximize: bool
 
@@ -47,6 +59,8 @@ def _require_non_negative(name: str, value: int) -> None:
 
 @dataclass(frozen=True)
 class EncodingConfig:
+    """离散编码配置；`num_levels` 决定每个 block 可表示的正分数等级数。"""
+
     num_levels: int = 50
 
     def __post_init__(self) -> None:
@@ -56,6 +70,8 @@ class EncodingConfig:
 
 @dataclass(frozen=True)
 class FMConfig:
+    """FM 训练配置；`optuna_trials=0` 时使用固定超参数，适合快速测试。"""
+
     optuna_trials: int = 20
     device: str = "cpu"
 
@@ -67,6 +83,8 @@ class FMConfig:
 
 @dataclass(frozen=True)
 class SAConfig:
+    """Simulated annealing 求解配置，对应 D-Wave Ocean `neal` 的 reads 和 sweeps。"""
+
     runs: int = 1000
     sweeps: int = 3000
 
@@ -77,6 +95,8 @@ class SAConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    """Figure 4 一次实验运行的完整配置。"""
+
     num_samples: int = 100
     iterations: int = 600
     encoding: EncodingConfig = field(default_factory=EncodingConfig)
@@ -112,6 +132,8 @@ class ExperimentConfig:
 
 
 def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
+    """把论文规模、快速规模和单元测试规模收敛到同一个配置 dataclass。"""
+
     if preset == "paper":
         return ExperimentConfig(fm=FMConfig(device=device))
     if preset == "quick_l50":
@@ -144,6 +166,8 @@ def resolve_experiment_config(
     sa_runs: int | None = None,
     sa_sweeps: int | None = None,
 ) -> ExperimentConfig:
+    """先解析 preset，再应用 CLI override，得到 runner 实际执行的配置。"""
+
     config = preset_config(preset, device=device)
     if num_samples is not None or iterations is not None:
         config = replace(
