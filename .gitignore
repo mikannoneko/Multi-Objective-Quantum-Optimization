@@ -29,6 +29,14 @@ figure4_compare*/
 figure4_cgfm*/
 figure4_quick_l50/
 
+# Figure 5 experiment outputs and checkpoints
+figure5_*output*/
+figure5_*full*/
+figure5_*quick*/
+figure5_*test*/
+figure5_quick150/
+figure5_paper/
+
 # Runtime logs and generated plots
 *.log
 *.pid

@@ -166,9 +166,10 @@ python plot_figure4.py `
 ### Figure 5 开发情况
 
 - 已实现多目标初始数据生成器：`generate_initial_dataset_multi_objective` 和 `generate_initial_dataset_multi_objective_batch`。
-- 已实现 `figure5_scalarization.py`：支持 `wo_ddts` weighted-sum 和 `w_ddts` DDTS/Tchebycheff scalarization。
+- 已实现 `figure5_scalarization.py`：支持论文式 DDTS 人工目标和 weighted-sum baseline 的三个独立 FM targets。
 - 已实现 `figure5_pareto.py`：支持 `is_dominated` 和 `pareto_front`。
-- 尚未实现 Figure 5 runner、pipeline、outputs、checkpoint、manifest、summary schema 和 plot。
+- 已实现 Figure 5 pipeline、`test/quick150/paper` 配置、checkpoint/resume、summary schema v1、manifest 和 runner。
+- 尚未实现 `plot_figure5.py`。
 - Figure 5 不应复用 Figure 4 的 `best_so_far` 单目标曲线作为核心结果；它比较的是多目标优化中采样到的解在三维目标空间中的覆盖情况。
 
 ### Figure 5 当前代码结构
@@ -176,16 +177,17 @@ python plot_figure4.py `
 - `alloy_dataset_generator.py`：已有 Figure 5 多目标初始数据生成器，复用 Figure 4 的 row schema、物性计算和 CSV 写出。
 - `figure5_scalarization.py`：定义 `w_ddts` 与 `wo_ddts` 的人工训练目标构造，以及 preference weights 采样/校验。
 - `figure5_pareto.py`：定义 Pareto 支配关系和非支配 front 筛选。
+- `figure5_experiment_config.py`：定义 Figure 5 的 `paper/quick150/test` preset 和 CLI override 规则。
+- `figure5_pipeline.py`：运行两条多目标 trajectory，处理 FM/QUBO/SA、decode、replacement、resume 和 Pareto summary。
+- `figure5_outputs.py`：定义 Figure 5 输出布局、checkpoint schema v1、原子 JSON 写入和日志。
+- `figure5_runner.py`：解析 CLI、检查 CUDA、运行 pipeline 并写 manifest。
 - `test_alloy_dataset_generator.py`：覆盖多目标初始数据生成。
 - `test_figure5_scalarization.py`：覆盖 weighted-sum、DDTS、权重采样和输入校验。
 - `test_figure5_pareto.py`：覆盖支配方向、相同点、折中点、非凸点和非法输入。
+- `test_figure5_pipeline.py`：覆盖 preset、一/三 FM 分支、QUBO 合并、replacement、resume、summary 和 manifest。
 
 ### Figure 5 待新增代码结构
 
-- `figure5_config.py`：定义 Figure 5 preset、目标集合 `kappa/E/rho`、DDTS 和 weighted-sum 配置。
-- `figure5_pipeline.py`：复用 Figure 4 的底层训练/求解组件，运行多目标 active learning。
-- `figure5_outputs.py`：定义 Figure 5 summary、checkpoint、manifest、日志和输出图路径。
-- `figure5_runner.py`：解析 Figure 5 CLI，调用 Figure 5 pipeline。
 - `plot_figure5.py`：读取 Figure 5 summary，绘制 3D objective space、Pareto front 和分段采样图。
 
 ### Figure 5 目标
@@ -195,23 +197,39 @@ python plot_figure4.py `
   - `kappa`：越大越好。
   - `E`：越大越好。
   - `rho`：越小越好。
-- 默认 paper 规模应对齐论文 Figure 5：
+- 论文参考规模对齐 Figure 5：
   - 初始数据集：`num_samples=500`。
   - active learning：`iterations=1000`。
-  - 编码：优先复用 Figure 4 的 `w_cgfm` 编码，即 3 个 CGFM 角度 block，每个 block `num_levels=50`。
+  - 编码：按论文 Figure 5 使用四相直接 one-hot 编码，4 个 block，每个 block `num_levels=25`，并加入 system penalty。
   - QUBO 求解：复用 D-Wave Ocean `neal` simulated annealing。
+- 由于论文规模运行时间过长，本项目仅保留 `paper` 参数用于对照，不尝试实际运行；实际复现输出以 `quick150` 为准。
 - 输出重点不是单目标 best-so-far，而是：
   - 每次迭代采样到的合金设计。
   - 每个设计的 `kappa/E/rho` 真实值。
   - `w_ddts` 和 `wo_ddts` 各自找到的非支配 Pareto front。
   - 按迭代区间分段的采样进展。
 
+### Figure 5 配置规模
+
+Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 是本项目实际复现和产出结果的正式规模；`test` 只用于小规模端到端验收，`paper` 只保留论文原始规模参数供对照。
+
+| preset | initial samples | iterations | direct one-hot levels | Optuna trials | SA reads | SA sweeps | default seeds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `test` | 10 | 2 | 8 | 0 | 2 | 6 | 1 |
+| `quick150` | 500 | 150 | 25 | 3 | 100 | 500 | 3 |
+| `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 20 |
+
+- `quick150` 保留论文规模的 500 条初始数据和 25-level 直接编码，将 active-learning 迭代缩短到 150，并降低 Optuna 和 SA 预算。
+- `quick150` 的 summary、Pareto front 和 Figure 5 图是本项目的正式复现产物。
+- `paper` 不进入实际运行、结果验收或输出交付范围。
+- CLI 数值参数应能覆盖 preset，与 Figure 4 runner 的规则保持一致。
+
 ### Figure 5 与 Figure 4 的复用边界
 
 Figure 5 应直接复用：
 
 - `alloy_dataset_generator.py` 中的真实物性计算和 `build_dataset_row`。
-- `figure4_qubo_math.py` 中的 CGFM 编码、one-hot 约束、FM QUBO 构造和 SA 求解。
+- `figure4_qubo_math.py` 中的直接四相编码、system/one-hot penalty、FM QUBO 构造和 SA 求解。
 - `figure4_fm_torch.py` 中的 FM 训练和 `fm_to_qubo`。
 - `figure4_outputs.py` 的输出布局思想、checkpoint 原子写入、日志配置和 schema 校验风格。
 - `figure4_pipeline.py` 中的候选验收思想：decode 后必须得到非负、总和为 1 的四相 composition；非法或重复候选用 random replacement 处理。
@@ -257,34 +275,34 @@ Figure 5 至少包含两个 setting：
 2. 生成 preference weights `w = (w_kappa, w_E, w_rho)`，要求非负且总和为 1。
 3. 对三个目标统一成最小化方向：`[-kappa, -E, rho]`。
 4. 对每个目标在当前数据集上做 z-score。
-5. 构造人工训练目标：
+5. 分别训练三个 FM，并将它们转换为 `Q_kappa/Q_E/Q_rho`。
+6. 在 QUBO 层按 preference weights 合并：
 
 ```text
-y_hat = w_kappa * z(-kappa) + w_E * z(-E) + w_rho * z(rho)
+Q_weighted = w_kappa * Q_kappa + w_E * Q_E + w_rho * Q_rho
 ```
 
 `w_ddts` DDTS 每轮 active learning：
 
 1. 当前数据集包含 composition 和真实 `kappa/E/rho`。
 2. 生成 preference weights `w = (w_kappa, w_E, w_rho)`。
-3. 计算 utopian point：`max(kappa), max(E), min(rho)`。
-4. 计算方向一致距离：`u_kappa-kappa`、`u_E-E`、`rho-u_rho`。
-5. 对距离做尺度归一化。
-6. 构造人工训练目标：
+3. 对 `kappa/E/rho` 分别做 z-score。
+4. 在 z-score 空间计算 utopian point：`1.1*max(z_kappa)`、`1.1*max(z_E)`、`1.1*min(z_rho)`。
+5. 计算方向一致距离，构造人工训练目标：
 
 ```text
 y_hat(d) = max(
-  w_kappa * normalized_dist_kappa(d),
-  w_E * normalized_dist_E(d),
-  w_rho * normalized_dist_rho(d)
+  w_kappa * (u_kappa - z_kappa(d)),
+  w_E * (u_E - z_E(d)),
+  w_rho * (z_rho(d) - u_rho)
 )
 ```
 
-两种 scalarization 输出都已经是“越小越好”的 FM 训练目标。
+`w_ddts` 输出一个“越小越好”的 FM 训练目标；`wo_ddts` 的三个方向一致 target 分别用于三个 FM，weighted sum 发生在 QUBO 层。
 
 ### Figure 5 Pareto front
 
-Figure 5 summary 必须保存所有被采样或替换后加入数据集的多目标解，并为每个 setting 计算非支配解。
+Figure 5 trajectory 分开保存每轮 proposed QUBO solution 和实际 added solution。summary 的扁平 `solutions` 只包含有效 proposed solution；重复 proposed solution 保留，random replacement 不进入论文式 Pareto front。
 
 对 `kappa/E/rho`，解 A 支配解 B 当且仅当：
 
@@ -332,6 +350,7 @@ figure5_output_dir/
   "seed_list": [0],
   "objectives": ["kappa", "E", "rho"],
   "settings": ["w_ddts", "wo_ddts"],
+  "trajectories": [],
   "solutions": [],
   "pareto_front": {
     "w_ddts": [],
@@ -343,7 +362,7 @@ figure5_output_dir/
 checkpoint 中必须保存：
 
 - 当前 rows。
-- 已加入的 solution records。
+- 每轮 proposed solution 和 added solution。
 - 当前 iteration。
 - random replacement 计数。
 - 当前 setting、seed、config。
@@ -358,14 +377,15 @@ checkpoint 中必须保存：
 3. panel c：`w_ddts` 按迭代区间分段的采样进展。
 4. panel d：`wo_ddts` 按迭代区间分段的采样进展。
 
-默认分段：
+本项目 `quick150` 正式结果的默认分段：
 
 ```text
-0-250
-250-500
-500-750
-750-1000
+0-50
+50-100
+100-150
 ```
+
+`paper` 参数对照的分段为 `0-250`、`250-500`、`500-750`、`750-1000`，但本项目不生成该规模图。
 
 坐标轴：
 
@@ -382,9 +402,7 @@ z = rho
 - 分段图用不同颜色表示迭代区间。
 - random replacement 可以保存在 summary 中，但论文图中默认只画 QO/SA 找到的最佳 alloy designs；是否显示 replacement 应由 `plot_figure5.py` CLI 参数控制。
 
-### Figure 5 目标运行命令
-
-代码尚未实现 Figure 5 runner 前，不应执行以下命令；这些命令定义的是目标 CLI 形态。
+### Figure 5 运行命令
 
 小规模验收：
 
@@ -397,24 +415,26 @@ python figure5_runner.py `
   --settings w_ddts wo_ddts
 ```
 
-论文规模：
+本项目正式复现运行：
 
 ```powershell
 python figure5_runner.py `
-  --output-dir figure5_paper `
+  --output-dir figure5_quick150 `
   --device cuda `
   --resume `
-  --preset paper `
+  --preset quick150 `
   --settings w_ddts wo_ddts
 ```
 
-画图：
+下列绘图命令是待实现的目标接口，当前尚不可执行：
 
 ```powershell
 python plot_figure5.py `
-  --summary figure5_paper\figure5_summary.json `
-  --output figure5_paper\figure5.png
+  --summary figure5_quick150\figure5_summary.json `
+  --output figure5_quick150\figure5.png
 ```
+
+`paper` preset 仅作为论文参数参考保留，本项目不安排运行或绘图。
 
 ### Figure 5 验收标准
 
@@ -428,10 +448,10 @@ Figure 5 代码落地后，至少需要通过：
    - checkpoint resume 不重复迭代、不丢失已有 solution records。
 2. 小规模端到端验收：
    - `figure5_runner.py --preset test --settings w_ddts wo_ddts` 能生成 summary、manifest、日志和 checkpoint。
-   - `plot_figure5.py` 能读取 summary 并生成非空 PNG。
-3. 论文规模输出验收：
+   - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema；绘图验收留到 `plot_figure5.py` 实现后。
+3. `quick150` 正式复现输出验收：
    - `figure5_summary.json` 中包含 `w_ddts` 与 `wo_ddts` 两个 setting。
-   - 每个 setting 至少有 `1000` 条 iteration solution record。
+   - 每个 setting 完成 3 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
    - `pareto_front.w_ddts` 和 `pareto_front.wo_ddts` 非空。
    - `figure5.png` 包含全局采样图和分段采样图。
 
@@ -440,7 +460,7 @@ Figure 5 代码落地后，至少需要通过：
 1. 已完成：在 `alloy_dataset_generator.py` 增加 Figure 5 多目标初始数据生成器。
 2. 已完成：新增 `figure5_scalarization.py`，实现 weighted-sum 和 DDTS。
 3. 已完成：新增 `figure5_pareto.py` 和 `test_figure5_pareto.py`。
-4. 待实现：新增 `figure5_pipeline.py`，复用 Figure 4 的 FM/QUBO/SA/decode/replacement。
-5. 待实现：新增 `figure5_runner.py` 和 `figure5_outputs.py`，保持 checkpoint、manifest、日志风格与 Figure 4 一致。
+4. 已完成：新增 `figure5_pipeline.py`，复用 Figure 4 的 FM/QUBO/SA/decode/replacement。
+5. 已完成：新增 `figure5_experiment_config.py`、`figure5_runner.py` 和 `figure5_outputs.py`，实现 preset、checkpoint、manifest、summary 和日志。
 6. 待实现：新增 `plot_figure5.py`。
-7. 待执行：先跑 `preset test`，再跑较小 quick preset，最后跑 paper preset。
+7. 待执行：先用 `preset test` 验收，再用 `preset quick150` 产出本项目正式复现结果；不运行 `preset paper`。

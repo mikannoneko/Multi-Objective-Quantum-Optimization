@@ -8,6 +8,7 @@ from figure5_scalarization import (
     FIGURE5_OBJECTIVE_SENSES,
     FIGURE5_OBJECTIVES,
     compute_ddts_targets,
+    compute_individual_objective_targets,
     compute_weighted_sum_targets,
     sample_preference_weights,
     scalarize_training_targets,
@@ -58,27 +59,46 @@ class Figure5ScalarizationTests(unittest.TestCase):
         self.assertEqual(result.metadata["zscore_mean"]["E"], -100.0)
         self.assertAlmostEqual(result.metadata["zscore_mean"]["rho"], 2.7666666666666666)
 
-    def test_ddts_matches_manual_utopian_range_tchebycheff(self) -> None:
+    def test_individual_targets_are_direction_consistent_and_standardized(self) -> None:
+        result = compute_individual_objective_targets(self.rows)
+
+        self.assertEqual(int(np.argmin(result.targets["kappa"])), 1)
+        self.assertEqual(int(np.argmin(result.targets["E"])), 2)
+        self.assertEqual(int(np.argmin(result.targets["rho"])), 1)
+        for objective in FIGURE5_OBJECTIVES:
+            self.assertAlmostEqual(float(np.mean(result.targets[objective])), 0.0, places=6)
+            self.assertAlmostEqual(float(np.std(result.targets[objective])), 1.0, places=6)
+
+    def test_ddts_matches_paper_zscore_utopian_tchebycheff(self) -> None:
         weights = np.array([0.2, 0.3, 0.5], dtype=np.float64)
         result = compute_ddts_targets(self.rows, weights)
 
-        expected_distances = np.array(
-            [
-                [1.0, 0.5, 1.0],
-                [0.0, 1.0, 0.0],
-                [0.5, 0.0, 0.6],
-            ],
-            dtype=np.float64,
+        raw = np.array([[10.0, 100.0, 3.0], [20.0, 90.0, 2.5], [15.0, 110.0, 2.8]], dtype=np.float64)
+        normalized = (raw - np.mean(raw, axis=0)) / np.std(raw, axis=0)
+        utopian = np.array(
+            [1.1 * np.max(normalized[:, 0]), 1.1 * np.max(normalized[:, 1]), 1.1 * np.min(normalized[:, 2])]
+        )
+        expected_distances = np.column_stack(
+            (
+                utopian[0] - normalized[:, 0],
+                utopian[1] - normalized[:, 1],
+                normalized[:, 2] - utopian[2],
+            )
         )
         expected = np.max(expected_distances * weights, axis=1).astype(np.float32)
 
         self.assertEqual(result.method, "ddts")
         self.assertEqual(result.setting, "w_ddts")
         self.assertTrue(np.allclose(result.targets, expected))
-        self.assertEqual(result.metadata["utopian_point"], {"kappa": 20.0, "E": 110.0, "rho": 2.5})
-        self.assertEqual(result.metadata["range_scale"], {"kappa": 10.0, "E": 20.0, "rho": 0.5})
+        self.assertEqual(result.metadata["utopian_space"], "zscore")
+        self.assertTrue(
+            np.allclose(
+                [result.metadata["utopian_point"][objective] for objective in FIGURE5_OBJECTIVES],
+                utopian,
+            )
+        )
 
-    def test_ddts_constant_ranges_are_finite(self) -> None:
+    def test_ddts_constant_columns_are_finite(self) -> None:
         rows = [
             {"kappa": 12.0, "E": 70.0, "rho": 2.7},
             {"kappa": 12.0, "E": 70.0, "rho": 2.7},
@@ -87,7 +107,8 @@ class Figure5ScalarizationTests(unittest.TestCase):
 
         self.assertTrue(np.all(np.isfinite(result.targets)))
         self.assertTrue(np.allclose(result.targets, np.zeros(2, dtype=np.float32)))
-        self.assertEqual(result.metadata["range_scale"], {"kappa": 1.0, "E": 1.0, "rho": 1.0})
+        self.assertEqual(result.metadata["zscore_scale"], {"kappa": 1.0, "E": 1.0, "rho": 1.0})
+        self.assertEqual(result.metadata["utopian_point"], {"kappa": 0.0, "E": 0.0, "rho": 0.0})
 
     def test_preference_weight_sampling_is_deterministic_and_normalized(self) -> None:
         weights_a = sample_preference_weights(random.Random(123))

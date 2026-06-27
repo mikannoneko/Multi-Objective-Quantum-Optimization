@@ -1,8 +1,8 @@
-"""Figure 5 多目标 scalarization 工具。
+"""Figure 5 多目标 scalarization 和目标预处理工具。
 
-当前模块只负责把真实 `kappa/E/rho` 多目标数据构造成单个 FM 训练目标：
-`wo_ddts` 使用 weighted-sum baseline，`w_ddts` 使用 DDTS/Tchebycheff 目标。
-Pareto front、runner、checkpoint 和绘图会在后续 Figure 5 pipeline 中实现。
+`w_ddts` 把三个真实目标转换为一个 DDTS 人工目标。论文中的
+`wo_ddts` baseline 会分别训练三个 FM，因此 pipeline 使用
+`compute_individual_objective_targets`，然后在 QUBO 层做 weighted sum。
 """
 
 from __future__ import annotations
@@ -33,6 +33,15 @@ class ScalarizationResult:
     objectives: tuple[str, ...]
     weights: tuple[float, ...]
     targets: np.ndarray
+    metadata: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ObjectiveTargetsResult:
+    """w/o DDTS 三个独立 FM 使用的方向一致 z-score targets。"""
+
+    objectives: tuple[str, ...]
+    targets: Dict[str, np.ndarray]
     metadata: Dict[str, Any]
 
 
@@ -68,21 +77,16 @@ def validate_preference_weights(weights: Sequence[float], num_objectives: int = 
 
 
 def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[float]) -> ScalarizationResult:
-    """构造 w/o DDTS 的 weighted-sum 训练目标。
+    """构造 weighted-sum 数学参考目标。
 
-    Figure 5 的三个目标方向不同：`kappa/E` 越大越好，`rho` 越小越好。这里先把
-    它们统一成最小化值 `[-kappa, -E, rho]`，再逐列 z-score，最后按 preference
-    weights 求和。返回的 target 已经是“越小越好”，后续 FM/QUBO 不应再反号。
+    该函数保留用于单元测试和数学对照。论文 Figure 5 baseline 不使用该
+    target 训练单个 FM，而是训练三个 FM 后合并 QUBO。
     """
 
     weight_array = validate_preference_weights(weights, num_objectives=len(FIGURE5_OBJECTIVES))
-    raw_values = _objective_matrix(rows)
-    transformed = _to_minimization_values(raw_values)
-    means = np.mean(transformed, axis=0)
-    stds = np.std(transformed, axis=0)
-    scales = np.where(stds < SCALARIZATION_SCALE_FLOOR, 1.0, stds)
-    normalized = (transformed - means) / scales
-    targets = np.dot(normalized, weight_array).astype(np.float32)
+    individual = compute_individual_objective_targets(rows)
+    target_matrix = np.column_stack([individual.targets[name] for name in FIGURE5_OBJECTIVES])
+    targets = np.dot(target_matrix, weight_array).astype(np.float32)
 
     return ScalarizationResult(
         method="weighted_sum",
@@ -90,6 +94,25 @@ def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Seq
         objectives=FIGURE5_OBJECTIVES,
         weights=tuple(float(value) for value in weight_array),
         targets=targets,
+        metadata={
+            "objective_senses": dict(FIGURE5_OBJECTIVE_SENSES),
+            **individual.metadata,
+        },
+    )
+
+
+def compute_individual_objective_targets(rows: Sequence[Mapping[str, Any]]) -> ObjectiveTargetsResult:
+    """Create three independently standardized minimization targets."""
+
+    raw_values = _objective_matrix(rows)
+    transformed = _to_minimization_values(raw_values)
+    normalized, means, scales = _zscore_columns(transformed)
+    return ObjectiveTargetsResult(
+        objectives=FIGURE5_OBJECTIVES,
+        targets={
+            objective: normalized[:, index].astype(np.float32)
+            for index, objective in enumerate(FIGURE5_OBJECTIVES)
+        },
         metadata={
             "objective_senses": dict(FIGURE5_OBJECTIVE_SENSES),
             "transformed_objectives": {"kappa": "-kappa", "E": "-E", "rho": "rho"},
@@ -102,40 +125,29 @@ def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Seq
 def compute_ddts_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[float]) -> ScalarizationResult:
     """构造 w/ DDTS 的 data-driven Tchebycheff 训练目标。
 
-    Utopian point 使用当前数据集中 `max(kappa), max(E), min(rho)`。每个样本到
-    utopian point 的方向一致距离先按当前数据集 range 归一化，再计算
-    `max(weight * normalized_distance)`。该值越小，表示样本越接近当前 preference
-    下的 utopian 方向。
+    按论文补充材料 S1.3，先对每个真实 objective 做 z-score，再在标准化
+    空间中把 utopian point 放在当前最佳值前方 10%。输出仍为越小越好。
     """
 
     weight_array = validate_preference_weights(weights, num_objectives=len(FIGURE5_OBJECTIVES))
     raw_values = _objective_matrix(rows)
+    normalized, means, scales = _zscore_columns(raw_values)
     utopian = np.array(
         [
-            np.max(raw_values[:, 0]),
-            np.max(raw_values[:, 1]),
-            np.min(raw_values[:, 2]),
+            1.1 * np.max(normalized[:, 0]),
+            1.1 * np.max(normalized[:, 1]),
+            1.1 * np.min(normalized[:, 2]),
         ],
         dtype=np.float64,
     )
     distances = np.column_stack(
         (
-            utopian[0] - raw_values[:, 0],
-            utopian[1] - raw_values[:, 1],
-            raw_values[:, 2] - utopian[2],
+            utopian[0] - normalized[:, 0],
+            utopian[1] - normalized[:, 1],
+            normalized[:, 2] - utopian[2],
         )
     )
-    ranges = np.array(
-        [
-            np.max(raw_values[:, 0]) - np.min(raw_values[:, 0]),
-            np.max(raw_values[:, 1]) - np.min(raw_values[:, 1]),
-            np.max(raw_values[:, 2]) - np.min(raw_values[:, 2]),
-        ],
-        dtype=np.float64,
-    )
-    scales = np.where(ranges < SCALARIZATION_SCALE_FLOOR, 1.0, ranges)
-    normalized_distances = distances / scales
-    targets = np.max(normalized_distances * weight_array, axis=1).astype(np.float32)
+    targets = np.max(distances * weight_array, axis=1).astype(np.float32)
 
     return ScalarizationResult(
         method="ddts",
@@ -146,7 +158,9 @@ def compute_ddts_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[fl
         metadata={
             "objective_senses": dict(FIGURE5_OBJECTIVE_SENSES),
             "utopian_point": _objective_metadata(utopian),
-            "range_scale": _objective_metadata(scales),
+            "utopian_space": "zscore",
+            "zscore_mean": _objective_metadata(means),
+            "zscore_scale": _objective_metadata(scales),
         },
     )
 
@@ -156,7 +170,7 @@ def scalarize_training_targets(
     weights: Sequence[float],
     setting: Figure5Setting,
 ) -> ScalarizationResult:
-    """按 Figure 5 setting 分发到 weighted-sum 或 DDTS。"""
+    """数学工具分发；pipeline 的 `wo_ddts` 会改用三 FM QUBO 合并。"""
 
     if setting == "wo_ddts":
         return compute_weighted_sum_targets(rows, weights)
@@ -189,6 +203,13 @@ def _to_minimization_values(raw_values: np.ndarray) -> np.ndarray:
     return np.column_stack((-raw_values[:, 0], -raw_values[:, 1], raw_values[:, 2]))
 
 
+def _zscore_columns(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    means = np.mean(values, axis=0)
+    stds = np.std(values, axis=0)
+    scales = np.where(stds < SCALARIZATION_SCALE_FLOOR, 1.0, stds)
+    return (values - means) / scales, means, scales
+
+
 def _objective_metadata(values: Sequence[float]) -> Dict[str, float]:
     return {objective: float(value) for objective, value in zip(FIGURE5_OBJECTIVES, values)}
 
@@ -197,9 +218,11 @@ __all__ = [
     "FIGURE5_OBJECTIVES",
     "FIGURE5_OBJECTIVE_SENSES",
     "Figure5Setting",
+    "ObjectiveTargetsResult",
     "ScalarizationMethod",
     "ScalarizationResult",
     "compute_ddts_targets",
+    "compute_individual_objective_targets",
     "compute_weighted_sum_targets",
     "sample_preference_weights",
     "scalarize_training_targets",

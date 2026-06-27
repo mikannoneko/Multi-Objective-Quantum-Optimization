@@ -1,0 +1,124 @@
+"""Figure 5 多目标实验规模和训练/求解配置。"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Literal
+
+from figure4_experiment_config import EncodingConfig, FMConfig, SAConfig
+
+
+Figure5RunScale = Literal["paper", "quick150", "test"]
+SUPPORTED_PRESETS: tuple[Figure5RunScale, ...] = ("paper", "quick150", "test")
+
+
+@dataclass(frozen=True)
+class Figure5ExperimentConfig:
+    """Figure 5 一次实验的完整配置。
+
+    Figure 5 复用 Figure 4 的 FM、SA 和离散编码参数类，但使用
+    独立的 preset，避免把 Figure 4 的 600 轮单目标默认值带入多目标实验。
+    """
+
+    num_samples: int = 500
+    iterations: int = 1000
+    encoding: EncodingConfig = field(default_factory=lambda: EncodingConfig(num_levels=25))
+    fm: FMConfig = field(default_factory=FMConfig)
+    sa: SAConfig = field(default_factory=SAConfig)
+
+    def __post_init__(self) -> None:
+        if int(self.num_samples) <= 0:
+            raise ValueError("num_samples must be positive")
+        if int(self.iterations) <= 0:
+            raise ValueError("iterations must be positive")
+
+    @property
+    def num_levels(self) -> int:
+        return self.encoding.num_levels
+
+    @property
+    def optuna_trials(self) -> int:
+        return self.fm.optuna_trials
+
+    @property
+    def device(self) -> str:
+        return self.fm.device
+
+    @property
+    def sa_runs(self) -> int:
+        return self.sa.runs
+
+    @property
+    def sa_sweeps(self) -> int:
+        return self.sa.sweeps
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5ExperimentConfig:
+    """Resolve the paper reference, project reproduction, or test scale."""
+
+    if preset == "paper":
+        return Figure5ExperimentConfig(fm=FMConfig(device=device))
+    if preset == "quick150":
+        return Figure5ExperimentConfig(
+            num_samples=500,
+            iterations=150,
+            encoding=EncodingConfig(num_levels=25),
+            fm=FMConfig(optuna_trials=3, device=device),
+            sa=SAConfig(runs=100, sweeps=500),
+        )
+    if preset == "test":
+        return Figure5ExperimentConfig(
+            num_samples=10,
+            iterations=2,
+            encoding=EncodingConfig(num_levels=8),
+            fm=FMConfig(optuna_trials=0, device=device),
+            sa=SAConfig(runs=2, sweeps=6),
+        )
+    raise ValueError(f"Unsupported preset {preset!r}. Choices: {', '.join(SUPPORTED_PRESETS)}")
+
+
+def resolve_experiment_config(
+    *,
+    preset: Figure5RunScale,
+    device: str,
+    num_samples: int | None = None,
+    iterations: int | None = None,
+    num_levels: int | None = None,
+    optuna_trials: int | None = None,
+    sa_runs: int | None = None,
+    sa_sweeps: int | None = None,
+) -> Figure5ExperimentConfig:
+    """Resolve a preset first, then apply explicit CLI overrides."""
+
+    config = preset_config(preset, device=device)
+    if num_samples is not None or iterations is not None:
+        config = replace(
+            config,
+            num_samples=config.num_samples if num_samples is None else int(num_samples),
+            iterations=config.iterations if iterations is None else int(iterations),
+        )
+    if num_levels is not None:
+        config = replace(config, encoding=EncodingConfig(num_levels=int(num_levels)))
+    if optuna_trials is not None:
+        config = replace(config, fm=replace(config.fm, optuna_trials=int(optuna_trials)))
+    if sa_runs is not None or sa_sweeps is not None:
+        config = replace(
+            config,
+            sa=SAConfig(
+                runs=config.sa.runs if sa_runs is None else int(sa_runs),
+                sweeps=config.sa.sweeps if sa_sweeps is None else int(sa_sweeps),
+            ),
+        )
+    return config
+
+
+__all__ = [
+    "Figure5ExperimentConfig",
+    "Figure5RunScale",
+    "SUPPORTED_PRESETS",
+    "preset_config",
+    "resolve_experiment_config",
+]
