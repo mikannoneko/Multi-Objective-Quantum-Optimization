@@ -88,7 +88,82 @@ class Figure5PipelineTests(unittest.TestCase):
 
         args = figure5_runner.parse_args(["--output-dir", "figure5_default", "--settings", "w_ddts"])
         self.assertEqual(args.preset, "quick150")
-        self.assertEqual(figure5_runner.PRESET_NUM_SEEDS["quick150"], 3)
+        self.assertEqual(
+            figure5_runner.PRESET_NUM_SEEDS,
+            {"paper": 1, "quick150": 1, "test": 1},
+        )
+        self.assertEqual(figure5_runner.resolve_seed_list(args.preset, args.num_seeds, args.seed_start), [0])
+
+        multi_seed_args = figure5_runner.parse_args(
+            [
+                "--output-dir",
+                "figure5_multi_seed",
+                "--settings",
+                "w_ddts",
+                "wo_ddts",
+                "--num-seeds",
+                "3",
+                "--seed-start",
+                "4",
+            ]
+        )
+        self.assertEqual(
+            figure5_runner.resolve_seed_list(
+                multi_seed_args.preset,
+                multi_seed_args.num_seeds,
+                multi_seed_args.seed_start,
+            ),
+            [4, 5, 6],
+        )
+
+    def test_explicit_multi_seed_runs_setting_seed_cartesian_product(self) -> None:
+        config = _test_config(iterations=1)
+
+        def fake_run(*_: object, **kwargs: object) -> Figure5TrajectoryResult:
+            return Figure5TrajectoryResult(
+                setting=str(kwargs["setting"]),
+                seed=int(kwargs["seed"]),
+                iteration_records=[],
+                final_dataset_size=config.num_samples,
+                training_backend=pipeline.TRAINING_BACKEND,
+                latest_weights=[],
+                latest_fm_metadata={},
+                latest_scalarization_metadata={},
+                qubo_stats=None,
+                duplicate_replacements=0,
+                invalid_replacements=0,
+                random_replacements=0,
+                random_replacement_draws=0,
+                accepted_sa_candidates=0,
+                completed_iterations=0,
+            )
+
+        output_dir = WORKSPACE_TMP_ROOT / "figure5_multi_seed"
+        with mock.patch("figure5_pipeline.run_single_trajectory", side_effect=fake_run) as run_mock:
+            summary = run_figure5_experiment(
+                seed_list=[4, 5, 6],
+                config=config,
+                output_dir=output_dir,
+                settings=("w_ddts", "wo_ddts"),
+            )
+
+        self.assertEqual(len(summary.trajectories), 6)
+        self.assertEqual(
+            [(result.setting, result.seed) for result in summary.trajectories],
+            [
+                ("w_ddts", 4),
+                ("wo_ddts", 4),
+                ("w_ddts", 5),
+                ("wo_ddts", 5),
+                ("w_ddts", 6),
+                ("wo_ddts", 6),
+            ],
+        )
+        for call_index in range(0, run_mock.call_count, 2):
+            self.assertIs(
+                run_mock.call_args_list[call_index].kwargs["initial_rows"],
+                run_mock.call_args_list[call_index + 1].kwargs["initial_rows"],
+            )
 
     def test_preference_weights_are_shared_and_deterministic(self) -> None:
         weights_a = preference_weights_for_iteration(seed=4, iteration=7)

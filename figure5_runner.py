@@ -25,8 +25,8 @@ from figure5_pipeline import SUPPORTED_SETTINGS, ensure_training_dependencies, r
 
 LOGGER = logging.getLogger(__name__)
 PRESET_NUM_SEEDS: dict[Figure5RunScale, int] = {
-    "paper": 20,
-    "quick150": 3,
+    "paper": 1,
+    "quick150": 1,
     "test": 1,
 }
 
@@ -40,7 +40,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="quick150",
         help="Run scale. Defaults to the project reproduction scale quick150.",
     )
-    parser.add_argument("--num-seeds", type=int, default=None, help="Number of setting/seed trajectories.")
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=None,
+        help="Number of seeds; every selected setting runs once for each seed.",
+    )
     parser.add_argument("--seed-start", type=int, default=0, help="First seed in the contiguous seed list.")
     parser.add_argument("--iterations", type=int, default=None, help="Active-learning iterations per trajectory.")
     parser.add_argument("--num-samples", type=int, default=None, help="Initial multi-objective dataset size.")
@@ -63,6 +68,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _ensure_requested_device_available(device: str) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         raise EnvironmentError("Requested --device cuda, but torch.cuda.is_available() is false.")
+
+
+def resolve_seed_list(
+    preset: Figure5RunScale,
+    num_seeds: int | None,
+    seed_start: int,
+) -> list[int]:
+    """Resolve the default single seed or an explicit contiguous seed range."""
+
+    resolved_num_seeds = PRESET_NUM_SEEDS[preset] if num_seeds is None else int(num_seeds)
+    if resolved_num_seeds <= 0:
+        raise ValueError("num_seeds must be positive")
+    return list(range(int(seed_start), int(seed_start) + resolved_num_seeds))
 
 
 def _write_manifest(
@@ -117,10 +135,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         sa_sweeps=args.sa_sweeps,
     )
     _ensure_requested_device_available(config.device)
-    num_seeds = PRESET_NUM_SEEDS[args.preset] if args.num_seeds is None else int(args.num_seeds)
-    if num_seeds <= 0:
-        raise ValueError("num_seeds must be positive")
-    seed_list = list(range(args.seed_start, args.seed_start + num_seeds))
+    seed_list = resolve_seed_list(args.preset, args.num_seeds, args.seed_start)
     LOGGER.info(
         "Resolved Figure 5 config=%s seeds=%s settings=%s resume=%s",
         json.dumps(config.to_dict(), sort_keys=True),
@@ -163,4 +178,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["PRESET_NUM_SEEDS", "main", "parse_args"]
+__all__ = ["PRESET_NUM_SEEDS", "main", "parse_args", "resolve_seed_list"]

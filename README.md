@@ -216,10 +216,13 @@ Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 
 | preset | initial samples | iterations | direct one-hot levels | Optuna trials | SA reads | SA sweeps | default seeds |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `test` | 10 | 2 | 8 | 0 | 2 | 6 | 1 |
-| `quick150` | 500 | 150 | 25 | 3 | 100 | 500 | 3 |
-| `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 20 |
+| `quick150` | 500 | 150 | 25 | 3 | 100 | 500 | 1 |
+| `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 1 |
 
 - `quick150` 保留论文规模的 500 条初始数据和 25-level 直接编码，将 active-learning 迭代缩短到 150，并降低 Optuna 和 SA 预算。
+- Figure 5 不做 Figure 4 式的默认多 seed 统计；三个 preset 都默认只使用 seed 0。
+- 一次默认实验共运行两条 trajectory：`w_ddts + seed 0` 和 `wo_ddts + seed 0`，两者使用同一份初始数据。
+- `--num-seeds` 和 `--seed-start` 仅用于用户主动执行额外稳定性实验；`N` 个 seeds 与两个 settings 会产生 `2 * N` 条 trajectory。
 - `quick150` 的 summary、Pareto front 和 Figure 5 图是本项目的正式复现产物。
 - `paper` 不进入实际运行、结果验收或输出交付范围。
 - CLI 数值参数应能覆盖 preset，与 Figure 4 runner 的规则保持一致。
@@ -426,6 +429,19 @@ python figure5_runner.py `
   --settings w_ddts wo_ddts
 ```
 
+可选的多 seed 稳定性实验（非论文 Figure 5 默认流程）：
+
+```powershell
+python figure5_runner.py `
+  --output-dir figure5_quick150_multiseed `
+  --device cuda `
+  --resume `
+  --preset quick150 `
+  --num-seeds 3 `
+  --seed-start 0 `
+  --settings w_ddts wo_ddts
+```
+
 下列绘图命令是待实现的目标接口，当前尚不可执行：
 
 ```powershell
@@ -451,7 +467,7 @@ Figure 5 代码落地后，至少需要通过：
    - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema；绘图验收留到 `plot_figure5.py` 实现后。
 3. `quick150` 正式复现输出验收：
    - `figure5_summary.json` 中包含 `w_ddts` 与 `wo_ddts` 两个 setting。
-   - 每个 setting 完成 3 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
+   - 每个 setting 完成 1 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
    - `pareto_front.w_ddts` 和 `pareto_front.wo_ddts` 非空。
    - `figure5.png` 包含全局采样图和分段采样图。
 
