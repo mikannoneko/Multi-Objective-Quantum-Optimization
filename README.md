@@ -169,7 +169,7 @@ python plot_figure4.py `
 - 已实现 `figure5_scalarization.py`：支持论文式 DDTS 人工目标和 weighted-sum baseline 的三个独立 FM targets。
 - 已实现 `figure5_pareto.py`：支持 `is_dominated` 和 `pareto_front`。
 - 已实现 Figure 5 pipeline、`test/quick150/paper` 配置、checkpoint/resume、summary schema v1、manifest 和 runner。
-- 尚未实现 `plot_figure5.py`。
+- 已实现 `plot_figure5.py`：支持单 seed 3D Pareto 总览、分段采样进展、可选 replacement 叠加和多 seed 显式选择。
 - Figure 5 不应复用 Figure 4 的 `best_so_far` 单目标曲线作为核心结果；它比较的是多目标优化中采样到的解在三维目标空间中的覆盖情况。
 
 ### Figure 5 当前代码结构
@@ -181,14 +181,12 @@ python plot_figure4.py `
 - `figure5_pipeline.py`：运行两条多目标 trajectory，处理 FM/QUBO/SA、decode、replacement、resume 和 Pareto summary。
 - `figure5_outputs.py`：定义 Figure 5 输出布局、checkpoint schema v1、原子 JSON 写入和日志。
 - `figure5_runner.py`：解析 CLI、检查 CUDA、运行 pipeline 并写 manifest。
+- `plot_figure5.py`：校验 summary schema v1，按 seed 重算 Pareto front，并绘制总览和时间窗图。
 - `test_alloy_dataset_generator.py`：覆盖多目标初始数据生成。
 - `test_figure5_scalarization.py`：覆盖 weighted-sum、DDTS、权重采样和输入校验。
 - `test_figure5_pareto.py`：覆盖支配方向、相同点、折中点、非凸点和非法输入。
 - `test_figure5_pipeline.py`：覆盖 preset、一/三 FM 分支、QUBO 合并、replacement、resume、summary 和 manifest。
-
-### Figure 5 待新增代码结构
-
-- `plot_figure5.py`：读取 Figure 5 summary，绘制 3D objective space、Pareto front 和分段采样图。
+- `test_plot_figure5.py`：覆盖 seed 选择、Pareto front 重算、时间窗、输入校验和 PNG 输出。
 
 ### Figure 5 目标
 
@@ -371,14 +369,13 @@ checkpoint 中必须保存：
 - 当前 setting、seed、config。
 - 最近一轮 weights、utopian point、FM metadata 和 QUBO stats。
 
-### Figure 5 绘图目标
+### Figure 5 绘图
 
-`plot_figure5.py` 应生成一个接近论文 Figure 5 的 2x2 图：
+`plot_figure5.py` 生成接近论文 Figure 5 的三行布局：
 
-1. panel a：`w_ddts` 全部采样点和 Pareto front。
-2. panel b：`wo_ddts` 全部采样点和 Pareto front。
-3. panel c：`w_ddts` 按迭代区间分段的采样进展。
-4. panel d：`wo_ddts` 按迭代区间分段的采样进展。
+1. 顶部 panel a/b：`w_ddts` 与 `wo_ddts` 的全部 proposed QUBO solutions 和 Pareto front。
+2. 中部 panel c：`w_ddts` 按迭代区间横向排列的采样进展。
+3. 底部 panel d：`wo_ddts` 按迭代区间横向排列的采样进展。
 
 本项目 `quick150` 正式结果的默认分段：
 
@@ -388,7 +385,7 @@ checkpoint 中必须保存：
 100-150
 ```
 
-`paper` 参数对照的分段为 `0-250`、`250-500`、`500-750`、`750-1000`，但本项目不生成该规模图。
+`paper` 参数对照的分段为 `0-250`、`250-500`、`500-750`、`750-1000`，但本项目不生成该规模图。其他迭代规模自动划分为最多四个近似等宽时间窗，也可用 `--iteration-boundaries` 覆盖。
 
 坐标轴：
 
@@ -403,7 +400,10 @@ z = rho
 - 灰色点：该 setting 找到的所有候选设计。
 - 蓝色点：该 setting 的 Pareto front。
 - 分段图用不同颜色表示迭代区间。
-- random replacement 可以保存在 summary 中，但论文图中默认只画 QO/SA 找到的最佳 alloy designs；是否显示 replacement 应由 `plot_figure5.py` CLI 参数控制。
+- 单 seed summary 自动选择唯一 seed；多 seed summary 必须通过 `--seed` 选择一条 trajectory，不做跨 seed 聚合。
+- 绘图时针对选定 seed 和每个 setting 重新计算 Pareto front，不使用多 seed summary 中的联合 front。
+- random replacement 默认不显示，也不参与 Pareto front；传入 `--include-replacements` 后以橙色 `x` 叠加。
+- 所有 3D panel 使用相同的坐标范围、视角和单位，重复 proposed solution 保留且 Pareto 点不连线。
 
 ### Figure 5 运行命令
 
@@ -442,12 +442,31 @@ python figure5_runner.py `
   --settings w_ddts wo_ddts
 ```
 
-下列绘图命令是待实现的目标接口，当前尚不可执行：
+生成正式 Figure 5 图：
 
 ```powershell
 python plot_figure5.py `
   --summary figure5_quick150\figure5_summary.json `
   --output figure5_quick150\figure5.png
+```
+
+显示 random replacement 并自定义时间窗：
+
+```powershell
+python plot_figure5.py `
+  --summary figure5_quick150\figure5_summary.json `
+  --output figure5_quick150\figure5_with_replacements.png `
+  --include-replacements `
+  --iteration-boundaries 0 30 75 110 150
+```
+
+绘制多 seed 实验中的指定 seed：
+
+```powershell
+python plot_figure5.py `
+  --summary figure5_quick150_multiseed\figure5_summary.json `
+  --output figure5_quick150_multiseed\figure5_seed_1.png `
+  --seed 1
 ```
 
 `paper` preset 仅作为论文参数参考保留，本项目不安排运行或绘图。
@@ -464,7 +483,8 @@ Figure 5 代码落地后，至少需要通过：
    - checkpoint resume 不重复迭代、不丢失已有 solution records。
 2. 小规模端到端验收：
    - `figure5_runner.py --preset test --settings w_ddts wo_ddts` 能生成 summary、manifest、日志和 checkpoint。
-   - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema；绘图验收留到 `plot_figure5.py` 实现后。
+   - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema。
+   - synthetic summary 能生成非空、非纯色 PNG，并写入 `logs/plot_figure5.log`。
 3. `quick150` 正式复现输出验收：
    - `figure5_summary.json` 中包含 `w_ddts` 与 `wo_ddts` 两个 setting。
    - 每个 setting 完成 1 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
@@ -478,5 +498,5 @@ Figure 5 代码落地后，至少需要通过：
 3. 已完成：新增 `figure5_pareto.py` 和 `test_figure5_pareto.py`。
 4. 已完成：新增 `figure5_pipeline.py`，复用 Figure 4 的 FM/QUBO/SA/decode/replacement。
 5. 已完成：新增 `figure5_experiment_config.py`、`figure5_runner.py` 和 `figure5_outputs.py`，实现 preset、checkpoint、manifest、summary 和日志。
-6. 待实现：新增 `plot_figure5.py`。
+6. 已完成：新增 `plot_figure5.py` 和 `test_plot_figure5.py`。
 7. 待执行：先用 `preset test` 验收，再用 `preset quick150` 产出本项目正式复现结果；不运行 `preset paper`。
