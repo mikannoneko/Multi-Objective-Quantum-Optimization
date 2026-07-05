@@ -22,6 +22,7 @@ from figure5_scalarization import FIGURE5_OBJECTIVES
 
 SUMMARY_SCHEMA_VERSION = 1
 FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
+FIGURE5_AXIS_OBJECTIVES = ("kappa", "rho", "E")
 SETTING_LABELS = {"w_ddts": "w/ DDTS", "wo_ddts": "w/o DDTS"}
 ALL_SOLUTION_COLOR = "#858b94"
 PARETO_COLOR = "#1769aa"
@@ -265,9 +266,11 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
 
 
 def _point_arrays(points: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return x/y/z values in the axis order used by the paper's Figure 5."""
+
     return tuple(
         np.asarray([float(point[objective]) for point in points], dtype=np.float64)
-        for objective in FIGURE5_OBJECTIVES
+        for objective in FIGURE5_AXIS_OBJECTIVES
     )  # type: ignore[return-value]
 
 
@@ -288,11 +291,11 @@ def _plot_limits(data: Figure5PlotData, include_replacements: bool) -> dict[str,
 
 def _configure_axis(axis: Any, limits: Mapping[str, tuple[float, float]], compact: bool = False) -> None:
     axis.set_xlim(*limits["kappa"])
-    axis.set_ylim(*limits["E"])
-    axis.set_zlim(*limits["rho"])
+    axis.set_ylim(*limits["rho"])
+    axis.set_zlim(*limits["E"])
     axis.set_xlabel(r"$\kappa$ [W m$^{-1}$ K$^{-1}$]", fontsize=7 if compact else 9, labelpad=2)
-    axis.set_ylabel(r"$E$ [GPa]", fontsize=7 if compact else 9, labelpad=2)
-    axis.set_zlabel(r"$\rho$ [g cm$^{-3}$]", fontsize=7 if compact else 9, labelpad=2)
+    axis.set_ylabel(r"$\rho$ [g cm$^{-3}$]", fontsize=7 if compact else 9, labelpad=2)
+    axis.set_zlabel(r"$E$ [GPa]", fontsize=7 if compact else 9, labelpad=2)
     axis.tick_params(labelsize=6 if compact else 8, pad=0)
     axis.view_init(elev=22, azim=-55)
     axis.grid(True, alpha=0.25)
@@ -490,6 +493,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "FIGURE5_AXIS_OBJECTIVES",
     "Figure5PlotData",
     "default_iteration_boundaries",
     "load_figure5_plot_data",

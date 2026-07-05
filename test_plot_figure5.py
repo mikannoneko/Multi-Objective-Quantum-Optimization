@@ -6,10 +6,13 @@ import unittest
 from pathlib import Path
 
 import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
 import numpy as np
 
+import plot_figure5 as plot_module
 from figure5_outputs import figure5_output_layout
 from plot_figure5 import (
+    FIGURE5_AXIS_OBJECTIVES,
     default_iteration_boundaries,
     load_figure5_plot_data,
     parse_args,
@@ -100,6 +103,28 @@ def _write_summary(name: str, payload: dict[str, object]) -> Path:
 
 
 class PlotFigure5Tests(unittest.TestCase):
+    def test_paper_axis_order_maps_kappa_rho_and_e(self) -> None:
+        point = _point("w_ddts", 0, 0, kappa=101.0, e_value=73.0, rho=2.8)
+        x_values, y_values, z_values = plot_module._point_arrays([point])
+
+        self.assertEqual(FIGURE5_AXIS_OBJECTIVES, ("kappa", "rho", "E"))
+        np.testing.assert_array_equal(x_values, [101.0])
+        np.testing.assert_array_equal(y_values, [2.8])
+        np.testing.assert_array_equal(z_values, [73.0])
+
+        figure = plt.figure()
+        axis = figure.add_subplot(111, projection="3d")
+        try:
+            limits = {"kappa": (90.0, 120.0), "rho": (2.5, 3.2), "E": (65.0, 85.0)}
+            plot_module._configure_axis(axis, limits)
+            self.assertEqual(axis.get_xlim(), limits["kappa"])
+            self.assertEqual(axis.get_ylim(), limits["rho"])
+            self.assertEqual(axis.get_zlim(), limits["E"])
+            self.assertIn(r"\rho", axis.get_ylabel())
+            self.assertIn("$E$", axis.get_zlabel())
+        finally:
+            plt.close(figure)
+
     def test_default_and_custom_iteration_boundaries(self) -> None:
         self.assertEqual(default_iteration_boundaries(150), (0, 50, 100, 150))
         self.assertEqual(default_iteration_boundaries(1000), (0, 250, 500, 750, 1000))

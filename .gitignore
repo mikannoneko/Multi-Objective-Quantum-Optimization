@@ -17,6 +17,9 @@ env_*/
 # Codex/local workspace metadata
 .codex/
 
+# references paper
+references
+
 # Temporary outputs
 .tmp_test/
 

@@ -1,6 +1,27 @@
 # 合金 Figure 4 / Figure 5 复现工作流
 
-本文档按复现目标拆成两部分：第一部分记录 Figure 4 单目标复现的当前实现、代码结构和运行方法；第二部分记录 Figure 5 多目标复现的当前实现进度、待实现模块和目标工作流。
+本文档按复现目标拆成两部分：第一部分记录 Figure 4 单目标复现的当前实现、代码结构和运行方法；第二部分记录 Figure 5 多目标复现的当前实现、代码结构和运行方法。
+
+## 项目复现定位与运行环境
+
+本项目不追求论文完整计算规模或逐点数值复现，目标是复现 Figure 4/5 的核心算法流程，并在可接受的计算预算下验证论文报告的定性趋势：
+
+- `test`：单元测试和烟测规模，只验证代码路径、schema、checkpoint 和绘图，不用于趋势结论。
+- `quick_l50` / `quick150`：项目实际运行规模，用于流程复现和定性趋势验证，不应解释为论文规模结果。
+- `paper`：保留论文参数作为对照，不在本项目中实际运行，也不属于验收或交付范围。
+
+论文补充材料使用老旧的 `fastFM + ALS`。当前 Conda 环境 `env_torch` 不提供可运行的 `fastFM`，因此项目使用 PyTorch 二阶 FM 和 LBFGS 作为工程替代，保留 rank 6、最多 2000 training steps、target z-score、Optuna 调参和 FM-to-QUBO 流程。训练后端和优化器与论文不同，因此不保证 active-learning trajectory 或最终数值与论文一致。
+
+所有命令通过 Conda 环境 `env_torch` 运行。当前工作区验证环境为 Python 3.9.21、PyTorch 1.9.1+cu111，CUDA 可用；可用下列命令重新检查当前机器状态：
+
+```powershell
+conda run -n env_torch python -c "import importlib.util, sys, torch; print(sys.executable); print(sys.version); print(torch.__version__); print('CUDA:', torch.cuda.is_available()); print('fastFM:', importlib.util.find_spec('fastFM'))"
+```
+
+输出目录约定：
+
+- 单元测试和 synthetic 绘图产生的临时文件统一写入工作区 `.tmp_test/`；该目录被 Git 忽略，可以安全删除并由测试重新生成。
+- 用户运行 `figure4_runner.py`、`figure5_runner.py` 和绘图脚本时，输出写入命令指定的工作区目录，例如 `figure4_compare_quick_l50/` 或 `figure5_quick150/`，不会重定向到 `.tmp_test/`。
 
 ## 第一部分：Figure 4 复现
 
@@ -48,9 +69,9 @@
 ### Figure 4 配置规则
 
 - preset 包括 `paper`、`quick_l50`、`test`。
-- `paper`：`num_samples=100`，`iterations=600`，`num_levels=50`，`optuna_trials=20`，`sa_runs=1000`，`sa_sweeps=3000`；默认 seed 数是 20。
-- `quick_l50`：`num_samples=100`，`iterations=100`，`num_levels=50`，`optuna_trials=3`，`sa_runs=100`，`sa_sweeps=500`；默认 seed 数是 3。
-- `test`：`num_samples=10`，`iterations=2`，`num_levels=8`，`optuna_trials=0`，`sa_runs=2`，`sa_sweeps=6`；默认 seed 数是 1。
+- `paper`（论文参数参考，不运行）：`num_samples=100`，`iterations=600`，`num_levels=50`，`optuna_trials=20`，`sa_runs=1000`，`sa_sweeps=3000`；默认 seed 数是 20。
+- `quick_l50`（流程复现和趋势验证）：`num_samples=100`，`iterations=100`，`num_levels=50`，`optuna_trials=3`，`sa_runs=100`，`sa_sweeps=500`；默认 seed 数是 3。
+- `test`（烟测）：`num_samples=10`，`iterations=2`，`num_levels=8`，`optuna_trials=0`，`sa_runs=2`，`sa_sweeps=6`；默认 seed 数是 1。
 - CLI 数值参数会覆盖 preset，例如 `--iterations`、`--num-levels`、`--optuna-trials`、`--sa-runs`、`--sa-sweeps`。
 - `--settings` 必填，可选值是 `wo_cgfm` 和 `w_cgfm`。
 - `--objectives` 可选；不传时按 `figure4_experiment_config.OBJECTIVES` 的 canonical 顺序运行全部五个 objective。
@@ -61,10 +82,10 @@
 
 ### Figure 4 运行方法
 
-推荐用 `quick_l50` 同时运行两条曲线：
+推荐用 `quick_l50` 同时运行两条曲线，作为 Figure 4 流程复现和定性趋势验证：
 
 ```powershell
-python figure4_runner.py `
+conda run -n env_torch python figure4_runner.py `
   --output-dir figure4_compare_quick_l50 `
   --device cuda `
   --resume `
@@ -75,7 +96,7 @@ python figure4_runner.py `
 只运行 `w/o CGFM`：
 
 ```powershell
-python figure4_runner.py `
+conda run -n env_torch python figure4_runner.py `
   --output-dir figure4_wo_cgfm_quick_l50 `
   --device cuda `
   --resume `
@@ -86,7 +107,7 @@ python figure4_runner.py `
 只运行 `w/ CGFM`：
 
 ```powershell
-python figure4_runner.py `
+conda run -n env_torch python figure4_runner.py `
   --output-dir figure4_w_cgfm_quick_l50 `
   --device cuda `
   --resume `
@@ -97,7 +118,7 @@ python figure4_runner.py `
 画单个 summary：
 
 ```powershell
-python plot_figure4.py `
+conda run -n env_torch python plot_figure4.py `
   --summary figure4_compare_quick_l50\figure4_summary.json `
   --output figure4_compare_quick_l50\figure4.png
 ```
@@ -105,7 +126,7 @@ python plot_figure4.py `
 合并分别运行得到的两个 summary 画图：
 
 ```powershell
-python plot_figure4.py `
+conda run -n env_torch python plot_figure4.py `
   --summary figure4_wo_cgfm_quick_l50\figure4_summary.json figure4_w_cgfm_quick_l50\figure4_summary.json `
   --output figure4_compare_quick_l50\figure4.png
 ```
@@ -140,13 +161,13 @@ python plot_figure4.py `
 运行完整单元测试：
 
 ```powershell
-python -m unittest discover -v
+conda run -n env_torch python -m unittest discover -v
 ```
 
 运行 Figure 4 小规模验收：
 
 ```powershell
-python figure4_runner.py `
+conda run -n env_torch python figure4_runner.py `
   --output-dir figure4_refactor_test `
   --device cuda `
   --resume `
@@ -156,7 +177,7 @@ python figure4_runner.py `
 ```
 
 ```powershell
-python plot_figure4.py `
+conda run -n env_torch python plot_figure4.py `
   --summary figure4_refactor_test\figure4_summary.json `
   --output figure4_refactor_test\figure4.png
 ```
@@ -200,7 +221,7 @@ python plot_figure4.py `
   - active learning：`iterations=1000`。
   - 编码：按论文 Figure 5 使用四相直接 one-hot 编码，4 个 block，每个 block `num_levels=25`，并加入 system penalty。
   - QUBO 求解：复用 D-Wave Ocean `neal` simulated annealing。
-- 由于论文规模运行时间过长，本项目仅保留 `paper` 参数用于对照，不尝试实际运行；实际复现输出以 `quick150` 为准。
+- 由于论文规模运行时间过长，本项目仅保留 `paper` 参数用于对照，不尝试实际运行；项目流程复现和趋势验证输出以 `quick150` 为准。
 - 输出重点不是单目标 best-so-far，而是：
   - 每次迭代采样到的合金设计。
   - 每个设计的 `kappa/E/rho` 真实值。
@@ -209,7 +230,7 @@ python plot_figure4.py `
 
 ### Figure 5 配置规模
 
-Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 是本项目实际复现和产出结果的正式规模；`test` 只用于小规模端到端验收，`paper` 只保留论文原始规模参数供对照。
+Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 是本项目实际运行的流程复现和趋势验证规模；`test` 只用于小规模端到端验收，`paper` 只保留论文原始规模参数供对照。
 
 | preset | initial samples | iterations | direct one-hot levels | Optuna trials | SA reads | SA sweeps | default seeds |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -221,7 +242,7 @@ Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 
 - Figure 5 不做 Figure 4 式的默认多 seed 统计；三个 preset 都默认只使用 seed 0。
 - 一次默认实验共运行两条 trajectory：`w_ddts + seed 0` 和 `wo_ddts + seed 0`，两者使用同一份初始数据。
 - `--num-seeds` 和 `--seed-start` 仅用于用户主动执行额外稳定性实验；`N` 个 seeds 与两个 settings 会产生 `2 * N` 条 trajectory。
-- `quick150` 的 summary、Pareto front 和 Figure 5 图是本项目的正式复现产物。
+- `quick150` 的 summary、Pareto front 和 Figure 5 图是本项目的流程复现和趋势验证产物，不代表论文完整规模结果。
 - `paper` 不进入实际运行、结果验收或输出交付范围。
 - CLI 数值参数应能覆盖 preset，与 Figure 4 runner 的规则保持一致。
 
@@ -377,7 +398,7 @@ checkpoint 中必须保存：
 2. 中部 panel c：`w_ddts` 按迭代区间横向排列的采样进展。
 3. 底部 panel d：`wo_ddts` 按迭代区间横向排列的采样进展。
 
-本项目 `quick150` 正式结果的默认分段：
+本项目 `quick150` 趋势验证结果的默认分段：
 
 ```text
 0-50
@@ -391,8 +412,8 @@ checkpoint 中必须保存：
 
 ```text
 x = kappa
-y = E
-z = rho
+y = rho
+z = E
 ```
 
 绘图规则：
@@ -410,7 +431,7 @@ z = rho
 小规模验收：
 
 ```powershell
-python figure5_runner.py `
+conda run -n env_torch python figure5_runner.py `
   --output-dir figure5_test `
   --device cuda `
   --resume `
@@ -418,10 +439,10 @@ python figure5_runner.py `
   --settings w_ddts wo_ddts
 ```
 
-本项目正式复现运行：
+本项目流程复现和趋势验证运行：
 
 ```powershell
-python figure5_runner.py `
+conda run -n env_torch python figure5_runner.py `
   --output-dir figure5_quick150 `
   --device cuda `
   --resume `
@@ -432,7 +453,7 @@ python figure5_runner.py `
 可选的多 seed 稳定性实验（非论文 Figure 5 默认流程）：
 
 ```powershell
-python figure5_runner.py `
+conda run -n env_torch python figure5_runner.py `
   --output-dir figure5_quick150_multiseed `
   --device cuda `
   --resume `
@@ -442,10 +463,10 @@ python figure5_runner.py `
   --settings w_ddts wo_ddts
 ```
 
-生成正式 Figure 5 图：
+生成项目 Figure 5 趋势验证图：
 
 ```powershell
-python plot_figure5.py `
+conda run -n env_torch python plot_figure5.py `
   --summary figure5_quick150\figure5_summary.json `
   --output figure5_quick150\figure5.png
 ```
@@ -453,7 +474,7 @@ python plot_figure5.py `
 显示 random replacement 并自定义时间窗：
 
 ```powershell
-python plot_figure5.py `
+conda run -n env_torch python plot_figure5.py `
   --summary figure5_quick150\figure5_summary.json `
   --output figure5_quick150\figure5_with_replacements.png `
   --include-replacements `
@@ -463,7 +484,7 @@ python plot_figure5.py `
 绘制多 seed 实验中的指定 seed：
 
 ```powershell
-python plot_figure5.py `
+conda run -n env_torch python plot_figure5.py `
   --summary figure5_quick150_multiseed\figure5_summary.json `
   --output figure5_quick150_multiseed\figure5_seed_1.png `
   --seed 1
@@ -485,7 +506,7 @@ Figure 5 代码落地后，至少需要通过：
    - `figure5_runner.py --preset test --settings w_ddts wo_ddts` 能生成 summary、manifest、日志和 checkpoint。
    - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema。
    - synthetic summary 能生成非空、非纯色 PNG，并写入 `logs/plot_figure5.log`。
-3. `quick150` 正式复现输出验收：
+3. `quick150` 流程复现和趋势验证输出验收：
    - `figure5_summary.json` 中包含 `w_ddts` 与 `wo_ddts` 两个 setting。
    - 每个 setting 完成 1 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
    - `pareto_front.w_ddts` 和 `pareto_front.wo_ddts` 非空。
@@ -499,4 +520,4 @@ Figure 5 代码落地后，至少需要通过：
 4. 已完成：新增 `figure5_pipeline.py`，复用 Figure 4 的 FM/QUBO/SA/decode/replacement。
 5. 已完成：新增 `figure5_experiment_config.py`、`figure5_runner.py` 和 `figure5_outputs.py`，实现 preset、checkpoint、manifest、summary 和日志。
 6. 已完成：新增 `plot_figure5.py` 和 `test_plot_figure5.py`。
-7. 待执行：先用 `preset test` 验收，再用 `preset quick150` 产出本项目正式复现结果；不运行 `preset paper`。
+7. 待执行：先用 `preset test` 验收，再用 `preset quick150` 产出本项目流程复现和趋势验证结果；不运行 `preset paper`。
