@@ -12,7 +12,22 @@
 
 论文补充材料使用老旧的 `fastFM + ALS`。当前 Conda 环境 `env_torch` 不提供可运行的 `fastFM`，因此项目使用 PyTorch 二阶 FM 和 LBFGS 作为工程替代，保留 rank 6、最多 2000 training steps、target z-score、Optuna 调参和 FM-to-QUBO 流程。训练后端和优化器与论文不同，因此不保证 active-learning trajectory 或最终数值与论文一致。
 
-所有命令通过 Conda 环境 `env_torch` 运行。当前工作区验证环境为 Python 3.9.21、PyTorch 1.9.1+cu111，CUDA 可用；可用下列命令重新检查当前机器状态：
+所有命令通过 Conda 环境 `env_torch` 运行。可复现环境文件已提供为 `environment.yml`，按当前工作区验证环境固定关键版本：Python 3.9、PyTorch 1.9.1、CUDA 11.1、NumPy 1.26.4、scikit-learn 1.6.1、Optuna 4.8.0、D-Wave `dimod` 0.12.21 和 `dwave-neal` 0.6.0。
+
+首次创建环境：
+
+```powershell
+conda env create -f environment.yml
+conda activate env_torch
+```
+
+如果 `env_torch` 已存在，可用下列命令按文件更新：
+
+```powershell
+conda env update -n env_torch -f environment.yml --prune
+```
+
+当前工作区验证环境为 Python 3.9.21、PyTorch 1.9.1+cu111，CUDA 可用；可用下列命令重新检查当前机器状态：
 
 ```powershell
 conda run -n env_torch python -c "import importlib.util, sys, torch; print(sys.executable); print(sys.version); print(torch.__version__); print('CUDA:', torch.cuda.is_available()); print('fastFM:', importlib.util.find_spec('fastFM'))"
