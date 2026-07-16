@@ -11,8 +11,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 
-RunScale = Literal["paper", "quick_l50", "test"]
-SUPPORTED_PRESETS: tuple[RunScale, ...] = ("paper", "quick_l50", "test")
+RunScale = Literal["paper", "quick", "test"]
+SUPPORTED_PRESETS: tuple[RunScale, ...] = ("paper", "quick", "test")
 
 
 @dataclass(frozen=True)
@@ -85,11 +85,11 @@ class FMConfig:
 class SAConfig:
     """Simulated annealing 求解配置，对应 D-Wave Ocean `neal` 的 reads 和 sweeps。"""
 
-    runs: int = 1000
+    reads: int = 1000
     sweeps: int = 3000
 
     def __post_init__(self) -> None:
-        _require_positive("sa_runs", self.runs)
+        _require_positive("sa_reads", self.reads)
         _require_positive("sa_sweeps", self.sweeps)
 
 
@@ -120,8 +120,8 @@ class ExperimentConfig:
         return self.fm.device
 
     @property
-    def sa_runs(self) -> int:
-        return self.sa.runs
+    def sa_reads(self) -> int:
+        return self.sa.reads
 
     @property
     def sa_sweeps(self) -> int:
@@ -136,13 +136,13 @@ def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
 
     if preset == "paper":
         return ExperimentConfig(fm=FMConfig(device=device))
-    if preset == "quick_l50":
+    if preset == "quick":
         return ExperimentConfig(
             num_samples=100,
             iterations=100,
             encoding=EncodingConfig(num_levels=50),
             fm=FMConfig(optuna_trials=3, device=device),
-            sa=SAConfig(runs=100, sweeps=500),
+            sa=SAConfig(reads=100, sweeps=500),
         )
     if preset == "test":
         return ExperimentConfig(
@@ -150,7 +150,7 @@ def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
             iterations=2,
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0, device=device),
-            sa=SAConfig(runs=2, sweeps=6),
+            sa=SAConfig(reads=32, sweeps=12),
         )
     raise ValueError(f"Unsupported preset {preset!r}. Choices: {', '.join(SUPPORTED_PRESETS)}")
 
@@ -163,7 +163,7 @@ def resolve_experiment_config(
     iterations: int | None = None,
     num_levels: int | None = None,
     optuna_trials: int | None = None,
-    sa_runs: int | None = None,
+    sa_reads: int | None = None,
     sa_sweeps: int | None = None,
 ) -> ExperimentConfig:
     """先解析 preset，再应用 CLI override，得到 runner 实际执行的配置。"""
@@ -179,11 +179,11 @@ def resolve_experiment_config(
         config = replace(config, encoding=EncodingConfig(num_levels=int(num_levels)))
     if optuna_trials is not None:
         config = replace(config, fm=replace(config.fm, optuna_trials=int(optuna_trials)))
-    if sa_runs is not None or sa_sweeps is not None:
+    if sa_reads is not None or sa_sweeps is not None:
         config = replace(
             config,
             sa=SAConfig(
-                runs=config.sa.runs if sa_runs is None else int(sa_runs),
+                reads=config.sa.reads if sa_reads is None else int(sa_reads),
                 sweeps=config.sa.sweeps if sa_sweeps is None else int(sa_sweeps),
             ),
         )

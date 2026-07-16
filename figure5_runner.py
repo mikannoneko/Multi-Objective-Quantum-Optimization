@@ -12,21 +12,26 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-import torch
-
 from figure5_experiment_config import (
     SUPPORTED_PRESETS,
+    Figure5ExperimentConfig,
     Figure5RunScale,
     resolve_experiment_config,
 )
 from figure5_outputs import Figure5OutputLayout, configure_file_logging_path, figure5_output_layout, write_json_atomic
-from figure5_pipeline import SUPPORTED_SETTINGS, ensure_training_dependencies, run_figure5_experiment
+from figure5_pipeline import (
+    SUPPORTED_SETTINGS,
+    ensure_training_dependencies,
+    run_figure5_experiment,
+    validate_settings,
+)
+from experiment_runtime import collect_runtime_metadata, ensure_compute_device_available, resolve_contiguous_seeds
 
 
 LOGGER = logging.getLogger(__name__)
 PRESET_NUM_SEEDS: dict[Figure5RunScale, int] = {
     "paper": 1,
-    "quick150": 1,
+    "quick": 1,
     "test": 1,
 }
 
@@ -37,8 +42,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--preset",
         choices=SUPPORTED_PRESETS,
-        default="quick150",
-        help="Run scale. Defaults to the project reproduction scale quick150.",
+        default="quick",
+        help="Run scale. Defaults to the project workflow scale quick.",
     )
     parser.add_argument(
         "--num-seeds",
@@ -51,7 +56,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=None, help="Initial multi-objective dataset size.")
     parser.add_argument("--num-levels", type=int, default=None, help="Direct one-hot levels per phase block.")
     parser.add_argument("--optuna-trials", type=int, default=None, help="Optuna trials per FM training.")
-    parser.add_argument("--sa-runs", type=int, default=None, help="Simulated annealing read count.")
+    parser.add_argument(
+        "--sa-reads",
+        "--sa-runs",
+        dest="sa_reads",
+        type=int,
+        default=None,
+        help="Simulated annealing read count (--sa-runs is a compatibility alias).",
+    )
     parser.add_argument("--sa-sweeps", type=int, default=None, help="Simulated annealing sweep count.")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="PyTorch execution device.")
     parser.add_argument("--resume", action="store_true", help="Resume matching trajectory checkpoints.")
@@ -65,11 +77,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _ensure_requested_device_available(device: str) -> None:
-    if device == "cuda" and not torch.cuda.is_available():
-        raise EnvironmentError("Requested --device cuda, but torch.cuda.is_available() is false.")
-
-
 def resolve_seed_list(
     preset: Figure5RunScale,
     num_seeds: int | None,
@@ -77,30 +84,23 @@ def resolve_seed_list(
 ) -> list[int]:
     """Resolve the default single seed or an explicit contiguous seed range."""
 
-    resolved_num_seeds = PRESET_NUM_SEEDS[preset] if num_seeds is None else int(num_seeds)
-    if resolved_num_seeds <= 0:
-        raise ValueError("num_seeds must be positive")
-    return list(range(int(seed_start), int(seed_start) + resolved_num_seeds))
+    return resolve_contiguous_seeds(PRESET_NUM_SEEDS[preset], num_seeds, seed_start)
 
 
 def _write_manifest(
     *,
     output_layout: Figure5OutputLayout,
     args: argparse.Namespace,
-    resolved_config: object,
+    resolved_config: Figure5ExperimentConfig,
     seed_list: list[int],
     settings: list[str],
 ) -> Path:
-    config_dict = resolved_config.to_dict()  # type: ignore[attr-defined]
+    config_dict = resolved_config.to_dict()
+    workspace_root = Path(__file__).resolve().parent
     manifest = {
         "command": [sys.executable, *sys.argv],
         "preset": args.preset,
-        "python_executable": sys.executable,
-        "python_version": sys.version,
-        "torch_version": torch.__version__,
-        "cuda_available": bool(torch.cuda.is_available()),
-        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
-        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "runtime": collect_runtime_metadata(workspace_root, "references/paper_2512_11479.pdf"),
         "resolved_config": config_dict,
         "output_paths": {
             "root": str(output_layout.root),
@@ -124,6 +124,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     log_path = configure_file_logging_path(output_layout.runner_log_path)
     LOGGER.info("Starting Figure 5 runner")
     ensure_training_dependencies()
+    selected_settings = validate_settings(args.settings)
     config = resolve_experiment_config(
         preset=args.preset,
         device=args.device,
@@ -131,16 +132,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         iterations=args.iterations,
         num_levels=args.num_levels,
         optuna_trials=args.optuna_trials,
-        sa_runs=args.sa_runs,
+        sa_reads=args.sa_reads,
         sa_sweeps=args.sa_sweeps,
     )
-    _ensure_requested_device_available(config.device)
+    ensure_compute_device_available(config.device)
     seed_list = resolve_seed_list(args.preset, args.num_seeds, args.seed_start)
     LOGGER.info(
         "Resolved Figure 5 config=%s seeds=%s settings=%s resume=%s",
         json.dumps(config.to_dict(), sort_keys=True),
         seed_list,
-        list(args.settings),
+        list(selected_settings),
         bool(args.resume),
     )
 
@@ -149,14 +150,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         args=args,
         resolved_config=config,
         seed_list=seed_list,
-        settings=list(args.settings),
+        settings=list(selected_settings),
     )
     summary = run_figure5_experiment(
         seed_list=seed_list,
         config=config,
         output_dir=args.output_dir,
         resume=args.resume,
-        settings=args.settings,
+        settings=selected_settings,
     )
     LOGGER.info("Finished Figure 5 runner summary=%s manifest=%s", output_layout.summary_path, manifest_path)
     print(
@@ -164,7 +165,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "output_dir": str(args.output_dir),
                 "preset": args.preset,
-                "settings": list(args.settings),
+                "settings": list(selected_settings),
                 "training_backend": summary.training_backend,
                 "manifest": str(manifest_path),
                 "log": str(log_path),

@@ -16,7 +16,7 @@ else:
     Figure4Setting = str
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 SUMMARY_FILENAME = "figure4_summary.json"
 MANIFEST_FILENAME = "manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure4.png"
@@ -100,7 +100,7 @@ def checkpoint_payload(
     state: object,
     config: ExperimentConfig,
 ) -> dict[str, Any]:
-    """构造 schema v2 checkpoint payload。
+    """构造 schema v3 checkpoint payload。
 
     checkpoint 绑定 objective、setting、seed 和 config；恢复时这些字段必须一致。
     """
@@ -115,8 +115,8 @@ def checkpoint_payload(
     }
 
 
-def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
-    """原子写入 checkpoint，避免长时间运行被中断时留下半截 JSON。"""
+def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> Path:
+    """原子写入 JSON，避免中断时留下半截文件。"""
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +124,12 @@ def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
     temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary_path.replace(output_path)
     return output_path
+
+
+def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
+    """原子写入 checkpoint。"""
+
+    return write_json_atomic(path, payload)
 
 
 def load_checkpoint(

@@ -100,4 +100,9 @@ def get_setting_strategy(setting: str) -> SettingStrategy:
 def validate_settings(settings: Sequence[str]) -> tuple[Figure4Setting, ...]:
     if not settings:
         raise ValueError("At least one setting is required.")
-    return tuple(get_setting_strategy(setting).name for setting in settings)
+    if any(not isinstance(setting, str) for setting in settings):
+        raise ValueError("Figure 4 settings must contain strings")
+    selected = tuple(get_setting_strategy(setting).name for setting in settings)
+    if len(set(selected)) != len(selected):
+        raise ValueError("Figure 4 settings must not contain duplicates")
+    return selected

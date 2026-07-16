@@ -8,8 +8,16 @@ from unittest import mock
 import numpy as np
 import torch
 
+import figure4_runner
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_single_objective
-from figure4_experiment_config import OBJECTIVES, EncodingConfig, ExperimentConfig, FMConfig, SAConfig, resolve_experiment_config
+from figure4_experiment_config import (
+    OBJECTIVES,
+    EncodingConfig,
+    ExperimentConfig,
+    FMConfig,
+    SAConfig,
+    resolve_experiment_config,
+)
 from figure4_fm_torch import TorchFMRegressor, fm_to_qubo
 from figure4_outputs import (
     CHECKPOINT_DIR_NAME,
@@ -29,6 +37,7 @@ from figure4_outputs import (
     write_checkpoint,
 )
 from figure4_pipeline import (
+    TrainingIterationResult,
     TrajectoryResult,
     aggregate_trajectory_results,
     discretize_rows_for_figure4,
@@ -38,6 +47,8 @@ from figure4_pipeline import (
 )
 from figure4_qubo_math import (
     QuboStats,
+    SASample,
+    SASamplingResult,
     build_one_hot_penalty_matrix,
     build_single_objective_qubo,
     build_system_penalty_matrix,
@@ -51,12 +62,39 @@ from figure4_qubo_math import (
     encode_single_objective_rows,
     evaluate_qubo_energy,
     prepare_discrete_composition,
+    select_lowest_energy_feasible_sample,
+    solve_qubo_with_sa,
     validate_candidate_composition,
 )
-from figure4_setting_strategies import get_setting_strategy
+from figure4_setting_strategies import get_setting_strategy, validate_settings
 
-WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test"
-WORKSPACE_TMP_ROOT.mkdir(exist_ok=True)
+WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test" / "figure4_schema_v3"
+WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _sampling_result(*states: np.ndarray) -> SASamplingResult:
+    return SASamplingResult(
+        samples=tuple(
+            SASample(np.asarray(state, dtype=np.float64), float(index))
+            for index, state in enumerate(states)
+        )
+    )
+
+
+def _training_result(config: ExperimentConfig, seed: int, iteration: int) -> TrainingIterationResult:
+    encoding = create_iteration_encoding(config.num_levels, seed + iteration, num_blocks=4)
+    candidate_bits = encode_single_objective_rows(
+        [build_dataset_row(0, seed, [1.0, 0.0, 0.0, 0.0])],
+        encoding,
+    )[0].astype(np.float64)
+    return TrainingIterationResult(
+        encoding=encoding,
+        candidate_bits=candidate_bits,
+        feasible_candidate_rank=1,
+        infeasible_sa_samples_skipped=0,
+        fm_metadata={"mock": True},
+        qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 4 * config.num_levels, 650.0),
+    )
 
 
 class Figure4PipelineTests(unittest.TestCase):
@@ -70,24 +108,63 @@ class Figure4PipelineTests(unittest.TestCase):
             EncodingConfig(num_levels=1)
         with self.assertRaisesRegex(ValueError, "iterations"):
             ExperimentConfig(iterations=0)
-        with self.assertRaisesRegex(ValueError, "sa_runs"):
-            SAConfig(runs=0, sweeps=1)
+        with self.assertRaisesRegex(ValueError, "sa_reads"):
+            SAConfig(reads=0, sweeps=1)
         with self.assertRaisesRegex(ValueError, "optuna_trials"):
             FMConfig(optuna_trials=-1)
 
-        quick = resolve_experiment_config(preset="quick_l50", device="cuda")
+        quick = resolve_experiment_config(preset="quick", device="cuda")
         self.assertEqual(quick.num_samples, 100)
         self.assertEqual(quick.iterations, 100)
         self.assertEqual(quick.num_levels, 50)
         self.assertEqual(quick.optuna_trials, 3)
-        self.assertEqual(quick.sa_runs, 100)
+        self.assertEqual(quick.sa_reads, 100)
         self.assertEqual(quick.sa_sweeps, 500)
         self.assertEqual(quick.device, "cuda")
 
-        overridden = resolve_experiment_config(preset="test", device="cpu", iterations=3, sa_runs=4)
+        overridden = resolve_experiment_config(preset="test", device="cpu", iterations=3, sa_reads=4)
         self.assertEqual(overridden.iterations, 3)
-        self.assertEqual(overridden.sa_runs, 4)
-        self.assertEqual(overridden.sa_sweeps, 6)
+        self.assertEqual(overridden.sa_reads, 4)
+        self.assertEqual(overridden.sa_sweeps, 12)
+
+        args = figure4_runner.parse_args(["--output-dir", "figure4_default", "--settings", "w_cgfm"])
+        self.assertEqual(args.preset, "quick")
+        alias_args = figure4_runner.parse_args(
+            ["--output-dir", "figure4_alias", "--settings", "w_cgfm", "--sa-runs", "7"]
+        )
+        self.assertEqual(alias_args.sa_reads, 7)
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            validate_settings(["w_cgfm", "w_cgfm"])
+
+        from experiment_runtime import validate_seed_list
+
+        self.assertEqual(validate_seed_list([0, np.int64(2)]), [0, 2])
+        for invalid_seeds in ([], [-1], [1, 1], [True]):
+            with self.subTest(invalid_seeds=invalid_seeds):
+                with self.assertRaises(ValueError):
+                    validate_seed_list(invalid_seeds)
+
+    def test_sa_batch_is_energy_sorted_and_feasible_selection_is_auditable(self) -> None:
+        q = np.asarray([[-1.0]], dtype=np.float64)
+        sampling = solve_qubo_with_sa(q, 0.0, reads=5, sweeps=10, seed=3)
+
+        self.assertEqual(sampling.num_samples, 5)
+        self.assertEqual(
+            [sample.energy for sample in sampling.samples],
+            sorted(sample.energy for sample in sampling.samples),
+        )
+        self.assertTrue(all(sample.state.shape == (1,) for sample in sampling.samples))
+
+        controlled = _sampling_result(np.asarray([0.0]), np.asarray([1.0]), np.asarray([0.0]))
+        selected = select_lowest_energy_feasible_sample(controlled, lambda state: bool(state[0] == 1.0))
+        self.assertEqual(selected.rank, 2)
+        self.assertEqual(selected.infeasible_samples_skipped, 1)
+        np.testing.assert_array_equal(selected.state, [1.0])
+
+        with self.assertRaisesRegex(RuntimeError, "No feasible"):
+            select_lowest_energy_feasible_sample(controlled, lambda _: False)
+        with self.assertRaisesRegex(ValueError, "reads"):
+            solve_qubo_with_sa(q, 0.0, reads=0, sweeps=1, seed=0)
 
     def test_checkpoint_manager_rules(self) -> None:
         from figure4_pipeline import TrajectoryState
@@ -97,7 +174,7 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=64, sweeps=12),
         )
         output_dir = WORKSPACE_TMP_ROOT / "checkpoint_rules"
         layout = figure4_output_layout(output_dir)
@@ -124,7 +201,7 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=6),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=64, sweeps=12),
         )
         with self.assertRaisesRegex(ValueError, "config"):
             load_checkpoint(path, objective=OBJECTIVES[0], seed=4, config=changed_config, setting="wo_cgfm")
@@ -143,7 +220,10 @@ class Figure4PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(classify_output_path(Path("figure4_quick_l50")), "protected_legacy")
-        self.assertEqual(classify_output_path(Path("figure4_cgfm_quick_l50") / CHECKPOINT_DIR_NAME), "protected_legacy")
+        self.assertEqual(
+            classify_output_path(Path("figure4_cgfm_quick_l50") / CHECKPOINT_DIR_NAME),
+            "protected_legacy",
+        )
         self.assertEqual(classify_output_path(Path("figure4_compare_l50_from_separate")), "protected_legacy")
         self.assertEqual(classify_output_path(Path("figure4_quick_150")), "protected_legacy")
         self.assertEqual(classify_output_path(Path("figure4_quick150")), "protected_legacy")
@@ -152,7 +232,7 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(classify_output_path(Path("figure4_compare_l50")), "managed_current")
         self.assertEqual(classify_output_path(Path("notes")), "unknown")
 
-        summary_payload = {"schema_version": 2, "aggregated": {}}
+        summary_payload = {"schema_version": 3, "aggregated": {}}
         layout.summary_path.parent.mkdir(parents=True, exist_ok=True)
         layout.summary_path.write_text(json.dumps(summary_payload), encoding="utf-8")
         self.assertEqual(load_summary(layout.summary_path), summary_payload)
@@ -162,12 +242,14 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertTrue(layout.runner_log_path.exists())
 
     def test_runner_checks_requested_cuda_availability(self) -> None:
-        import figure4_runner
+        import experiment_runtime
 
-        with mock.patch("figure4_runner.torch.cuda.is_available", return_value=False):
+        with mock.patch("experiment_runtime.torch.cuda.is_available", return_value=False):
             with self.assertRaisesRegex(EnvironmentError, "cuda"):
-                figure4_runner._ensure_requested_device_available("cuda")
-            figure4_runner._ensure_requested_device_available("cpu")
+                experiment_runtime.ensure_compute_device_available("cuda")
+            experiment_runtime.ensure_compute_device_available("cpu")
+        with self.assertRaisesRegex(ValueError, "device"):
+            experiment_runtime.ensure_compute_device_available("tpu")
 
     def test_workflow_documentation_exists(self) -> None:
         repo_root = Path(__file__).resolve().parent
@@ -175,22 +257,40 @@ class Figure4PipelineTests(unittest.TestCase):
         content = document_path.read_text(encoding="utf-8")
         for heading in (
             "## 第一部分：Figure 4 复现",
-            "### Figure 4 开发情况",
+            "### Figure 4 当前状态",
             "### Figure 4 代码结构",
             "### Figure 4 算法流程",
+            "### Figure 4 对象命名与调用规则",
             "### Figure 4 配置规则",
             "### Figure 4 运行方法",
             "### Figure 4 输出规则",
+            "### Figure 4 验收规则",
             "## 第二部分：Figure 5 复现",
+            "### Figure 5 当前状态",
+            "### Figure 5 代码结构",
+            "### Figure 5 算法流程",
+            "### Figure 5 对象命名与调用规则",
+            "### Figure 5 配置规则",
+            "### Figure 5 运行方法",
+            "### Figure 5 输出规则",
+            "### Figure 5 验收规则",
+        ):
+            self.assertIn(heading, content)
+        for obsolete_heading in (
+            "### Figure 4 开发情况",
             "### Figure 5 开发情况",
             "### Figure 5 当前代码结构",
             "### Figure 5 实现顺序",
         ):
-            self.assertIn(heading, content)
+            self.assertNotIn(obsolete_heading, content)
         for figure4_keyword in ("figure4_experiment_config.py", "figure4_setting_strategies.py"):
             self.assertIn(figure4_keyword, content)
+        for figure4_object in ("ExperimentConfig", "Figure4Summary", "run_figure4_experiment"):
+            self.assertIn(figure4_object, content)
         for figure5_keyword in ("w_ddts", "wo_ddts", "weighted-sum", "Pareto front", "figure5_runner.py"):
             self.assertIn(figure5_keyword, content)
+        for figure5_object in ("Figure5ExperimentConfig", "Figure5Summary", "run_figure5_experiment"):
+            self.assertIn(figure5_object, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
         self.assertFalse((repo_root / legacy_document_name).exists())
 
@@ -264,7 +364,12 @@ class Figure4PipelineTests(unittest.TestCase):
         encoding_b = create_iteration_encoding(10, seed=11)
         encoding_c = create_iteration_encoding(10, seed=12)
         for block_idx in range(4):
-            self.assertTrue(np.array_equal(encoding_a.positive_count_by_bit[block_idx], encoding_b.positive_count_by_bit[block_idx]))
+            self.assertTrue(
+                np.array_equal(
+                    encoding_a.positive_count_by_bit[block_idx],
+                    encoding_b.positive_count_by_bit[block_idx],
+                )
+            )
         self.assertTrue(
             any(
                 not np.array_equal(encoding_a.positive_count_by_bit[idx], encoding_c.positive_count_by_bit[idx])
@@ -339,7 +444,10 @@ class Figure4PipelineTests(unittest.TestCase):
 
         feasible_row = build_dataset_row(1, 0, np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64))
         feasible = encode_single_objective_rows([feasible_row], encoding)[0].astype(np.float64)
-        self.assertLess(evaluate_qubo_energy(feasible, system_q, system_bias), evaluate_qubo_energy(infeasible, system_q, system_bias))
+        self.assertLess(
+            evaluate_qubo_energy(feasible, system_q, system_bias),
+            evaluate_qubo_energy(infeasible, system_q, system_bias),
+        )
 
     def test_run_single_trajectory_grows_dataset(self) -> None:
         rows, _ = generate_initial_dataset_single_objective(num_samples=12, seed=3)
@@ -348,7 +456,7 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=2,
             encoding=EncodingConfig(num_levels=10),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=2, sweeps=6),
+            sa=SAConfig(reads=20, sweeps=6),
         )
         result = run_single_trajectory(rows, OBJECTIVES[0], seed=3, config=config, setting="wo_cgfm")
         self.assertEqual(len(result.best_so_far), 2)
@@ -375,13 +483,16 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=4),
+            sa=SAConfig(reads=64, sweeps=12),
         )
         q = np.zeros((3 * config.num_levels, 3 * config.num_levels), dtype=np.float64)
         with (
             mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
             mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
-            mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(3 * config.num_levels), 0.0)),
+            mock.patch(
+                "figure4_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(np.zeros(3 * config.num_levels)),
+            ),
         ):
             result = run_single_trajectory(rows, OBJECTIVES[0], seed=7, config=config, setting="w_cgfm")
         self.assertEqual(result.setting, "w_cgfm")
@@ -404,27 +515,36 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(stats.best_so_far_std, [1.0, 1.0, 1.0])
         self.assertEqual(stats.num_trajectories, 2)
 
-    def test_invalid_and_duplicate_candidates_are_counted_as_replacements(self) -> None:
+    def test_infeasible_sa_samples_are_skipped_and_duplicates_are_replaced(self) -> None:
         rows, _ = generate_initial_dataset_single_objective(num_samples=6, seed=8)
         config = ExperimentConfig(
             num_samples=6,
             iterations=1,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=1, sweeps=1),
         )
         q = np.zeros((4 * config.num_levels, 4 * config.num_levels), dtype=np.float64)
 
+        encoding = create_iteration_encoding(config.num_levels, seed=8, num_blocks=4)
+        valid_bits = encode_single_objective_rows(
+            [build_dataset_row(0, 8, [1.0, 0.0, 0.0, 0.0])],
+            encoding,
+        )[0].astype(np.float64)
         with (
             mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
             mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
-            mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(4 * config.num_levels), 0.0)),
+            mock.patch(
+                "figure4_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(np.zeros(4 * config.num_levels), valid_bits),
+            ),
         ):
-            invalid_result = run_single_trajectory(rows, OBJECTIVES[0], seed=8, config=config, setting="wo_cgfm")
-        self.assertEqual(invalid_result.invalid_replacements, 1)
-        self.assertEqual(invalid_result.duplicate_replacements, 0)
-        self.assertEqual(invalid_result.accepted_sa_candidates, 0)
-        self.assertEqual(invalid_result.random_replacements, 1)
+            selected_result = run_single_trajectory(rows, OBJECTIVES[0], seed=8, config=config, setting="wo_cgfm")
+        self.assertEqual(selected_result.duplicate_replacements, 0)
+        self.assertEqual(selected_result.accepted_sa_candidates, 1)
+        self.assertEqual(selected_result.random_replacements, 0)
+        self.assertEqual(selected_result.infeasible_sa_samples_skipped, 1)
+        self.assertEqual(selected_result.max_feasible_candidate_rank, 2)
 
         duplicate_composition = discretize_rows_for_figure4(rows, config.num_levels)[0]
         duplicate_array = np.array(
@@ -439,11 +559,13 @@ class Figure4PipelineTests(unittest.TestCase):
         with (
             mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
             mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
-            mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(4 * config.num_levels), 0.0)),
+            mock.patch(
+                "figure4_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(np.zeros(4 * config.num_levels)),
+            ),
             mock.patch("figure4_setting_strategies.WOCGFMStrategy.decode_candidate", return_value=duplicate_array),
         ):
             duplicate_result = run_single_trajectory(rows, OBJECTIVES[0], seed=8, config=config, setting="wo_cgfm")
-        self.assertEqual(duplicate_result.invalid_replacements, 0)
         self.assertEqual(duplicate_result.duplicate_replacements, 1)
         self.assertEqual(duplicate_result.accepted_sa_candidates, 0)
         self.assertEqual(duplicate_result.random_replacements, 1)
@@ -460,7 +582,7 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=1, sweeps=1),
         )
         output_dir = WORKSPACE_TMP_ROOT / "novel_replacement"
         checkpoint = figure4_output_layout(output_dir).checkpoint_path("wo_cgfm", "kappa", 11)
@@ -468,8 +590,15 @@ class Figure4PipelineTests(unittest.TestCase):
         with (
             mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
             mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
-            mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(4 * config.num_levels), 0.0)),
-            mock.patch("figure4_pipeline.sample_single_objective_design", side_effect=[tuple(duplicate), tuple(unique)]),
+            mock.patch(
+                "figure4_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(np.zeros(4 * config.num_levels)),
+            ),
+            mock.patch("figure4_setting_strategies.WOCGFMStrategy.decode_candidate", return_value=duplicate),
+            mock.patch(
+                "figure4_pipeline.sample_single_objective_design",
+                side_effect=[tuple(duplicate), tuple(unique)],
+            ),
         ):
             result = run_single_trajectory(
                 rows,
@@ -497,9 +626,9 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=3,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=1, sweeps=1),
         )
-        output_dir = WORKSPACE_TMP_ROOT / "resume_output_v2"
+        output_dir = WORKSPACE_TMP_ROOT / "resume_output_v3"
         checkpoint = figure4_output_layout(output_dir).checkpoint_path("wo_cgfm", "kappa", 9)
         prepared_rows = discretize_rows_for_figure4(rows, config.num_levels)
         replacement_row = build_dataset_row(len(prepared_rows), 9, np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64))
@@ -510,9 +639,10 @@ class Figure4PipelineTests(unittest.TestCase):
             best_so_far=[partial_best],
             fm_metadata={"mock": True},
             qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 20, 650.0),
-            invalid_replacements=1,
             random_replacements=1,
             random_replacement_draws=1,
+            infeasible_sa_samples_skipped=1,
+            max_feasible_candidate_rank=2,
         )
         payload = checkpoint_payload(
             objective=OBJECTIVES[0],
@@ -530,11 +660,9 @@ class Figure4PipelineTests(unittest.TestCase):
             setting="wo_cgfm",
         )
         self.assertEqual(loaded["schema_version"], CHECKPOINT_SCHEMA_VERSION)
-        q = np.zeros((4 * config.num_levels, 4 * config.num_levels), dtype=np.float64)
-        with (
-            mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
-            mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
-            mock.patch("figure4_pipeline.simulated_annealing_qubo", return_value=(np.zeros(4 * config.num_levels), 0.0)),
+        with mock.patch(
+            "figure4_pipeline._fit_and_solve_iteration",
+            side_effect=[_training_result(config, 9, 1), _training_result(config, 9, 2)],
         ):
             resumed = run_single_trajectory(
                 rows,
@@ -557,7 +685,7 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(resumed.completed_iterations, 3)
         self.assertEqual(len(resumed.best_so_far), 3)
         self.assertEqual(resumed.final_dataset_size, config.num_samples + config.iterations)
-        self.assertEqual(resumed.invalid_replacements, 3)
+        self.assertEqual(resumed.infeasible_sa_samples_skipped, 1)
         self.assertEqual(skipped.completed_iterations, 3)
 
     def test_checkpoint_config_mismatch_fails(self) -> None:
@@ -567,9 +695,9 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=64, sweeps=12),
         )
-        output_dir = WORKSPACE_TMP_ROOT / "config_mismatch_v2"
+        output_dir = WORKSPACE_TMP_ROOT / "config_mismatch_v3_reads64"
         run_figure4_experiment(
             seed_list=[12],
             config=config,
@@ -583,7 +711,7 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=6),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=1),
+            sa=SAConfig(reads=64, sweeps=12),
         )
         with self.assertRaisesRegex(ValueError, "config"):
             run_single_trajectory(
@@ -602,9 +730,9 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=2,
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=2, sweeps=6),
+            sa=SAConfig(reads=20, sweeps=6),
         )
-        output_dir = WORKSPACE_TMP_ROOT / "figure4_output_v2"
+        output_dir = WORKSPACE_TMP_ROOT / "figure4_output_v3"
         summary = run_figure4_experiment(
             seed_list=[0],
             config=config,
@@ -617,8 +745,9 @@ class Figure4PipelineTests(unittest.TestCase):
         summary_path = layout.summary_path
         output_png = layout.figure_path
         self.assertTrue(summary_path.exists())
-        self.assertEqual(summary.schema_version, 2)
+        self.assertEqual(summary.schema_version, 3)
         self.assertEqual(summary.training_backend, "pytorch_fm_lbfgs")
+        self.assertEqual(summary.settings, ["wo_cgfm", "w_cgfm"])
         self.assertIn("kappa:wo_cgfm", summary.aggregated)
         self.assertIn("kappa:w_cgfm", summary.aggregated)
         self.assertTrue(summary.aggregated["kappa:wo_cgfm"].best_so_far_std)
@@ -636,10 +765,10 @@ class Figure4PipelineTests(unittest.TestCase):
             iterations=1,
             encoding=EncodingConfig(num_levels=6),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(runs=1, sweeps=4),
+            sa=SAConfig(reads=64, sweeps=12),
         )
-        wo_dir = WORKSPACE_TMP_ROOT / "figure4_multi_plot_wo"
-        w_dir = WORKSPACE_TMP_ROOT / "figure4_multi_plot_w"
+        wo_dir = WORKSPACE_TMP_ROOT / "figure4_multi_plot_v3_reads64_wo"
+        w_dir = WORKSPACE_TMP_ROOT / "figure4_multi_plot_v3_reads64_w"
         run_figure4_experiment(
             seed_list=[1],
             config=config,
@@ -656,7 +785,7 @@ class Figure4PipelineTests(unittest.TestCase):
             resume=True,
             settings=("w_cgfm",),
         )
-        output_png = WORKSPACE_TMP_ROOT / "figure4_multi_plot.png"
+        output_png = WORKSPACE_TMP_ROOT / "figure4_multi_plot_v3_reads64.png"
         subprocess.run(
             [
                 sys.executable,
@@ -681,7 +810,7 @@ class Figure4PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
         empty_summary = invalid_dir / "empty_summary.json"
-        empty_summary.write_text(json.dumps({"schema_version": 2, "aggregated": {}}), encoding="utf-8")
+        empty_summary.write_text(json.dumps({"schema_version": 3, "aggregated": {}}), encoding="utf-8")
 
         for summary_path in (old_schema_summary, empty_summary):
             with self.assertRaises(subprocess.CalledProcessError):

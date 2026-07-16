@@ -8,8 +8,8 @@ from typing import Any, Literal
 from figure4_experiment_config import EncodingConfig, FMConfig, SAConfig
 
 
-Figure5RunScale = Literal["paper", "quick150", "test"]
-SUPPORTED_PRESETS: tuple[Figure5RunScale, ...] = ("paper", "quick150", "test")
+Figure5RunScale = Literal["paper", "quick", "test"]
+SUPPORTED_PRESETS: tuple[Figure5RunScale, ...] = ("paper", "quick", "test")
 
 
 @dataclass(frozen=True)
@@ -45,8 +45,8 @@ class Figure5ExperimentConfig:
         return self.fm.device
 
     @property
-    def sa_runs(self) -> int:
-        return self.sa.runs
+    def sa_reads(self) -> int:
+        return self.sa.reads
 
     @property
     def sa_sweeps(self) -> int:
@@ -61,13 +61,13 @@ def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5Experi
 
     if preset == "paper":
         return Figure5ExperimentConfig(fm=FMConfig(device=device))
-    if preset == "quick150":
+    if preset == "quick":
         return Figure5ExperimentConfig(
             num_samples=500,
             iterations=150,
             encoding=EncodingConfig(num_levels=25),
             fm=FMConfig(optuna_trials=3, device=device),
-            sa=SAConfig(runs=100, sweeps=500),
+            sa=SAConfig(reads=100, sweeps=500),
         )
     if preset == "test":
         return Figure5ExperimentConfig(
@@ -75,7 +75,7 @@ def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5Experi
             iterations=2,
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0, device=device),
-            sa=SAConfig(runs=2, sweeps=6),
+            sa=SAConfig(reads=32, sweeps=12),
         )
     raise ValueError(f"Unsupported preset {preset!r}. Choices: {', '.join(SUPPORTED_PRESETS)}")
 
@@ -88,7 +88,7 @@ def resolve_experiment_config(
     iterations: int | None = None,
     num_levels: int | None = None,
     optuna_trials: int | None = None,
-    sa_runs: int | None = None,
+    sa_reads: int | None = None,
     sa_sweeps: int | None = None,
 ) -> Figure5ExperimentConfig:
     """Resolve a preset first, then apply explicit CLI overrides."""
@@ -104,11 +104,11 @@ def resolve_experiment_config(
         config = replace(config, encoding=EncodingConfig(num_levels=int(num_levels)))
     if optuna_trials is not None:
         config = replace(config, fm=replace(config.fm, optuna_trials=int(optuna_trials)))
-    if sa_runs is not None or sa_sweeps is not None:
+    if sa_reads is not None or sa_sweeps is not None:
         config = replace(
             config,
             sa=SAConfig(
-                runs=config.sa.runs if sa_runs is None else int(sa_runs),
+                reads=config.sa.reads if sa_reads is None else int(sa_reads),
                 sweeps=config.sa.sweeps if sa_sweeps is None else int(sa_sweeps),
             ),
         )

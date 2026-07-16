@@ -32,7 +32,8 @@ from figure4_qubo_math import (
     decode_candidate_bits_to_composition,
     encode_single_objective_rows,
     prepare_discrete_composition,
-    simulated_annealing_qubo,
+    select_lowest_energy_feasible_sample,
+    solve_qubo_with_sa,
     validate_candidate_composition,
 )
 from figure5_experiment_config import Figure5ExperimentConfig
@@ -51,16 +52,17 @@ from figure5_scalarization import (
     compute_individual_objective_targets,
     sample_preference_weights,
 )
+from experiment_runtime import validate_seed_list
 
 
 TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 TRAINING_BACKEND = "pytorch_fm_lbfgs"
 SUPPORTED_SETTINGS: tuple[Figure5Setting, ...] = ("w_ddts", "wo_ddts")
 MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
 PREFERENCE_SEED_OFFSET = 50_005
 PREFERENCE_ITERATION_STRIDE = 97_409
-CandidateStatus = Literal["accepted", "invalid_replacement", "duplicate_replacement"]
+CandidateStatus = Literal["accepted", "duplicate_replacement"]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -91,10 +93,12 @@ class IterationRecord:
     weights: List[float]
     scalarization_method: str
     decision_status: CandidateStatus
-    proposed_solution: SolutionPoint | None
+    proposed_solution: SolutionPoint
     added_solution: SolutionPoint
     replacement_draws: int
     sa_energy: float
+    feasible_candidate_rank: int = 1
+    infeasible_sa_samples_skipped: int = 0
 
 
 @dataclass
@@ -108,10 +112,11 @@ class Figure5TrajectoryState:
     latest_scalarization_metadata: Dict[str, Any] = field(default_factory=dict)
     qubo_stats: QuboStats | None = None
     duplicate_replacements: int = 0
-    invalid_replacements: int = 0
     random_replacements: int = 0
     random_replacement_draws: int = 0
     accepted_sa_candidates: int = 0
+    infeasible_sa_samples_skipped: int = 0
+    max_feasible_candidate_rank: int = 0
 
     @property
     def completed_iterations(self) -> int:
@@ -130,17 +135,18 @@ class Figure5TrajectoryResult:
     latest_scalarization_metadata: Dict[str, Any]
     qubo_stats: QuboStats | None
     duplicate_replacements: int
-    invalid_replacements: int
     random_replacements: int
     random_replacement_draws: int
     accepted_sa_candidates: int
-    completed_iterations: int
+    infeasible_sa_samples_skipped: int = 0
+    max_feasible_candidate_rank: int = 0
+    completed_iterations: int = 0
 
 
 @dataclass(frozen=True)
 class CandidateDecision:
     status: CandidateStatus
-    proposed_row: Dict[str, Any] | None
+    proposed_row: Dict[str, Any]
     added_row: Dict[str, Any]
     replacement_draws: int = 0
 
@@ -155,6 +161,8 @@ class TrainingIterationResult:
     scalarization_metadata: Dict[str, Any]
     qubo_stats: QuboStats
     sa_energy: float
+    feasible_candidate_rank: int
+    infeasible_sa_samples_skipped: int
 
 
 @dataclass(frozen=True)
@@ -176,9 +184,13 @@ class Figure5Summary:
 def validate_settings(settings: Sequence[str]) -> tuple[Figure5Setting, ...]:
     if not settings:
         raise ValueError("At least one setting is required")
+    if any(not isinstance(setting, str) for setting in settings):
+        raise ValueError("Figure 5 settings must contain strings")
     unknown = [setting for setting in settings if setting not in SUPPORTED_SETTINGS]
     if unknown:
         raise ValueError(f"Unsupported Figure 5 settings: {', '.join(unknown)}")
+    if len(set(settings)) != len(settings):
+        raise ValueError("Figure 5 settings must not contain duplicates")
     return tuple(settings)  # type: ignore[return-value]
 
 
@@ -200,7 +212,12 @@ def discretize_rows_for_figure5(rows: Sequence[Mapping[str, Any]], num_levels: i
     return [discretize_row_for_figure5(row, num_levels) for row in rows]
 
 
-def random_replacement_row(sample_id: int, seed: int, rng: random.Random, num_levels: int) -> Dict[str, Any]:
+def _sample_random_replacement_row(
+    sample_id: int,
+    seed: int,
+    rng: random.Random,
+    num_levels: int,
+) -> Dict[str, Any]:
     continuous_design = sample_multi_objective_design(rng)
     composition = prepare_discrete_composition(continuous_design, num_levels)
     return dict(build_dataset_row(sample_id, seed, composition))
@@ -231,9 +248,7 @@ def _solution_point_from_row(row: Mapping[str, Any]) -> SolutionPoint:
     )
 
 
-def _solution_point_from_payload(payload: Mapping[str, Any] | None) -> SolutionPoint | None:
-    if payload is None:
-        return None
+def _solution_point_from_payload(payload: Mapping[str, Any]) -> SolutionPoint:
     return SolutionPoint(
         sample_id=int(payload["sample_id"]),
         composition=[float(value) for value in payload["composition"]],
@@ -244,9 +259,12 @@ def _solution_point_from_payload(payload: Mapping[str, Any] | None) -> SolutionP
 
 
 def _iteration_record_from_payload(payload: Mapping[str, Any]) -> IterationRecord:
-    added_solution = _solution_point_from_payload(payload.get("added_solution"))
-    if added_solution is None:
+    raw_added_solution = payload.get("added_solution")
+    raw_proposed_solution = payload.get("proposed_solution")
+    if not isinstance(raw_added_solution, Mapping):
         raise ValueError("Checkpoint iteration record is missing added_solution")
+    if not isinstance(raw_proposed_solution, Mapping):
+        raise ValueError("Checkpoint iteration record is missing proposed_solution")
     return IterationRecord(
         setting=str(payload["setting"]),
         seed=int(payload["seed"]),
@@ -254,10 +272,12 @@ def _iteration_record_from_payload(payload: Mapping[str, Any]) -> IterationRecor
         weights=[float(value) for value in payload.get("weights", [])],
         scalarization_method=str(payload["scalarization_method"]),
         decision_status=payload["decision_status"],
-        proposed_solution=_solution_point_from_payload(payload.get("proposed_solution")),
-        added_solution=added_solution,
+        proposed_solution=_solution_point_from_payload(raw_proposed_solution),
+        added_solution=_solution_point_from_payload(raw_added_solution),
         replacement_draws=int(payload.get("replacement_draws", 0)),
         sa_energy=float(payload["sa_energy"]),
+        feasible_candidate_rank=int(payload.get("feasible_candidate_rank", 1)),
+        infeasible_sa_samples_skipped=int(payload.get("infeasible_sa_samples_skipped", 0)),
     )
 
 
@@ -275,10 +295,11 @@ def _state_from_checkpoint(payload: Mapping[str, Any]) -> Figure5TrajectoryState
         latest_scalarization_metadata=dict(raw_state.get("latest_scalarization_metadata", {})),
         qubo_stats=qubo_stats,
         duplicate_replacements=int(raw_state.get("duplicate_replacements", 0)),
-        invalid_replacements=int(raw_state.get("invalid_replacements", 0)),
         random_replacements=int(raw_state.get("random_replacements", 0)),
         random_replacement_draws=int(raw_state.get("random_replacement_draws", 0)),
         accepted_sa_candidates=int(raw_state.get("accepted_sa_candidates", 0)),
+        infeasible_sa_samples_skipped=int(raw_state.get("infeasible_sa_samples_skipped", 0)),
+        max_feasible_candidate_rank=int(raw_state.get("max_feasible_candidate_rank", 0)),
     )
 
 
@@ -287,7 +308,7 @@ def _advance_replacement_rng(rng: random.Random, replacement_draws: int) -> None
         sample_multi_objective_design(rng)
 
 
-def _generate_unique_replacement_row(
+def _sample_unique_replacement_row(
     *,
     sample_id: int,
     seed: int,
@@ -297,7 +318,7 @@ def _generate_unique_replacement_row(
     max_attempts: int = MAX_RANDOM_REPLACEMENT_ATTEMPTS,
 ) -> tuple[Dict[str, Any], int]:
     for attempt in range(1, max_attempts + 1):
-        row = random_replacement_row(sample_id, seed, rng, num_levels)
+        row = _sample_random_replacement_row(sample_id, seed, rng, num_levels)
         if _row_composition_key(row) not in seen_compositions:
             return row, attempt
     raise RuntimeError(f"Unable to generate a novel random replacement after {max_attempts} attempts")
@@ -363,22 +384,30 @@ def _fit_and_solve_iteration(
         encoding,
         include_system_penalty=True,
     )
-    candidate_bits, sa_energy = simulated_annealing_qubo(
+    sampling = solve_qubo_with_sa(
         qubo_result.q,
         qubo_result.bias,
-        runs=config.sa_runs,
+        reads=config.sa_reads,
         sweeps=config.sa_sweeps,
         seed=seed + (iteration * 9973),
     )
+
+    def is_feasible_candidate(state: np.ndarray) -> bool:
+        composition = decode_candidate_bits_to_composition(state, encoding)
+        return composition is not None and validate_candidate_composition(composition)
+
+    selected = select_lowest_energy_feasible_sample(sampling, is_feasible_candidate)
     return TrainingIterationResult(
         encoding=encoding,
-        candidate_bits=candidate_bits,
+        candidate_bits=selected.state,
         weights=weights,
         scalarization_method=scalarization_method,
         fm_metadata=fm_metadata,
         scalarization_metadata=scalarization_metadata,
         qubo_stats=qubo_result.stats,
-        sa_energy=float(sa_energy),
+        sa_energy=float(selected.energy),
+        feasible_candidate_rank=selected.rank,
+        infeasible_sa_samples_skipped=selected.infeasible_samples_skipped,
     )
 
 
@@ -394,18 +423,11 @@ def _decide_candidate(
 ) -> CandidateDecision:
     composition = decode_candidate_bits_to_composition(candidate_bits, encoding)
     if composition is None or not validate_candidate_composition(composition):
-        replacement, draws = _generate_unique_replacement_row(
-            sample_id=sample_id,
-            seed=seed,
-            rng=replacement_rng,
-            num_levels=num_levels,
-            seen_compositions=seen_compositions,
-        )
-        return CandidateDecision("invalid_replacement", None, replacement, draws)
+        raise RuntimeError("Internal error: selected SA candidate is not feasible")
 
     proposed_row = dict(build_dataset_row(sample_id, seed, composition))
     if _composition_key(composition) in seen_compositions:
-        replacement, draws = _generate_unique_replacement_row(
+        replacement, draws = _sample_unique_replacement_row(
             sample_id=sample_id,
             seed=seed,
             rng=replacement_rng,
@@ -419,10 +441,6 @@ def _decide_candidate(
 def _apply_candidate_decision(state: Figure5TrajectoryState, decision: CandidateDecision) -> None:
     if decision.status == "accepted":
         state.accepted_sa_candidates += 1
-    elif decision.status == "invalid_replacement":
-        state.invalid_replacements += 1
-        state.random_replacements += 1
-        state.random_replacement_draws += decision.replacement_draws
     elif decision.status == "duplicate_replacement":
         state.duplicate_replacements += 1
         state.random_replacements += 1
@@ -444,10 +462,11 @@ def _result_from_state(setting: Figure5Setting, seed: int, state: Figure5Traject
         latest_scalarization_metadata=dict(state.latest_scalarization_metadata),
         qubo_stats=state.qubo_stats,
         duplicate_replacements=state.duplicate_replacements,
-        invalid_replacements=state.invalid_replacements,
         random_replacements=state.random_replacements,
         random_replacement_draws=state.random_replacement_draws,
         accepted_sa_candidates=state.accepted_sa_candidates,
+        infeasible_sa_samples_skipped=state.infeasible_sa_samples_skipped,
+        max_feasible_candidate_rank=state.max_feasible_candidate_rank,
         completed_iterations=state.completed_iterations,
     )
 
@@ -502,6 +521,11 @@ def run_single_trajectory(
         state.latest_fm_metadata = dict(training.fm_metadata)
         state.latest_scalarization_metadata = dict(training.scalarization_metadata)
         state.qubo_stats = training.qubo_stats
+        state.infeasible_sa_samples_skipped += training.infeasible_sa_samples_skipped
+        state.max_feasible_candidate_rank = max(
+            state.max_feasible_candidate_rank,
+            training.feasible_candidate_rank,
+        )
 
         decision = _decide_candidate(
             candidate_bits=training.candidate_bits,
@@ -522,12 +546,12 @@ def run_single_trajectory(
                 weights=list(state.latest_weights),
                 scalarization_method=training.scalarization_method,
                 decision_status=decision.status,
-                proposed_solution=(
-                    None if decision.proposed_row is None else _solution_point_from_row(decision.proposed_row)
-                ),
+                proposed_solution=_solution_point_from_row(decision.proposed_row),
                 added_solution=_solution_point_from_row(decision.added_row),
                 replacement_draws=decision.replacement_draws,
                 sa_energy=training.sa_energy,
+                feasible_candidate_rank=training.feasible_candidate_rank,
+                infeasible_sa_samples_skipped=training.infeasible_sa_samples_skipped,
             )
         )
 
@@ -555,8 +579,6 @@ def _flatten_proposed_solutions(
     solutions: List[Dict[str, Any]] = []
     for trajectory in trajectories:
         for record in trajectory.iteration_records:
-            if record.proposed_solution is None:
-                continue
             solutions.append(
                 {
                     "setting": record.setting,
@@ -577,20 +599,19 @@ def run_figure5_experiment(
     resume: bool = False,
     settings: Sequence[Figure5Setting] = SUPPORTED_SETTINGS,
 ) -> Figure5Summary:
-    """Run the setting/seed Cartesian product and write Figure 5 summary schema v1."""
+    """Run the setting/seed Cartesian product and write Figure 5 summary schema v2."""
 
     selected_settings = validate_settings(settings)
-    if not seed_list:
-        raise ValueError("seed_list must not be empty")
+    selected_seeds = validate_seed_list(seed_list)
 
     output_layout = figure5_output_layout(output_dir)
     output_layout.root.mkdir(parents=True, exist_ok=True)
     dataset_batch = generate_initial_dataset_multi_objective_batch(
-        seed_list=seed_list,
+        seed_list=selected_seeds,
         num_samples=config.num_samples,
     )
     trajectories: List[Figure5TrajectoryResult] = []
-    for seed in seed_list:
+    for seed in selected_seeds:
         initial_rows, _ = dataset_batch[int(seed)]
         for setting in selected_settings:
             trajectories.append(
@@ -613,7 +634,7 @@ def run_figure5_experiment(
         schema_version=SUMMARY_SCHEMA_VERSION,
         training_backend=TRAINING_BACKEND,
         config=config.to_dict(),
-        seed_list=[int(seed) for seed in seed_list],
+        seed_list=selected_seeds,
         objectives=list(FIGURE5_OBJECTIVES),
         settings=list(selected_settings),
         trajectories=trajectories,

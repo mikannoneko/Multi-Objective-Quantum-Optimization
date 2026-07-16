@@ -16,7 +16,7 @@ else:
     Figure5Setting = str
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 SUMMARY_FILENAME = "figure5_summary.json"
 MANIFEST_FILENAME = "manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure5.png"

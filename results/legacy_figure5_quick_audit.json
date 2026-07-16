@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-07-13",
+  "source": "figure5_quick150/figure5_summary.json",
+  "source_summary_schema_version": 1,
+  "source_scale": {
+    "num_samples": 500,
+    "iterations": 150,
+    "num_levels": 25,
+    "num_seeds": 1
+  },
+  "accepted": false,
+  "exact_front_size": 1316,
+  "settings": {
+    "w_ddts": {
+      "unique_proposals": 143,
+      "exact_front_hits": 81,
+      "exact_front_coverage": 0.06155015197568389,
+      "exact_front_precision": 0.5664335664335665,
+      "spacing_cv": 0.7034628042044185
+    },
+    "wo_ddts": {
+      "unique_proposals": 141,
+      "exact_front_hits": 103,
+      "exact_front_coverage": 0.07826747720364742,
+      "exact_front_precision": 0.7304964539007093,
+      "spacing_cv": 1.3075773040468497
+    }
+  },
+  "comparison": {
+    "coverage_ratio_w_ddts_over_wo_ddts": 0.786407766990291,
+    "spacing_cv_ratio_w_ddts_over_wo_ddts": 0.537989457317174
+  },
+  "rejection_reasons": [
+    "The source uses obsolete summary schema v1.",
+    "The output predates feasible-read selection and current candidate-accounting checks.",
+    "Scientific coverage differences are retained as diagnostics and are not current acceptance criteria."
+  ]
+}

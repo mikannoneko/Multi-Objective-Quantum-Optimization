@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-07-13",
+  "source": "figure4_compare_quick_l50/figure4_summary.json",
+  "source_summary_schema_version": 2,
+  "source_scale": {
+    "num_samples": 100,
+    "iterations": 100,
+    "num_levels": 50,
+    "num_seeds": 3
+  },
+  "accepted": false,
+  "settings": {
+    "wo_cgfm": {
+      "completed_iterations": 1500,
+      "accepted_sa_candidates": 632,
+      "invalid_replacements": 861,
+      "duplicate_replacements": 7,
+      "random_replacements": 868,
+      "invalid_replacement_fraction": 0.574
+    },
+    "w_cgfm": {
+      "completed_iterations": 1500,
+      "accepted_sa_candidates": 1487,
+      "invalid_replacements": 0,
+      "duplicate_replacements": 13,
+      "random_replacements": 13,
+      "invalid_replacement_fraction": 0.0
+    }
+  },
+  "rejection_reasons": [
+    "The source uses obsolete summary schema v2.",
+    "The wo_cgfm baseline replaced 57.4% of proposed candidates after infeasible SA states, contaminating the comparison.",
+    "The current schema v3 quick workflow removes invalid random replacement and enforces candidate-accounting checks."
+  ]
+}

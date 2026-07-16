@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import dimod
 import numpy as np
@@ -53,6 +53,35 @@ class QuboBuildResult:
     q: np.ndarray
     bias: float
     stats: QuboStats
+
+
+@dataclass(frozen=True)
+class SASample:
+    """One simulated-annealing sample in ascending energy order."""
+
+    state: np.ndarray
+    energy: float
+
+
+@dataclass(frozen=True)
+class SASamplingResult:
+    """All samples returned by one D-Wave Ocean `neal` call."""
+
+    samples: Tuple[SASample, ...]
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.samples)
+
+
+@dataclass(frozen=True)
+class FeasibleSASolution:
+    """Lowest-energy sample accepted by a caller-provided feasibility check."""
+
+    state: np.ndarray
+    energy: float
+    rank: int
+    infeasible_samples_skipped: int
 
 
 def get_positive_level_values(num_levels: int) -> np.ndarray:
@@ -428,17 +457,60 @@ def _qubo_to_bqm(q: np.ndarray, bias: float) -> dimod.BinaryQuadraticModel:
     return dimod.BinaryQuadraticModel(linear, quadratic, float(bias), dimod.BINARY)
 
 
-def simulated_annealing_qubo(
+def solve_qubo_with_sa(
     q: np.ndarray,
     bias: float,
-    runs: int,
+    reads: int,
     sweeps: int,
     seed: int,
-) -> Tuple[np.ndarray, float]:
+) -> SASamplingResult:
+    """Return every SA read, sorted by energy, instead of discarding alternatives.
+
+    The lowest-energy unconstrained sample is not necessarily a legal one-hot/system
+    state. Keeping the full sample batch lets the pipeline select the lowest-energy
+    feasible state without replacing an optimization result with random data.
+    """
+
+    if int(reads) <= 0:
+        raise ValueError("reads must be positive")
+    if int(sweeps) <= 0:
+        raise ValueError("sweeps must be positive")
     bqm = _qubo_to_bqm(q, bias)
     sampler = SimulatedAnnealingSampler()
-    sampleset = sampler.sample(bqm, num_reads=max(1, runs), num_sweeps=max(1, sweeps), seed=seed)
-    best_sample = sampleset.first.sample
-    best_state = np.array([best_sample[idx] for idx in range(q.shape[0])], dtype=np.float64)
-    best_energy = float(sampleset.first.energy)
-    return best_state, best_energy
+    sample_set = sampler.sample(bqm, num_reads=int(reads), num_sweeps=int(sweeps), seed=seed)
+    variables = [int(variable) for variable in sample_set.variables]
+    order = np.argsort(sample_set.record.energy, kind="stable")
+    samples = []
+    for record_index in order:
+        state = np.zeros(q.shape[0], dtype=np.float64)
+        raw_state = sample_set.record.sample[int(record_index)]
+        for column_index, variable in enumerate(variables):
+            state[variable] = float(raw_state[column_index])
+        samples.append(
+            SASample(
+                state=state,
+                energy=float(sample_set.record.energy[int(record_index)]),
+            )
+        )
+    if not samples:
+        raise RuntimeError("Simulated annealing returned no samples")
+    return SASamplingResult(samples=tuple(samples))
+
+
+def select_lowest_energy_feasible_sample(
+    sampling: SASamplingResult,
+    is_feasible: Callable[[np.ndarray], bool],
+) -> FeasibleSASolution:
+    """Select the first feasible state from an energy-sorted SA sample batch."""
+
+    for sample_index, sample in enumerate(sampling.samples):
+        if is_feasible(sample.state):
+            return FeasibleSASolution(
+                state=sample.state.copy(),
+                energy=float(sample.energy),
+                rank=sample_index + 1,
+                infeasible_samples_skipped=sample_index,
+            )
+    raise RuntimeError(
+        f"No feasible QUBO candidate found among {sampling.num_samples} simulated-annealing reads"
+    )

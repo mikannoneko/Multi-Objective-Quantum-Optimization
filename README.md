@@ -1,538 +1,488 @@
-# 合金 Figure 4 / Figure 5 复现工作流
+# Figure 4 / Figure 5 小规模流程复现
 
-本文档按复现目标拆成两部分：第一部分记录 Figure 4 单目标复现的当前实现、代码结构和运行方法；第二部分记录 Figure 5 多目标复现的当前实现、代码结构和运行方法。
+本项目复现论文 *Progress on Data-Driven, Multi-Objective Quantum Optimization*（arXiv:2512.11479）中 Figure 4 和 Figure 5 的算法流程。论文元数据、本地 PDF 文件名及 SHA-256 见 `references/README.md`。
 
-## 项目复现定位与运行环境
+## 项目边界
 
-本项目不追求论文完整计算规模或逐点数值复现，目标是复现 Figure 4/5 的核心算法流程，并在可接受的计算预算下验证论文报告的定性趋势：
+本项目只验收小规模流程复现，不验收论文计算规模，也不以复现论文数值或定性优势作为通过条件。
 
-- `test`：单元测试和烟测规模，只验证代码路径、schema、checkpoint 和绘图，不用于趋势结论。
-- `quick_l50` / `quick150`：项目实际运行规模，用于流程复现和定性趋势验证，不应解释为论文规模结果。
-- `paper`：保留论文参数作为对照，不在本项目中实际运行，也不属于验收或交付范围。
+- `quick`：Figure 4 和 Figure 5 统一使用的小规模正式验收名称。
+- `test`：单元测试和端到端烟测，只确认最短代码路径可运行。
+- `paper`：论文参数的参考配置；可以显式运行，但不属于本项目验收边界，验收器不会接受 paper-scale summary。
+- 新输出目录统一命名为 `figure4_quick`、`figure5_quick`；`quick_l50`、`quick150`、`quick_150` 等旧名称仅用于识别历史输出，不再用于新调用。
+- `validate_reproduction.py` 只验收 canonical `quick` 规模、轨迹完整性、输出结构和候选计数一致性。
+- Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
-论文补充材料使用老旧的 `fastFM + ALS`。当前 Conda 环境 `env_torch` 不提供可运行的 `fastFM`，因此项目使用 PyTorch 二阶 FM 和 LBFGS 作为工程替代，保留 rank 6、最多 2000 training steps、target z-score、Optuna 调参和 FM-to-QUBO 流程。训练后端和优化器与论文不同，因此不保证 active-learning trajectory 或最终数值与论文一致。
+论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。这是工程替代，因此结果只能称为“小规模流程复现”。
 
-所有命令通过 Conda 环境 `env_torch` 运行。可复现环境文件已提供为 `environment.yml`，按当前工作区验证环境固定关键版本：Python 3.9、PyTorch 1.9.1、CUDA 11.1、NumPy 1.26.4、scikit-learn 1.6.1、Optuna 4.8.0、D-Wave `dimod` 0.12.21 和 `dwave-neal` 0.6.0。
+当前仓库尚未提交新版本 canonical `quick` 验收通过报告；实时状态见 `results/reproduction_status.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
 
-首次创建环境：
+## 环境与测试
 
 ```powershell
 conda env create -f environment.yml
 conda activate env_torch
 ```
 
-如果 `env_torch` 已存在，可用下列命令按文件更新：
+已有环境可更新：
 
 ```powershell
 conda env update -n env_torch -f environment.yml --prune
 ```
 
-当前工作区验证环境为 Python 3.9.21、PyTorch 1.9.1+cu111，CUDA 可用；可用下列命令重新检查当前机器状态：
-
-```powershell
-conda run -n env_torch python -c "import importlib.util, sys, torch; print(sys.executable); print(sys.version); print(torch.__version__); print('CUDA:', torch.cuda.is_available()); print('fastFM:', importlib.util.find_spec('fastFM'))"
-```
-
-输出目录约定：
-
-- 单元测试和 synthetic 绘图产生的临时文件统一写入工作区 `.tmp_test/`；该目录被 Git 忽略，可以安全删除并由测试重新生成。
-- 用户运行 `figure4_runner.py`、`figure5_runner.py` 和绘图脚本时，输出写入命令指定的工作区目录，例如 `figure4_compare_quick_l50/` 或 `figure5_quick150/`，不会重定向到 `.tmp_test/`。
-
-## 第一部分：Figure 4 复现
-
-### Figure 4 开发情况
-
-- 已实现 `w/o CGFM` 和 `w/ CGFM` 两条流程，对应 setting 名称 `wo_cgfm` 和 `w_cgfm`。
-- 已实现 schema v2 checkpoint 和 schema v2 summary；不再兼容旧 checkpoint/summary schema。
-- 已实现 per-trajectory checkpoint、`--resume`、多 seed 聚合、mean/std/min/max 曲线和 Figure 4 绘图。
-- 运行入口是 `figure4_runner.py`，绘图入口是 `plot_figure4.py`。
-- 旧成功输出目录受保护，可查看结果，但不保证新版代码可以直接 `--resume`。
-
-### Figure 4 代码结构
-
-- `alloy_dataset_generator.py`：生成合金组成行，并计算 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T`。
-- `figure4_experiment_config.py`：定义 Figure 4 preset、配置 dataclass、`ObjectiveSpec` 和 canonical `OBJECTIVES` 顺序。
-- `figure4_setting_strategies.py`：定义 `wo_cgfm` 和 `w_cgfm` 的编码/解码 strategy。
-- `figure4_qubo_math.py`：定义 one-hot 编码、CGFM 角度映射、QUBO 构造、惩罚项和 simulated annealing。
-- `figure4_fm_torch.py`：定义 PyTorch FM、Optuna 调参、LBFGS 训练和 FM-to-QUBO 转换。
-- `figure4_pipeline.py`：运行 trajectory、恢复 checkpoint、验收或替换候选、聚合结果、写 summary。
-- `figure4_outputs.py`：统一输出路径、checkpoint schema 和 I/O、summary 读取、文件日志和输出目录分类。
-- `figure4_runner.py`：解析 CLI、配置日志、检查训练依赖和 CUDA 可用性、调用 pipeline、写 manifest。
-- `plot_figure4.py`：读取一个或多个 schema v2 summary，绘制 Figure 4 曲线。
-
-### Figure 4 算法流程
-
-1. `figure4_runner.py` 根据 preset 和 CLI override 解析 `ExperimentConfig`。
-2. `run_figure4_experiment` 为每个 seed 生成初始数据集。
-3. 初始行用 `discretize_rows_for_figure4` 离散化；底层 `prepare_discrete_composition` 将四个相分数放到 `num_levels` 网格上，并保持总和为 1。
-4. trajectory 粒度是固定的 `setting + objective + seed`。
-5. 每轮 active learning 创建 setting-specific encoding：
-   - `wo_cgfm`：直接编码 4 个相分数 block，特征维度是 `4 * num_levels`。
-   - `w_cgfm`：编码 3 个 CGFM 角度 block，特征维度是 `3 * num_levels`。
-6. 当前数据集被 strategy 编码后，objective 被转换成训练用的最小化目标，并对 target 做 z-score。
-7. `fit_torch_fm` 训练 FM，`fm_to_qubo` 将 FM 转换为 QUBO 项。
-8. `build_single_objective_qubo` 构造最终 QUBO：
-   - `wo_cgfm`：`FM + system penalty + one-hot penalty`。
-   - `w_cgfm`：`FM + one-hot penalty`。
-9. `simulated_annealing_qubo` 求解候选 bit vector。
-10. setting strategy 解码候选。每个 block 允许全零表示 0；一个 block 中多于一个 active bit 为非法。
-11. 候选必须解码为非负四相分数、总和为 1，且不能重复已有 composition。
-12. 非法或重复候选使用 random replacement；replacement 也会检查 `seen_compositions`，避免加入重复 composition。
-13. 追加候选行或 replacement 行后更新 `best_so_far`，并写入 trajectory checkpoint。
-14. 结果按 `{objective}:{setting}` 聚合为 best-so-far 的 mean、std、min、max 曲线。
-
-### Figure 4 配置规则
-
-- preset 包括 `paper`、`quick_l50`、`test`。
-- `paper`（论文参数参考，不运行）：`num_samples=100`，`iterations=600`，`num_levels=50`，`optuna_trials=20`，`sa_runs=1000`，`sa_sweeps=3000`；默认 seed 数是 20。
-- `quick_l50`（流程复现和趋势验证）：`num_samples=100`，`iterations=100`，`num_levels=50`，`optuna_trials=3`，`sa_runs=100`，`sa_sweeps=500`；默认 seed 数是 3。
-- `test`（烟测）：`num_samples=10`，`iterations=2`，`num_levels=8`，`optuna_trials=0`，`sa_runs=2`，`sa_sweeps=6`；默认 seed 数是 1。
-- CLI 数值参数会覆盖 preset，例如 `--iterations`、`--num-levels`、`--optuna-trials`、`--sa-runs`、`--sa-sweeps`。
-- `--settings` 必填，可选值是 `wo_cgfm` 和 `w_cgfm`。
-- `--objectives` 可选；不传时按 `figure4_experiment_config.OBJECTIVES` 的 canonical 顺序运行全部五个 objective。
-- `EncodingConfig` 要求 `num_levels > 1`；`ExperimentConfig` 要求 `num_samples` 和 `iterations` 为正数。
-- `FMConfig` 要求 `optuna_trials >= 0`，且 `device` 为 `cpu` 或 `cuda`。
-- `SAConfig` 要求 `runs` 和 `sweeps` 为正数。
-- runner 不强制解释器名称；如果传入 `--device cuda` 但 PyTorch CUDA 不可用，会在训练前失败。
-
-### Figure 4 运行方法
-
-推荐用 `quick_l50` 同时运行两条曲线，作为 Figure 4 流程复现和定性趋势验证：
-
-```powershell
-conda run -n env_torch python figure4_runner.py `
-  --output-dir figure4_compare_quick_l50 `
-  --device cuda `
-  --resume `
-  --preset quick_l50 `
-  --settings wo_cgfm w_cgfm
-```
-
-只运行 `w/o CGFM`：
-
-```powershell
-conda run -n env_torch python figure4_runner.py `
-  --output-dir figure4_wo_cgfm_quick_l50 `
-  --device cuda `
-  --resume `
-  --preset quick_l50 `
-  --settings wo_cgfm
-```
-
-只运行 `w/ CGFM`：
-
-```powershell
-conda run -n env_torch python figure4_runner.py `
-  --output-dir figure4_w_cgfm_quick_l50 `
-  --device cuda `
-  --resume `
-  --preset quick_l50 `
-  --settings w_cgfm
-```
-
-画单个 summary：
-
-```powershell
-conda run -n env_torch python plot_figure4.py `
-  --summary figure4_compare_quick_l50\figure4_summary.json `
-  --output figure4_compare_quick_l50\figure4.png
-```
-
-合并分别运行得到的两个 summary 画图：
-
-```powershell
-conda run -n env_torch python plot_figure4.py `
-  --summary figure4_wo_cgfm_quick_l50\figure4_summary.json figure4_w_cgfm_quick_l50\figure4_summary.json `
-  --output figure4_compare_quick_l50\figure4.png
-```
-
-### Figure 4 输出规则
-
-`figure4_outputs.py` 定义统一输出布局：
-
-- summary：`figure4_summary.json`
-- manifest：`manifest.json`
-- 默认图像：`figure4.png`
-- runner 日志：`logs/figure4_runner.log`
-- plot 日志：`logs/plot_figure4.log`
-- checkpoint：`trajectories/{setting}_{objective}_seed_{seed}.json`
-
-`classify_output_path(path)` 返回 `managed_current`、`protected_legacy`、`temporary_test` 或 `unknown`。
-
-受保护旧输出包括 `figure4_quick_l50`、`figure4_cgfm_quick_l50`、`figure4_compare_l50_from_separate`，以及名字包含 `quick_150` 或 `quick150` 的目录。这些目录可用于查看历史结果，但新版代码不保证读取旧 checkpoint 或旧 summary schema。
-
-### Figure 4 命名与 schema 规则
-
-- setting 名称是 `wo_cgfm` 和 `w_cgfm`。
-- objective 名称是 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T`。
-- summary 聚合 key 是 `{objective}:{setting}`，例如 `kappa:wo_cgfm`。
-- summary schema 和 checkpoint schema 都是 version 2。
-- 聚合曲线字段是 `best_so_far_mean`、`best_so_far_std`、`best_so_far_min`、`best_so_far_max`。
-- replacement 计数字段是 `duplicate_replacements`、`invalid_replacements`、`random_replacements`、`random_replacement_draws`、`accepted_sa_candidates`、`completed_iterations`。
-- `delta_alpha` 和 `delta_T` 绘图时使用 log y 轴，并仅在绘图层把显示值 clamp 到 `1e-12`；JSON 保留真实值。
-
-### Figure 4 测试与验收
-
-运行完整单元测试：
+运行全部测试：
 
 ```powershell
 conda run -n env_torch python -m unittest discover -v
 ```
 
-运行 Figure 4 小规模验收：
+`manifest.json` 会记录命令、解析后的配置、Python 与依赖版本、CUDA 信息、Git commit/dirty 状态，以及本地论文 PDF 的路径、存在状态和 SHA-256。原始实验目录、checkpoint 和 PNG 默认不进入 Git；验收器生成的精简 JSON 报告应保存到 `results/`。
+
+## 共同的候选选择规则
+
+Figure 4 和 Figure 5 共用 `figure4_qubo_math.py` 中的退火求解逻辑：
+
+1. 保留 `neal` 返回的全部 SA reads，并按能量升序排列。
+2. 从低能量到高能量逐个解码，选择第一个同时满足编码约束和四相总和约束的候选。
+3. 如果整批 reads 都没有可行候选，本轮明确失败，不用随机样本伪装成 QUBO 结果。
+4. 只有可行候选与已有 composition 重复时，才生成唯一的 random replacement。
+
+summary 会记录 `infeasible_sa_samples_skipped`、`max_feasible_candidate_rank`、`duplicate_replacements`、`random_replacements` 和 `random_replacement_draws`。旧版 `invalid_replacement` 路径已移除。
+
+命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device 检查、seed 列表校验和 manifest 运行环境元数据。
+
+## 第一部分：Figure 4 复现
+
+### Figure 4 当前状态
+
+- 已完成 `wo_cgfm`（直接四相编码）和 `w_cgfm`（CGFM 角度编码）两条流程。
+- 已完成 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T` 五个 objective；优化方向由 `ObjectiveSpec` 统一定义。
+- 已完成 PyTorch FM、FM-to-QUBO、SA 全 reads 可行解筛选、重复候选替换、best-so-far 更新及多 seed 聚合。
+- 已完成 per-trajectory checkpoint、`--resume`、manifest、runner/plot 日志、schema v3 summary 和多 summary 合并绘图；旧 schema 不自动迁移。
+- `figure4_runner.py` 默认使用 `quick`，`test` 用于烟测，`paper` 只作参数参考。
+- 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 4 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
+
+### Figure 4 代码结构
+
+Figure 4 按“数据与运行环境 → 配置与策略 → 数学与模型 → pipeline → I/O 与入口”分层：
+
+```text
+alloy_dataset_generator.py       组成采样、四相归一化、五个真实性质计算
+experiment_runtime.py            device/seed 校验、运行环境与论文哈希元数据
+figure4_experiment_config.py     objective、嵌套配置、paper/quick/test preset
+figure4_setting_strategies.py    wo_cgfm/w_cgfm 编码与解码策略分发
+figure4_qubo_math.py             离散编码、CGFM、QUBO 惩罚、SA 与可行解筛选
+figure4_fm_torch.py              PyTorch FM、Optuna、LBFGS、FM-to-QUBO
+figure4_pipeline.py              trajectory、active learning、checkpoint 恢复与聚合
+figure4_outputs.py               schema v3 checkpoint/summary、标准路径、原子 JSON、日志
+figure4_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
+plot_figure4.py                  读取一个或多个 schema v3 summary 并绘图
+validate_reproduction.py         canonical quick 结构验收与非阻断 diagnostics
+test_figure4_pipeline.py         配置、数学、流程、输出、绘图和 README 契约测试
+```
+
+主依赖方向为：
+
+```text
+figure4_runner
+  -> figure4_experiment_config / experiment_runtime / figure4_outputs
+  -> figure4_pipeline
+       -> alloy_dataset_generator
+       -> figure4_setting_strategies
+       -> figure4_fm_torch
+       -> figure4_qubo_math
+       -> figure4_outputs
+
+plot_figure4 / validate_reproduction -> figure4_summary.json
+```
+
+runner 只做参数解析和编排；active-learning 逻辑只放在 pipeline；编码差异只放在 strategy；路径和 JSON 写入只由 outputs 模块管理。
+
+### Figure 4 算法流程
+
+1. runner 解析 preset 和显式覆盖参数，检查训练依赖与 device，生成连续且非负的 seed 列表，并写 `manifest.json`。
+2. `generate_initial_dataset_batch` 为每个 seed 生成一份初始合金数据；同一 seed 下所有 setting/objective 从相同初始数据出发。
+3. pipeline 对 `seed × objective × setting` 的笛卡尔积运行独立 trajectory；一条 trajectory 的唯一身份为 `(setting, objective, seed)`。
+4. 每轮读取当前数据集的真实 objective。最大化目标先取负，最小化目标保持原值，再做 z-score，使 FM/QUBO 始终按“越小越好”求解。
+5. strategy 创建当轮离散编码并编码训练特征：
+   - `wo_cgfm` 使用四个 composition block，QUBO 需要 `system penalty + one-hot penalty`。
+   - `w_cgfm` 使用三个 CGFM angle block；解码天然得到非负且总和为 1 的四相 composition，因此只加 `one-hot penalty`。
+6. `fit_torch_fm` 训练二阶 FM，`fm_to_qubo` 将常数、线性项和交互项展开为 QUBO；`build_single_objective_qubo` 归一化并叠加所需约束。
+7. `solve_qubo_with_sa` 返回全部能量排序后的 reads，`select_lowest_energy_feasible_sample` 选择最低能量可行状态并记录其 rank 和跳过数量。
+8. strategy 解码候选。新 composition 直接加入数据集；重复 composition 保留“重复”判定并加入唯一 random replacement；不可行候选不会进入替换分支。
+9. 用真实性质更新该 objective 的 best-so-far，更新审计计数，并在每轮后原子写入 trajectory checkpoint。
+10. 全部 trajectory 完成后，按 `{objective}:{setting}` 聚合各 seed 的 `mean/std/min/max` 曲线并写 schema v3 summary；绘图和验收只读取 summary，不重新训练。
+
+### Figure 4 对象命名与调用规则
+
+| 层 | 对象或值 | 命名与职责 |
+| --- | --- | --- |
+| 规模 | `RunScale` | 只允许 `paper`、`quick`、`test`；正式验收只使用 `quick`。 |
+| 目标 | `ObjectiveSpec`、`OBJECTIVES` | objective 名固定为 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T`，顺序以 `OBJECTIVES` 为准。 |
+| 配置 | `ExperimentConfig` | 顶层持有 `EncodingConfig`、`FMConfig`、`SAConfig`，不在 pipeline 中散落独立参数。 |
+| setting | `Figure4Setting` | 只允许 `wo_cgfm`、`w_cgfm`；不得使用大小写变体或显示名称代替机器值。 |
+| 策略 | `SettingStrategy` | 统一接口为 `create_encoding`、`encode_rows`、`decode_candidate`；实现类为 `WOCGFMStrategy`、`WCGFMStrategy`。 |
+| 运行状态 | `TrajectoryState` | 只表示可 checkpoint 的单轨迹可变状态。 |
+| 结果 | `TrajectoryResult`、`AggregatedTrajectory`、`Figure4Summary` | 分别表示单轨迹、跨 seed 曲线和完整 summary；summary 聚合键固定为 `{objective}:{setting}`。 |
+| 输出 | `Figure4OutputLayout` | 统一派生 summary、manifest、日志、图片和 checkpoint 路径。 |
+
+调用规则：
+
+1. 完整实验优先调用 `figure4_runner.py`，因为它会执行依赖/device 检查并写 manifest。
+2. 程序化调用依次使用 `resolve_experiment_config(...)` 和 `run_figure4_experiment(...)`；直接调用 pipeline 不会自动写 manifest。
+3. `run_single_trajectory(...)` 只用于聚焦测试或高级编排；普通调用者不应自行拼接 checkpoint payload。
+4. 以 `_` 开头的函数和未列入模块 `__all__` 的迭代中间对象属于模块内部实现，不作为跨模块调用接口。
+5. setting 和 seed 列表必须非空、无重复；seed 必须是非负整数。objective 子集会按 canonical `OBJECTIVES` 顺序执行，而不是按 CLI 输入顺序执行。
+6. 路径必须通过 `figure4_output_layout(...)` / `Figure4OutputLayout` 获取；同一输出目录不得混用不同 config、setting、objective 或 seed 身份后继续 `--resume`。
+
+程序化调用示例：
+
+```python
+from figure4_experiment_config import OBJECTIVES, resolve_experiment_config
+from figure4_pipeline import run_figure4_experiment
+
+config = resolve_experiment_config(preset="quick", device="cpu")
+summary = run_figure4_experiment(
+    seed_list=[0, 1, 2],
+    config=config,
+    output_dir="figure4_quick",
+    objectives=OBJECTIVES,
+    settings=("wo_cgfm", "w_cgfm"),
+    resume=True,
+)
+```
+
+### Figure 4 配置规则
+
+`ExperimentConfig` 的结构为：
+
+```text
+ExperimentConfig
+  num_samples
+  iterations
+  encoding: EncodingConfig(num_levels)
+  fm: FMConfig(optuna_trials, device)
+  sa: SAConfig(reads, sweeps)
+```
+
+| preset | initial samples | iterations | levels | Optuna trials | SA reads | SA sweeps | default seeds | 用途 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `test` | 10 | 2 | 8 | 0 | 32 | 12 | 1 | 烟测 |
+| `quick` | 100 | 100 | 50 | 3 | 100 | 500 | 3 | 项目验收 |
+| `paper` | 100 | 600 | 50 | 20 | 1000 | 3000 | 20 | 参数参考，不验收 |
+
+- 配置先由 `preset_config` 解析，再由 `resolve_experiment_config` 应用 CLI 显式覆盖；未覆盖字段保留 preset 值。
+- `num_samples`、`iterations`、SA reads/sweeps 必须为正数；`num_levels > 1`；`optuna_trials >= 0`；device 只允许 `cpu` 或 `cuda`。
+- CLI 可覆盖 `--num-samples`、`--iterations`、`--num-levels`、`--optuna-trials`、`--sa-reads`、`--sa-sweeps`。
+- `--settings` 必填；`--objectives` 省略或传空时运行全部五个目标。
+- `--seed-start` 必须非负，`--num-seeds` 必须为正；默认 seed 为从 0 开始的连续列表。
+- 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
+- canonical `quick` 验收要求表中精确配置、3 个默认 seed、全部 setting 和 objective；任何数值或 seed 覆盖都可运行，但不属于 canonical 验收结果。
+
+### Figure 4 运行方法
+
+最短烟测：
 
 ```powershell
 conda run -n env_torch python figure4_runner.py `
-  --output-dir figure4_refactor_test `
-  --device cuda `
-  --resume `
+  --output-dir figure4_test `
+  --preset test `
   --settings wo_cgfm w_cgfm `
   --objectives kappa `
-  --preset test
+  --resume
+
+conda run -n env_torch python plot_figure4.py `
+  --summary figure4_test\figure4_summary.json `
+  --output figure4_test\figure4.png
 ```
 
+正式小规模流程：
+
 ```powershell
+conda run -n env_torch python figure4_runner.py `
+  --output-dir figure4_quick `
+  --preset quick `
+  --settings wo_cgfm w_cgfm `
+  --device cuda `
+  --resume
+
 conda run -n env_torch python plot_figure4.py `
-  --summary figure4_refactor_test\figure4_summary.json `
-  --output figure4_refactor_test\figure4.png
+  --summary figure4_quick\figure4_summary.json `
+  --output figure4_quick\figure4.png
 ```
+
+验收 canonical `quick` summary：
+
+```powershell
+conda run -n env_torch python validate_reproduction.py figure4 `
+  --summary figure4_quick\figure4_summary.json `
+  --output results\figure4_quick_validation.json
+```
+
+### Figure 4 输出规则
+
+```text
+<output-dir>/
+  figure4_summary.json
+  manifest.json
+  figure4.png
+  logs/
+    figure4_runner.log
+    plot_figure4.log
+  trajectories/
+    {setting}_{objective}_seed_{seed}.json
+```
+
+| 输出 | 规则 |
+| --- | --- |
+| `manifest.json` | 记录命令、preset、resolved config、runtime、seed/objective/setting 选择和标准输出路径。 |
+| trajectory checkpoint | schema v3；绑定 `setting + objective + seed + config`，只在全部身份字段精确匹配时恢复。 |
+| `figure4_summary.json` | schema v3；包含 config、seed/objective/setting、所有 `trajectories` 和 `{objective}:{setting}` 聚合曲线。 |
+| `figure4.png` | 由 `plot_figure4.py` 从一个或多个 schema v3 summary 生成；不是训练输入。 |
+| 日志 | runner 和 plot 分文件记录；不得用日志替代机器可读 summary/validation report。 |
+
+每条轨迹必须满足：`completed_iterations == iterations`、`len(best_so_far) == iterations`、`final_dataset_size == num_samples + iterations`，并且 `accepted_sa_candidates + duplicate_replacements == iterations`。不同配置必须使用不同输出目录；旧 schema checkpoint 不会自动覆盖或迁移。
+
+### Figure 4 验收规则
+
+Figure 4 canonical `quick` 只检查：
+
+- 配置为 100 条初始数据、100 次迭代、50 levels、3 seeds。
+- 五个 objectives × 两个 settings × 三个 seeds，共 30 条轨迹全部完成。
+- 聚合曲线字段完整、长度正确且数值有限。
+- accepted/replacement 计数、数据集增长和迭代数一致。
+
+`w_cgfm` 是否表现出论文报告的优势只写入 `diagnostics.cgfm_paper_direction`，不影响验收结果。
 
 ## 第二部分：Figure 5 复现
 
-### Figure 5 开发情况
+### Figure 5 当前状态
 
-- 已实现多目标初始数据生成器：`generate_initial_dataset_multi_objective` 和 `generate_initial_dataset_multi_objective_batch`。
-- 已实现 `figure5_scalarization.py`：支持论文式 DDTS 人工目标和 weighted-sum baseline 的三个独立 FM targets。
-- 已实现 `figure5_pareto.py`：支持 `is_dominated` 和 `pareto_front`。
-- 已实现 Figure 5 pipeline、`test/quick150/paper` 配置、checkpoint/resume、summary schema v1、manifest 和 runner。
-- 已实现 `plot_figure5.py`：支持单 seed 3D Pareto 总览、分段采样进展、可选 replacement 叠加和多 seed 显式选择。
-- Figure 5 不应复用 Figure 4 的 `best_so_far` 单目标曲线作为核心结果；它比较的是多目标优化中采样到的解在三维目标空间中的覆盖情况。
+- 已完成 `w_ddts` 和 `wo_ddts`（weighted-sum baseline）两条多目标流程。
+- 已完成最大化 `kappa`、最大化 `E`、最小化 `rho` 的统一方向处理、可复现 preference weights、DDTS 人工目标、三 FM QUBO 合并和 Pareto front。
+- 已完成每轮 proposed solution 与实际 added solution 的分别记录；重复 proposed solution 会保留，random replacement 不进入 Pareto front。
+- 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、schema v2 checkpoint/summary、`--resume`、manifest 和 runner/plot 日志；旧 schema 不自动迁移。
+- 已完成单/双 setting 绘图、3D 总览、迭代窗口及多 seed 显式选择；canonical `quick` 要求两个 setting 完整对比。
+- 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 5 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
 
-### Figure 5 当前代码结构
+### Figure 5 代码结构
 
-- `alloy_dataset_generator.py`：已有 Figure 5 多目标初始数据生成器，复用 Figure 4 的 row schema、物性计算和 CSV 写出。
-- `figure5_scalarization.py`：定义 `w_ddts` 与 `wo_ddts` 的人工训练目标构造，以及 preference weights 采样/校验。
-- `figure5_pareto.py`：定义 Pareto 支配关系和非支配 front 筛选。
-- `figure5_experiment_config.py`：定义 Figure 5 的 `paper/quick150/test` preset 和 CLI override 规则。
-- `figure5_pipeline.py`：运行两条多目标 trajectory，处理 FM/QUBO/SA、decode、replacement、resume 和 Pareto summary。
-- `figure5_outputs.py`：定义 Figure 5 输出布局、checkpoint schema v1、原子 JSON 写入和日志。
-- `figure5_runner.py`：解析 CLI、检查 CUDA、运行 pipeline 并写 manifest。
-- `plot_figure5.py`：校验 summary schema v1，按 seed 重算 Pareto front，并绘制总览和时间窗图。
-- `test_alloy_dataset_generator.py`：覆盖多目标初始数据生成。
-- `test_figure5_scalarization.py`：覆盖 weighted-sum、DDTS、权重采样和输入校验。
-- `test_figure5_pareto.py`：覆盖支配方向、相同点、折中点、非凸点和非法输入。
-- `test_figure5_pipeline.py`：覆盖 preset、一/三 FM 分支、QUBO 合并、replacement、resume、summary 和 manifest。
-- `test_plot_figure5.py`：覆盖 seed 选择、Pareto front 重算、时间窗、输入校验和 PNG 输出。
+Figure 5 复用数据、FM、QUBO 和运行环境基础层，并在其上增加多目标 scalarization、Pareto 和独立 pipeline：
 
-### Figure 5 目标
+```text
+alloy_dataset_generator.py       多目标初始数据、组成归一化、真实性质计算
+experiment_runtime.py            device/seed 校验、运行环境与论文哈希元数据
+figure4_experiment_config.py     复用 EncodingConfig/FMConfig/SAConfig
+figure4_fm_torch.py              复用 PyTorch FM、Optuna、LBFGS、FM-to-QUBO
+figure4_qubo_math.py             复用直接编码、QUBO 惩罚、SA 与可行解筛选
+figure5_experiment_config.py     Figure 5 配置与 paper/quick/test preset
+figure5_scalarization.py         preference weights、DDTS、三目标标准化与数学对照
+figure5_pareto.py                mixed-sense 支配关系与 Pareto front
+figure5_pipeline.py              多目标 active learning、checkpoint、solutions 与 summary
+figure5_outputs.py               schema v2 checkpoint/summary、标准路径、原子 JSON、日志
+figure5_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
+plot_figure5.py                  单/双 setting、seed 选择、3D 总览和迭代窗口
+validate_reproduction.py         canonical quick 结构验收与精确 front diagnostics
+test_figure5_*.py                scalarization、Pareto、pipeline 和输出契约测试
+test_plot_figure5.py             summary 校验、seed 选择和绘图测试
+```
 
-- 复现论文 Figure 5 的多目标 FM+QO 对比：`w/ DDTS` 与 `w/o DDTS`。
-- 多目标集合固定为 `kappa`、`E`、`rho`：
-  - `kappa`：越大越好。
-  - `E`：越大越好。
-  - `rho`：越小越好。
-- 论文参考规模对齐 Figure 5：
-  - 初始数据集：`num_samples=500`。
-  - active learning：`iterations=1000`。
-  - 编码：按论文 Figure 5 使用四相直接 one-hot 编码，4 个 block，每个 block `num_levels=25`，并加入 system penalty。
-  - QUBO 求解：复用 D-Wave Ocean `neal` simulated annealing。
-- 由于论文规模运行时间过长，本项目仅保留 `paper` 参数用于对照，不尝试实际运行；项目流程复现和趋势验证输出以 `quick150` 为准。
-- 输出重点不是单目标 best-so-far，而是：
-  - 每次迭代采样到的合金设计。
-  - 每个设计的 `kappa/E/rho` 真实值。
-  - `w_ddts` 和 `wo_ddts` 各自找到的非支配 Pareto front。
-  - 按迭代区间分段的采样进展。
+主依赖方向为：
 
-### Figure 5 配置规模
+```text
+figure5_runner
+  -> figure5_experiment_config / experiment_runtime / figure5_outputs
+  -> figure5_pipeline
+       -> alloy_dataset_generator
+       -> figure5_scalarization / figure5_pareto
+       -> figure4_fm_torch / figure4_qubo_math
+       -> figure5_outputs
 
-Figure 5 runner 提供 `paper`、`quick150`、`test` 三个 preset。`quick150` 是本项目实际运行的流程复现和趋势验证规模；`test` 只用于小规模端到端验收，`paper` 只保留论文原始规模参数供对照。
+plot_figure5 / validate_reproduction -> figure5_summary.json
+```
 
-| preset | initial samples | iterations | direct one-hot levels | Optuna trials | SA reads | SA sweeps | default seeds |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `test` | 10 | 2 | 8 | 0 | 2 | 6 | 1 |
-| `quick150` | 500 | 150 | 25 | 3 | 100 | 500 | 1 |
-| `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 1 |
+Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用稳定的配置子对象、FM 和 QUBO/SA 数学组件。
 
-- `quick150` 保留论文规模的 500 条初始数据和 25-level 直接编码，将 active-learning 迭代缩短到 150，并降低 Optuna 和 SA 预算。
-- Figure 5 不做 Figure 4 式的默认多 seed 统计；三个 preset 都默认只使用 seed 0。
-- 一次默认实验共运行两条 trajectory：`w_ddts + seed 0` 和 `wo_ddts + seed 0`，两者使用同一份初始数据。
-- `--num-seeds` 和 `--seed-start` 仅用于用户主动执行额外稳定性实验；`N` 个 seeds 与两个 settings 会产生 `2 * N` 条 trajectory。
-- `quick150` 的 summary、Pareto front 和 Figure 5 图是本项目的流程复现和趋势验证产物，不代表论文完整规模结果。
-- `paper` 不进入实际运行、结果验收或输出交付范围。
-- CLI 数值参数应能覆盖 preset，与 Figure 4 runner 的规则保持一致。
+### Figure 5 算法流程
 
-### Figure 5 与 Figure 4 的复用边界
+1. runner 解析 preset 和覆盖参数，检查依赖/device，生成 seed 列表并写 `manifest.json`。
+2. `generate_initial_dataset_multi_objective_batch` 为每个 seed 生成共享初始数据；同一 seed 下 `w_ddts` 和 `wo_ddts` 从相同数据出发。
+3. pipeline 对 `seed × setting` 运行独立 trajectory；一条 trajectory 的唯一身份为 `(setting, seed)`。
+4. `preference_weights_for_iteration(seed, iteration)` 为每轮生成三个非负且和为 1 的确定性权重；同一 seed/iteration 的两个 setting 使用相同权重。
+5. 两条 scalarization 路径分别构造 FM/QUBO：
+   - `w_ddts`：对三个真实目标做 z-score，构造 utopian point，并以最大加权方向距离作为一个 FM 的人工 target：
 
-Figure 5 应直接复用：
+     ```text
+     max(
+       w_kappa * (u_kappa - z_kappa),
+       w_E     * (u_E     - z_E),
+       w_rho   * (z_rho   - u_rho)
+     )
+     ```
 
-- `alloy_dataset_generator.py` 中的真实物性计算和 `build_dataset_row`。
-- `figure4_qubo_math.py` 中的直接四相编码、system/one-hot penalty、FM QUBO 构造和 SA 求解。
-- `figure4_fm_torch.py` 中的 FM 训练和 `fm_to_qubo`。
-- `figure4_outputs.py` 的输出布局思想、checkpoint 原子写入、日志配置和 schema 校验风格。
-- `figure4_pipeline.py` 中的候选验收思想：decode 后必须得到非负、总和为 1 的四相 composition；非法或重复候选用 random replacement 处理。
+   - `wo_ddts`：将目标转换为 `-kappa`、`-E`、`rho` 后分别 z-score，训练三个 FM，再在 QUBO 层合并：
 
-Figure 5 应新增而不是硬塞到 Figure 4 中：
+     ```text
+     Q = w_kappa * Q_kappa + w_E * Q_E + w_rho * Q_rho
+     ```
 
-- 多目标 scalarization 策略。
-- Pareto front 计算。
-- 3D objective-space summary 和 plot schema。
-- Figure 5 专用 runner、summary 和 checkpoint dataclass。
+6. 两条路径都使用四个 composition one-hot block，并对合并后的 QUBO 加 `system penalty + one-hot penalty`。
+7. SA 返回全部 reads；流程选择最低能量可行候选，记录 `sa_energy`、`feasible_candidate_rank` 和跳过的不可行样本数。
+8. 每轮同时保存 `proposed_solution` 与 `added_solution`。新候选两者相同；重复候选的 proposed 保持不变，added 改为唯一 random replacement，状态为 `duplicate_replacement`。
+9. 每轮更新 trajectory state 并原子写 checkpoint；完成后将所有 proposed solution 展平到 summary 的 `solutions`。
+10. `pareto_front` 按 setting 从 proposed solutions 计算非支配集：A 支配 B 当且仅当 `A.kappa >= B.kappa`、`A.E >= B.E`、`A.rho <= B.rho`，且至少一个目标严格更优。
+11. 绘图器对选定 seed 重新校验并计算展示 front；验收器枚举 25-level 离散设计空间，计算精确 front coverage、precision 和 spacing diagnostics。
 
-### Figure 5 初始数据生成
+### Figure 5 对象命名与调用规则
 
-Figure 5 的多目标初始数据生成器已实现：
+| 层 | 对象或值 | 命名与职责 |
+| --- | --- | --- |
+| 规模 | `Figure5RunScale` | 只允许 `paper`、`quick`、`test`；正式验收只使用 `quick`。 |
+| 配置 | `Figure5ExperimentConfig` | 顶层持有复用的 `EncodingConfig`、`FMConfig`、`SAConfig`。 |
+| setting | `Figure5Setting` | 只允许 `w_ddts`、`wo_ddts`；顺序以 `SUPPORTED_SETTINGS` 为准。 |
+| 目标 | `FIGURE5_OBJECTIVES` | 固定顺序为 `kappa`、`E`、`rho`；方向由 `FIGURE5_OBJECTIVE_SENSES` 定义。 |
+| scalarization | `ScalarizationResult`、`ObjectiveTargetsResult` | 分别表示单人工 target 和三目标独立 target；权重顺序必须与 `FIGURE5_OBJECTIVES` 一致。 |
+| 迭代记录 | `SolutionPoint`、`IterationRecord` | 分别表示一个设计点和一轮 proposed/added 决策；iteration 使用从 0 开始的整数。 |
+| 运行状态 | `Figure5TrajectoryState`、`Figure5TrajectoryResult` | 分别表示可恢复状态和完整单轨迹结果。 |
+| 总结果 | `Figure5Summary` | 保存 trajectories、展平后的 proposed `solutions` 和按 setting 分组的 `pareto_front`。 |
+| 输出 | `Figure5OutputLayout` | 统一派生 summary、manifest、日志、图片和 checkpoint 路径。 |
+
+调用规则：
+
+1. 完整实验优先调用 `figure5_runner.py`；程序化调用依次使用 `resolve_experiment_config(...)` 和 `run_figure5_experiment(...)`。
+2. pipeline 的 `w_ddts` 路径调用 `compute_ddts_targets(...)`；`wo_ddts` 路径必须调用 `compute_individual_objective_targets(...)` 后训练三个 FM，并在 QUBO 层合并。
+3. `compute_weighted_sum_targets(...)` 和 `scalarize_training_targets(...)` 保留为数学对照/测试工具，不代表生产 pipeline 的三 FM baseline 调用路径。
+4. `run_single_trajectory(...)` 只用于聚焦测试或高级编排；以 `_` 开头的函数和未公开的训练中间对象不作为跨模块 API。
+5. `decision_status` 只允许 `accepted` 或 `duplicate_replacement`；Pareto front 只读取 `proposed_solution`，不得把 random replacement 当成优化器提出的点。
+6. setting 和 seed 列表必须非空、无重复；seed 必须为非负整数。同一 seed/iteration 的权重由函数确定，不允许调用方为两个 setting 分别随机采样。
+7. 路径必须通过 `figure5_output_layout(...)` / `Figure5OutputLayout` 获取；多 seed summary 绘图必须用 `--seed` 明确选择一条 seed，避免隐式混合轨迹。
+
+程序化调用示例：
 
 ```python
-generate_initial_dataset_multi_objective(
-    num_samples: int = 500,
-    seed: int | None = None,
-    output_path: str | Path | None = None,
+from figure5_experiment_config import resolve_experiment_config
+from figure5_pipeline import run_figure5_experiment
+
+config = resolve_experiment_config(preset="quick", device="cpu")
+summary = run_figure5_experiment(
+    seed_list=[0],
+    config=config,
+    output_dir="figure5_quick",
+    settings=("w_ddts", "wo_ddts"),
+    resume=True,
 )
 ```
 
-生成流程：
+### Figure 5 配置规则
 
-1. 固定 Al matrix 为 80%，四个次相归一化分数总和为 1。
-2. 从剩余 simplex 区间中逐步抽取前三个临时分数。
-3. 最后一个临时分数取剩余量。
-4. 打乱四个分数分配到 Si、Mg2Si、Al3Ni、Al2Cu。
-5. 用 `build_dataset_row` 计算所有物性。
-6. 可选复用现有 CSV schema 写出数据。
-
-### Figure 5 scalarization
-
-Figure 5 至少包含两个 setting：
-
-- `w_ddts`：使用 DDTS，即 data-driven Tchebycheff scalarization。
-- `wo_ddts`：使用标准 weighted-sum scalarization。
-
-`wo_ddts` weighted-sum 每轮 active learning：
-
-1. 当前数据集包含 composition 和真实 `kappa/E/rho`。
-2. 生成 preference weights `w = (w_kappa, w_E, w_rho)`，要求非负且总和为 1。
-3. 对三个目标统一成最小化方向：`[-kappa, -E, rho]`。
-4. 对每个目标在当前数据集上做 z-score。
-5. 分别训练三个 FM，并将它们转换为 `Q_kappa/Q_E/Q_rho`。
-6. 在 QUBO 层按 preference weights 合并：
+`Figure5ExperimentConfig` 的结构为：
 
 ```text
-Q_weighted = w_kappa * Q_kappa + w_E * Q_E + w_rho * Q_rho
+Figure5ExperimentConfig
+  num_samples
+  iterations
+  encoding: EncodingConfig(num_levels)
+  fm: FMConfig(optuna_trials, device)
+  sa: SAConfig(reads, sweeps)
 ```
 
-`w_ddts` DDTS 每轮 active learning：
+| preset | initial samples | iterations | levels | Optuna trials | SA reads | SA sweeps | default seeds | 用途 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `test` | 10 | 2 | 8 | 0 | 32 | 12 | 1 | 烟测 |
+| `quick` | 500 | 150 | 25 | 3 | 100 | 500 | 1 | 项目验收 |
+| `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 1 | 参数参考，不验收 |
 
-1. 当前数据集包含 composition 和真实 `kappa/E/rho`。
-2. 生成 preference weights `w = (w_kappa, w_E, w_rho)`。
-3. 对 `kappa/E/rho` 分别做 z-score。
-4. 在 z-score 空间计算 utopian point：`1.1*max(z_kappa)`、`1.1*max(z_E)`、`1.1*min(z_rho)`。
-5. 计算方向一致距离，构造人工训练目标：
+- 配置先由 Figure 5 的 `preset_config` 解析，再由 `resolve_experiment_config` 应用显式覆盖；Figure 4 和 Figure 5 的 preset 名相同，但数值彼此独立。
+- 数值、device、seed 和 SA 参数遵循与 Figure 4 相同的合法性规则；CLI 首选 `--sa-reads`。
+- `--settings` 必填；objectives 固定为 `kappa E rho`，Figure 5 CLI 不接受 objective 子集。
+- Figure 5 使用四相直接 one-hot 编码和 system penalty，不接受 CGFM setting。
+- 默认运行 seed 0；显式传入 `--num-seeds N` 时每个 setting 都运行 N 条 trajectory。
+- 多 seed 和数值覆盖是受支持的开发配置，但 canonical `quick` 验收要求表中精确配置、seed 0 和两个 setting。
+- 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
 
-```text
-y_hat(d) = max(
-  w_kappa * (u_kappa - z_kappa(d)),
-  w_E * (u_E - z_E(d)),
-  w_rho * (z_rho(d) - u_rho)
-)
-```
+### Figure 5 运行方法
 
-`w_ddts` 输出一个“越小越好”的 FM 训练目标；`wo_ddts` 的三个方向一致 target 分别用于三个 FM，weighted sum 发生在 QUBO 层。
-
-### Figure 5 Pareto front
-
-Figure 5 trajectory 分开保存每轮 proposed QUBO solution 和实际 added solution。summary 的扁平 `solutions` 只包含有效 proposed solution；重复 proposed solution 保留，random replacement 不进入论文式 Pareto front。
-
-对 `kappa/E/rho`，解 A 支配解 B 当且仅当：
-
-```text
-A.kappa >= B.kappa
-A.E >= B.E
-A.rho <= B.rho
-```
-
-并且至少一个目标严格更好。未被任何其他点支配的点属于 Pareto front。
-
-当前已实现：
-
-```python
-is_dominated(candidate, other) -> bool
-pareto_front(points) -> list[points]
-```
-
-`pareto_front` 保持输入顺序，并返回原始 point 对象，方便后续 summary 保留 `setting/seed/iteration/composition` 等字段。
-
-### Figure 5 目标输出布局
-
-建议 Figure 5 采用独立输出目录和 schema，不复用 `figure4_summary.json`：
-
-```text
-figure5_output_dir/
-  figure5_summary.json
-  manifest.json
-  logs/
-    figure5_runner.log
-    plot_figure5.log
-  trajectories/
-    w_ddts_seed_0.json
-    wo_ddts_seed_0.json
-  figure5.png
-```
-
-`figure5_summary.json` 建议字段：
-
-```json
-{
-  "schema_version": 1,
-  "training_backend": "pytorch_fm_lbfgs",
-  "config": {},
-  "seed_list": [0],
-  "objectives": ["kappa", "E", "rho"],
-  "settings": ["w_ddts", "wo_ddts"],
-  "trajectories": [],
-  "solutions": [],
-  "pareto_front": {
-    "w_ddts": [],
-    "wo_ddts": []
-  }
-}
-```
-
-checkpoint 中必须保存：
-
-- 当前 rows。
-- 每轮 proposed solution 和 added solution。
-- 当前 iteration。
-- random replacement 计数。
-- 当前 setting、seed、config。
-- 最近一轮 weights、utopian point、FM metadata 和 QUBO stats。
-
-### Figure 5 绘图
-
-`plot_figure5.py` 生成接近论文 Figure 5 的三行布局：
-
-1. 顶部 panel a/b：`w_ddts` 与 `wo_ddts` 的全部 proposed QUBO solutions 和 Pareto front。
-2. 中部 panel c：`w_ddts` 按迭代区间横向排列的采样进展。
-3. 底部 panel d：`wo_ddts` 按迭代区间横向排列的采样进展。
-
-本项目 `quick150` 趋势验证结果的默认分段：
-
-```text
-0-50
-50-100
-100-150
-```
-
-`paper` 参数对照的分段为 `0-250`、`250-500`、`500-750`、`750-1000`，但本项目不生成该规模图。其他迭代规模自动划分为最多四个近似等宽时间窗，也可用 `--iteration-boundaries` 覆盖。
-
-坐标轴：
-
-```text
-x = kappa
-y = rho
-z = E
-```
-
-绘图规则：
-
-- 灰色点：该 setting 找到的所有候选设计。
-- 蓝色点：该 setting 的 Pareto front。
-- 分段图用不同颜色表示迭代区间。
-- 单 seed summary 自动选择唯一 seed；多 seed summary 必须通过 `--seed` 选择一条 trajectory，不做跨 seed 聚合。
-- 绘图时针对选定 seed 和每个 setting 重新计算 Pareto front，不使用多 seed summary 中的联合 front。
-- random replacement 默认不显示，也不参与 Pareto front；传入 `--include-replacements` 后以橙色 `x` 叠加。
-- 所有 3D panel 使用相同的坐标范围、视角和单位，重复 proposed solution 保留且 Pareto 点不连线。
-
-### Figure 5 运行命令
-
-小规模验收：
+最短烟测：
 
 ```powershell
 conda run -n env_torch python figure5_runner.py `
   --output-dir figure5_test `
-  --device cuda `
-  --resume `
   --preset test `
-  --settings w_ddts wo_ddts
+  --settings w_ddts wo_ddts `
+  --resume
+
+conda run -n env_torch python plot_figure5.py `
+  --summary figure5_test\figure5_summary.json `
+  --output figure5_test\figure5.png
 ```
 
-本项目流程复现和趋势验证运行：
+正式小规模流程：
 
 ```powershell
 conda run -n env_torch python figure5_runner.py `
-  --output-dir figure5_quick150 `
+  --output-dir figure5_quick `
+  --preset quick `
+  --settings w_ddts wo_ddts `
   --device cuda `
-  --resume `
-  --preset quick150 `
-  --settings w_ddts wo_ddts
+  --resume
+
+conda run -n env_torch python plot_figure5.py `
+  --summary figure5_quick\figure5_summary.json `
+  --output figure5_quick\figure5.png
 ```
 
-可选的多 seed 稳定性实验（非论文 Figure 5 默认流程）：
+单 setting 开发路径仍受支持：
 
 ```powershell
 conda run -n env_torch python figure5_runner.py `
-  --output-dir figure5_quick150_multiseed `
-  --device cuda `
-  --resume `
-  --preset quick150 `
-  --num-seeds 3 `
-  --seed-start 0 `
-  --settings w_ddts wo_ddts
+  --output-dir figure5_w_ddts_test `
+  --preset test `
+  --settings w_ddts
+
+conda run -n env_torch python plot_figure5.py `
+  --summary figure5_w_ddts_test\figure5_summary.json `
+  --output figure5_w_ddts_test\figure5.png
 ```
 
-生成项目 Figure 5 趋势验证图：
+验收 canonical `quick` summary：
 
 ```powershell
-conda run -n env_torch python plot_figure5.py `
-  --summary figure5_quick150\figure5_summary.json `
-  --output figure5_quick150\figure5.png
+conda run -n env_torch python validate_reproduction.py figure5 `
+  --summary figure5_quick\figure5_summary.json `
+  --output results\figure5_quick_validation.json
 ```
 
-显示 random replacement 并自定义时间窗：
+### Figure 5 输出规则
 
-```powershell
-conda run -n env_torch python plot_figure5.py `
-  --summary figure5_quick150\figure5_summary.json `
-  --output figure5_quick150\figure5_with_replacements.png `
-  --include-replacements `
-  --iteration-boundaries 0 30 75 110 150
+```text
+<output-dir>/
+  figure5_summary.json
+  manifest.json
+  figure5.png
+  logs/
+    figure5_runner.log
+    plot_figure5.log
+  trajectories/
+    {setting}_seed_{seed}.json
 ```
 
-绘制多 seed 实验中的指定 seed：
+| 输出 | 规则 |
+| --- | --- |
+| `manifest.json` | 记录命令、preset、resolved config、runtime、seed/setting 选择、固定 objectives 和标准输出路径。 |
+| trajectory checkpoint | schema v2；绑定 `setting + seed + config`，只在全部身份字段精确匹配时恢复。 |
+| `figure5_summary.json` | schema v2；包含 config、trajectories、proposed `solutions` 和每个 setting 的 `pareto_front`。 |
+| `figure5.png` | 由 `plot_figure5.py` 从 schema v2 summary 生成；多 seed 时必须显式传 `--seed`。 |
+| 日志 | runner 和 plot 分文件记录；验收结论只来自 validation report。 |
 
-```powershell
-conda run -n env_torch python plot_figure5.py `
-  --summary figure5_quick150_multiseed\figure5_summary.json `
-  --output figure5_quick150_multiseed\figure5_seed_1.png `
-  --seed 1
-```
+每条轨迹必须满足：`completed_iterations == iterations`、`len(iteration_records) == iterations`、`final_dataset_size == num_samples + iterations`，并且 `accepted_sa_candidates + duplicate_replacements == iterations`。每条 `IterationRecord` 必须同时保留 setting、seed、iteration、weights、scalarization method、decision status、proposed/added solution 和 SA 诊断字段。
 
-`paper` preset 仅作为论文参数参考保留，本项目不安排运行或绘图。
+### Figure 5 验收规则
 
-### Figure 5 验收标准
+Figure 5 canonical `quick` 只检查：
 
-Figure 5 代码落地后，至少需要通过：
+- 配置为 500 条初始数据、150 次迭代、25 levels、seed 0。
+- `w_ddts` 和 `wo_ddts` 两条 trajectory 均完整，共有 300 条 proposed solution records。
+- composition、真实目标值、iteration identity 和候选计数一致。
+- 两个 summary Pareto fronts 非空，并且精确离散 Pareto front 指标可成功计算。
 
-1. 单元测试：
-   - 多目标初始数据生成器生成的每行 composition 非负且总和为 1。
-   - weighted-sum 的目标方向正确。
-   - DDTS 的 utopian point 和 `max(weighted distance)` 计算正确。
-   - Pareto 支配关系正确。
-   - checkpoint resume 不重复迭代、不丢失已有 solution records。
-2. 小规模端到端验收：
-   - `figure5_runner.py --preset test --settings w_ddts wo_ddts` 能生成 summary、manifest、日志和 checkpoint。
-   - 当前通过 mock FM/SA 测试 summary、manifest、日志和 checkpoint schema。
-   - synthetic summary 能生成非空、非纯色 PNG，并写入 `logs/plot_figure5.log`。
-3. `quick150` 流程复现和趋势验证输出验收：
-   - `figure5_summary.json` 中包含 `w_ddts` 与 `wo_ddts` 两个 setting。
-   - 每个 setting 完成 1 条 trajectory，每条 trajectory 包含 `150` 条 iteration solution record。
-   - `pareto_front.w_ddts` 和 `pareto_front.wo_ddts` 非空。
-   - `figure5.png` 包含全局采样图和分段采样图。
-
-### Figure 5 实现顺序
-
-1. 已完成：在 `alloy_dataset_generator.py` 增加 Figure 5 多目标初始数据生成器。
-2. 已完成：新增 `figure5_scalarization.py`，实现 weighted-sum 和 DDTS。
-3. 已完成：新增 `figure5_pareto.py` 和 `test_figure5_pareto.py`。
-4. 已完成：新增 `figure5_pipeline.py`，复用 Figure 4 的 FM/QUBO/SA/decode/replacement。
-5. 已完成：新增 `figure5_experiment_config.py`、`figure5_runner.py` 和 `figure5_outputs.py`，实现 preset、checkpoint、manifest、summary 和日志。
-6. 已完成：新增 `plot_figure5.py` 和 `test_plot_figure5.py`。
-7. 待执行：先用 `preset test` 验收，再用 `preset quick150` 产出本项目流程复现和趋势验证结果；不运行 `preset paper`。
+验收器仍会枚举 25-level 离散设计空间，报告精确 front coverage、precision、spacing CV 及两种 setting 的比值。这些数据只位于 `metrics` 和 `diagnostics`，不设置覆盖率或均匀性通过阈值。

@@ -12,9 +12,22 @@ import figure5_pipeline as pipeline
 import figure5_runner
 from alloy_dataset_generator import generate_initial_dataset_multi_objective
 from figure4_experiment_config import EncodingConfig, FMConfig, SAConfig
-from figure4_qubo_math import QuboStats, build_single_objective_qubo, create_iteration_encoding, encode_discrete_composition
+from figure4_qubo_math import (
+    QuboStats,
+    SASample,
+    SASamplingResult,
+    build_single_objective_qubo,
+    create_iteration_encoding,
+    encode_discrete_composition,
+)
 from figure5_experiment_config import Figure5ExperimentConfig, preset_config, resolve_experiment_config
-from figure5_outputs import CHECKPOINT_SCHEMA_VERSION, checkpoint_payload, figure5_output_layout, load_checkpoint, write_checkpoint
+from figure5_outputs import (
+    CHECKPOINT_SCHEMA_VERSION,
+    checkpoint_payload,
+    figure5_output_layout,
+    load_checkpoint,
+    write_checkpoint,
+)
 from figure5_pipeline import (
     Figure5TrajectoryResult,
     IterationRecord,
@@ -26,8 +39,8 @@ from figure5_pipeline import (
 )
 
 
-WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test"
-WORKSPACE_TMP_ROOT.mkdir(exist_ok=True)
+WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test" / "figure5_schema_v2_reads32"
+WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _test_config(iterations: int = 2) -> Figure5ExperimentConfig:
@@ -36,7 +49,7 @@ def _test_config(iterations: int = 2) -> Figure5ExperimentConfig:
         iterations=iterations,
         encoding=EncodingConfig(num_levels=8),
         fm=FMConfig(optuna_trials=0, device="cpu"),
-        sa=SAConfig(runs=2, sweeps=6),
+        sa=SAConfig(reads=32, sweeps=12),
     )
 
 
@@ -54,45 +67,65 @@ def _qubo_stats(num_variables: int = 32) -> QuboStats:
 
 def _training_result(config: Figure5ExperimentConfig, seed: int, iteration: int) -> TrainingIterationResult:
     encoding = create_iteration_encoding(config.num_levels, seed + iteration, num_blocks=4)
+    composition = [1.0, 0.0, 0.0, 0.0] if iteration % 2 == 0 else [0.0, 1.0, 0.0, 0.0]
     return TrainingIterationResult(
         encoding=encoding,
-        candidate_bits=np.zeros(4 * config.num_levels, dtype=np.float64),
+        candidate_bits=encode_discrete_composition(composition, encoding),
         weights=preference_weights_for_iteration(seed, iteration),
         scalarization_method="ddts",
         fm_metadata={"mock": True},
         scalarization_metadata={"mock": True},
         qubo_stats=_qubo_stats(4 * config.num_levels),
         sa_energy=0.0,
+        feasible_candidate_rank=1,
+        infeasible_sa_samples_skipped=0,
+    )
+
+
+def _sampling_result(*states: np.ndarray) -> SASamplingResult:
+    return SASamplingResult(
+        samples=tuple(
+            SASample(np.asarray(state, dtype=np.float64), float(index))
+            for index, state in enumerate(states)
+        )
     )
 
 
 class Figure5PipelineTests(unittest.TestCase):
     def test_config_presets_overrides_and_runner_default(self) -> None:
         paper = preset_config("paper", device="cpu")
-        quick = preset_config("quick150", device="cuda")
+        quick = preset_config("quick", device="cuda")
         test = preset_config("test", device="cpu")
 
         self.assertEqual((paper.num_samples, paper.iterations, paper.num_levels), (500, 1000, 25))
         self.assertEqual((quick.num_samples, quick.iterations, quick.num_levels), (500, 150, 25))
-        self.assertEqual((quick.optuna_trials, quick.sa_runs, quick.sa_sweeps), (3, 100, 500))
+        self.assertEqual((quick.optuna_trials, quick.sa_reads, quick.sa_sweeps), (3, 100, 500))
         self.assertEqual((test.num_samples, test.iterations, test.num_levels), (10, 2, 8))
+        self.assertEqual((test.sa_reads, test.sa_sweeps), (32, 12))
 
         overridden = resolve_experiment_config(
             preset="test",
             device="cpu",
             iterations=4,
             num_levels=9,
-            sa_runs=7,
+            sa_reads=7,
         )
-        self.assertEqual((overridden.iterations, overridden.num_levels, overridden.sa_runs), (4, 9, 7))
+        self.assertEqual((overridden.iterations, overridden.num_levels, overridden.sa_reads), (4, 9, 7))
 
         args = figure5_runner.parse_args(["--output-dir", "figure5_default", "--settings", "w_ddts"])
-        self.assertEqual(args.preset, "quick150")
+        self.assertEqual(args.preset, "quick")
         self.assertEqual(
             figure5_runner.PRESET_NUM_SEEDS,
-            {"paper": 1, "quick150": 1, "test": 1},
+            {"paper": 1, "quick": 1, "test": 1},
         )
         self.assertEqual(figure5_runner.resolve_seed_list(args.preset, args.num_seeds, args.seed_start), [0])
+
+        alias_args = figure5_runner.parse_args(
+            ["--output-dir", "figure5_alias", "--settings", "w_ddts", "--sa-runs", "9"]
+        )
+        self.assertEqual(alias_args.sa_reads, 9)
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            pipeline.validate_settings(["w_ddts", "w_ddts"])
 
         multi_seed_args = figure5_runner.parse_args(
             [
@@ -131,7 +164,6 @@ class Figure5PipelineTests(unittest.TestCase):
                 latest_scalarization_metadata={},
                 qubo_stats=None,
                 duplicate_replacements=0,
-                invalid_replacements=0,
                 random_replacements=0,
                 random_replacement_draws=0,
                 accepted_sa_candidates=0,
@@ -180,13 +212,15 @@ class Figure5PipelineTests(unittest.TestCase):
         rows = pipeline.discretize_rows_for_figure5(rows, config.num_levels)
         size = 4 * config.num_levels
 
-        def fake_sa(q: np.ndarray, bias: float, **_: object) -> tuple[np.ndarray, float]:
-            return np.zeros(q.shape[0], dtype=np.float64), float(bias)
+        def fake_sa(q: np.ndarray, bias: float, **_: object) -> SASamplingResult:
+            encoding = create_iteration_encoding(config.num_levels, seed=2, num_blocks=4)
+            state = encode_discrete_composition([1.0, 0.0, 0.0, 0.0], encoding)
+            return _sampling_result(state)
 
         with (
             mock.patch("figure5_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})) as fit_mock,
             mock.patch("figure5_pipeline.fm_to_qubo", return_value=(np.eye(size), 1.0)),
-            mock.patch("figure5_pipeline.simulated_annealing_qubo", side_effect=fake_sa),
+            mock.patch("figure5_pipeline.solve_qubo_with_sa", side_effect=fake_sa),
         ):
             ddts = pipeline._fit_and_solve_iteration(
                 rows=rows,
@@ -221,7 +255,7 @@ class Figure5PipelineTests(unittest.TestCase):
             mock.patch("figure5_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})) as fit_mock,
             mock.patch("figure5_pipeline.fm_to_qubo", side_effect=objective_qubos),
             mock.patch("figure5_pipeline.build_single_objective_qubo", side_effect=capture_build),
-            mock.patch("figure5_pipeline.simulated_annealing_qubo", side_effect=fake_sa),
+            mock.patch("figure5_pipeline.solve_qubo_with_sa", side_effect=fake_sa),
         ):
             weighted = pipeline._fit_and_solve_iteration(
                 rows=rows,
@@ -273,17 +307,16 @@ class Figure5PipelineTests(unittest.TestCase):
             pipeline._row_composition_key(duplicate.added_row),
         )
 
-        invalid = pipeline._decide_candidate(
-            candidate_bits=np.zeros(4 * config.num_levels),
-            encoding=encoding,
-            sample_id=10,
-            seed=3,
-            replacement_rng=random.Random(21),
-            num_levels=config.num_levels,
-            seen_compositions=set(),
-        )
-        self.assertEqual(invalid.status, "invalid_replacement")
-        self.assertIsNone(invalid.proposed_row)
+        with self.assertRaisesRegex(RuntimeError, "not feasible"):
+            pipeline._decide_candidate(
+                candidate_bits=np.zeros(4 * config.num_levels),
+                encoding=encoding,
+                sample_id=10,
+                seed=3,
+                replacement_rng=random.Random(21),
+                num_levels=config.num_levels,
+                seen_compositions=set(),
+            )
 
     def test_partial_resume_and_completed_skip(self) -> None:
         config = _test_config(iterations=2)
@@ -323,9 +356,8 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual(fit_mock.call_count, 1)
         self.assertEqual(resumed.completed_iterations, 2)
         self.assertEqual(resumed.final_dataset_size, config.num_samples + config.iterations)
-        self.assertEqual(resumed.invalid_replacements, 2)
-        self.assertEqual(resumed.random_replacements, 2)
-        self.assertGreaterEqual(resumed.random_replacement_draws, 2)
+        self.assertEqual(resumed.random_replacements, 0)
+        self.assertEqual(resumed.infeasible_sa_samples_skipped, 0)
 
         with mock.patch("figure5_pipeline._fit_and_solve_iteration") as fit_mock:
             skipped = run_single_trajectory(
@@ -377,8 +409,8 @@ class Figure5PipelineTests(unittest.TestCase):
                     2,
                     [0.2, 0.3, 0.5],
                     "ddts",
-                    "invalid_replacement",
-                    None,
+                    "duplicate_replacement",
+                    weak,
                     replacement,
                     1,
                     -3.0,
@@ -394,8 +426,7 @@ class Figure5PipelineTests(unittest.TestCase):
                 latest_fm_metadata={"mock": True},
                 latest_scalarization_metadata={"mock": True},
                 qubo_stats=_qubo_stats(),
-                duplicate_replacements=1,
-                invalid_replacements=1,
+                duplicate_replacements=2,
                 random_replacements=2,
                 random_replacement_draws=2,
                 accepted_sa_candidates=1,
@@ -414,12 +445,12 @@ class Figure5PipelineTests(unittest.TestCase):
                 settings=("w_ddts", "wo_ddts"),
             )
 
-        self.assertEqual(len(summary.solutions), 4)
+        self.assertEqual(len(summary.solutions), 6)
         self.assertTrue(all(solution["composition"] != replacement.composition for solution in summary.solutions))
         self.assertEqual(len(summary.pareto_front["w_ddts"]), 1)
         self.assertEqual(summary.pareto_front["w_ddts"][0]["composition"], strong.composition)
         payload = json.loads(figure5_output_layout(output_dir).summary_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["settings"], ["w_ddts", "wo_ddts"])
 
     def test_output_checkpoint_and_manifest_schema(self) -> None:
@@ -450,11 +481,16 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual(manifest["resolved_config"], config.to_dict())
         self.assertEqual(manifest["objectives"], ["kappa", "E", "rho"])
         self.assertEqual(manifest["settings"], ["w_ddts", "wo_ddts"])
+        paper_metadata = manifest["runtime"]["reference_paper"]
+        self.assertTrue(paper_metadata["path"].endswith("paper_2512_11479.pdf"))
+        self.assertEqual(paper_metadata["sha256"] is not None, paper_metadata["exists"])
 
     def test_runner_rejects_unavailable_cuda(self) -> None:
-        with mock.patch("figure5_runner.torch.cuda.is_available", return_value=False):
+        import experiment_runtime
+
+        with mock.patch("experiment_runtime.torch.cuda.is_available", return_value=False):
             with self.assertRaisesRegex(EnvironmentError, "cuda"):
-                figure5_runner._ensure_requested_device_available("cuda")
+                experiment_runtime.ensure_compute_device_available("cuda")
 
 
 if __name__ == "__main__":

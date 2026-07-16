@@ -40,13 +40,17 @@ def _point(setting: str, seed: int, iteration: int, kappa: float, e_value: float
     }
 
 
-def _summary(seed_list: list[int] | None = None, iterations: int = 150) -> dict[str, object]:
+def _summary(
+    seed_list: list[int] | None = None,
+    iterations: int = 150,
+    settings: tuple[str, ...] = ("w_ddts", "wo_ddts"),
+) -> dict[str, object]:
     seeds = [0] if seed_list is None else seed_list
     solutions: list[dict[str, object]] = []
     trajectories: list[dict[str, object]] = []
     for seed in seeds:
         seed_shift = float(seed) * 0.1
-        for setting in ("w_ddts", "wo_ddts"):
+        for setting in settings:
             setting_shift = 0.0 if setting == "w_ddts" else -2.0
             points = [
                 _point(setting, seed, 0, 100.0 + setting_shift + seed_shift, 70.0, 3.0),
@@ -82,16 +86,16 @@ def _summary(seed_list: list[int] | None = None, iterations: int = 150) -> dict[
             )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "training_backend": "pytorch_fm_lbfgs",
         "config": {"iterations": iterations},
         "seed_list": seeds,
         "objectives": ["kappa", "E", "rho"],
-        "settings": ["w_ddts", "wo_ddts"],
+        "settings": list(settings),
         "trajectories": trajectories,
         "solutions": solutions,
         # Deliberately wrong: the plotter must recompute the front for the selected seed.
-        "pareto_front": {"w_ddts": [], "wo_ddts": []},
+        "pareto_front": {setting: [] for setting in settings},
     }
 
 
@@ -144,6 +148,7 @@ class PlotFigure5Tests(unittest.TestCase):
         data = load_figure5_plot_data(summary_path)
 
         self.assertEqual(data.seed, 0)
+        self.assertEqual(data.settings, ("w_ddts", "wo_ddts"))
         self.assertEqual(len(data.solutions["w_ddts"]), 4)
         self.assertEqual(len(data.replacements["w_ddts"]), 1)
         self.assertEqual(sum(point["kappa"] == 110.0 for point in data.solutions["w_ddts"]), 2)
@@ -166,12 +171,8 @@ class PlotFigure5Tests(unittest.TestCase):
         cases: list[tuple[str, dict[str, object], str]] = []
 
         wrong_schema = _summary()
-        wrong_schema["schema_version"] = 2
+        wrong_schema["schema_version"] = 1
         cases.append(("wrong_schema", wrong_schema, "schema"))
-
-        missing_setting = _summary()
-        missing_setting["settings"] = ["w_ddts"]
-        cases.append(("missing_setting", missing_setting, "settings"))
 
         non_finite = _summary()
         non_finite["solutions"][0]["kappa"] = math.inf  # type: ignore[index]
@@ -200,6 +201,19 @@ class PlotFigure5Tests(unittest.TestCase):
                 path = _write_summary(name, payload)
                 with self.assertRaisesRegex(ValueError, message):
                     load_figure5_plot_data(path)
+
+    def test_single_setting_summary_can_render(self) -> None:
+        summary_path = _write_summary(
+            "single_setting",
+            _summary(settings=("w_ddts",)),
+        )
+        data = load_figure5_plot_data(summary_path)
+        output_path = summary_path.parent / "figure5_w_ddts.png"
+
+        self.assertEqual(data.settings, ("w_ddts",))
+        self.assertEqual(tuple(data.solutions), ("w_ddts",))
+        self.assertEqual(plot_figure5(summary_path, output_path), output_path)
+        self.assertGreater(output_path.stat().st_size, 10_000)
 
     def test_cli_parses_seed_replacements_and_boundaries(self) -> None:
         args = parse_args(

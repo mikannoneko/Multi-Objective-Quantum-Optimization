@@ -20,7 +20,7 @@ from figure5_pareto import pareto_front
 from figure5_scalarization import FIGURE5_OBJECTIVES
 
 
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
 FIGURE5_AXIS_OBJECTIVES = ("kappa", "rho", "E")
 SETTING_LABELS = {"w_ddts": "w/ DDTS", "wo_ddts": "w/o DDTS"}
@@ -35,6 +35,7 @@ LOGGER = logging.getLogger(__name__)
 class Figure5PlotData:
     seed: int
     iterations: int
+    settings: tuple[str, ...]
     solutions: dict[str, list[dict[str, Any]]]
     pareto_fronts: dict[str, list[Mapping[str, Any]]]
     replacements: dict[str, list[dict[str, Any]]]
@@ -48,7 +49,7 @@ def _strict_int(value: Any, context: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot the Figure 5 multi-objective reproduction summary.")
-    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v1 JSON file.")
+    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v2 JSON file.")
     parser.add_argument("--output", type=Path, required=True, help="Output PNG path.")
     parser.add_argument(
         "--seed",
@@ -104,6 +105,8 @@ def validate_iteration_boundaries(
     if any(right <= left for left, right in zip(resolved, resolved[1:])):
         raise ValueError("iteration boundaries must be strictly increasing")
     return resolved
+
+
 def _selected_seed(seed_list: Any, requested_seed: int | None) -> int:
     if not isinstance(seed_list, list) or not seed_list:
         raise ValueError("Figure 5 summary seed_list must be a non-empty list")
@@ -164,16 +167,21 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
 
     summary = load_summary(summary_path)
     if summary.get("schema_version") != SUMMARY_SCHEMA_VERSION:
-        raise ValueError("Unsupported Figure 5 summary schema; expected schema_version 1")
+        raise ValueError(
+            f"Unsupported Figure 5 summary schema; expected schema_version {SUMMARY_SCHEMA_VERSION}"
+        )
     if tuple(summary.get("objectives", ())) != FIGURE5_OBJECTIVES:
         raise ValueError(f"Figure 5 objectives must be {FIGURE5_OBJECTIVES}")
-    settings = summary.get("settings")
-    if (
-        not isinstance(settings, list)
-        or len(settings) != len(FIGURE5_SETTINGS)
-        or set(settings) != set(FIGURE5_SETTINGS)
+    raw_settings = summary.get("settings")
+    if not isinstance(raw_settings, list) or not raw_settings:
+        raise ValueError("Figure 5 summary settings must be a non-empty list")
+    if any(not isinstance(setting, str) for setting in raw_settings):
+        raise ValueError("Figure 5 summary settings must contain strings")
+    if len(set(raw_settings)) != len(raw_settings) or any(
+        setting not in FIGURE5_SETTINGS for setting in raw_settings
     ):
-        raise ValueError(f"Figure 5 summary must contain settings {FIGURE5_SETTINGS}")
+        raise ValueError(f"Figure 5 summary settings must be a unique subset of {FIGURE5_SETTINGS}")
+    selected_settings = tuple(setting for setting in FIGURE5_SETTINGS if setting in raw_settings)
     config = summary.get("config")
     if not isinstance(config, dict):
         raise ValueError("Figure 5 summary config must contain positive iterations")
@@ -185,7 +193,7 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
     raw_solutions = summary.get("solutions")
     if not isinstance(raw_solutions, list):
         raise ValueError("Figure 5 summary solutions must be a list")
-    solutions: dict[str, list[dict[str, Any]]] = {setting: [] for setting in FIGURE5_SETTINGS}
+    solutions: dict[str, list[dict[str, Any]]] = {setting: [] for setting in selected_settings}
     available_seeds = {
         _strict_int(value, f"seed_list[{index}]") for index, value in enumerate(summary["seed_list"])
     }
@@ -194,8 +202,8 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
         if not isinstance(raw_point, dict):
             raise ValueError(f"{context} must be an object")
         setting = str(raw_point.get("setting"))
-        if setting not in FIGURE5_SETTINGS:
-            raise ValueError(f"{context} has unsupported setting {setting!r}")
+        if setting not in selected_settings:
+            raise ValueError(f"{context} setting {setting!r} is not declared in summary settings")
         point_seed = _strict_int(raw_point.get("seed"), f"{context} seed")
         if point_seed not in available_seeds:
             raise ValueError(f"{context} seed {point_seed} is not declared in seed_list")
@@ -210,11 +218,11 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
         if point_seed == selected_seed:
             solutions[setting].append(point)
 
-    for setting in FIGURE5_SETTINGS:
+    for setting in selected_settings:
         if not solutions[setting]:
             raise ValueError(f"No proposed QUBO solutions for setting {setting!r} and seed {selected_seed}")
 
-    replacements: dict[str, list[dict[str, Any]]] = {setting: [] for setting in FIGURE5_SETTINGS}
+    replacements: dict[str, list[dict[str, Any]]] = {setting: [] for setting in selected_settings}
     trajectories = summary.get("trajectories")
     if not isinstance(trajectories, list):
         raise ValueError("Figure 5 summary trajectories must be a list")
@@ -223,7 +231,7 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
             raise ValueError(f"trajectory {trajectory_index} must be an object")
         trajectory_setting = str(trajectory.get("setting"))
         trajectory_seed = _strict_int(trajectory.get("seed"), f"trajectory {trajectory_index} seed")
-        if trajectory_setting not in FIGURE5_SETTINGS or trajectory_seed not in available_seeds:
+        if trajectory_setting not in selected_settings or trajectory_seed not in available_seeds:
             raise ValueError(f"trajectory {trajectory_index} has invalid setting or seed")
         records = trajectory.get("iteration_records")
         if not isinstance(records, list):
@@ -237,10 +245,7 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
             if record_setting != trajectory_setting or record_seed != trajectory_seed:
                 raise ValueError(f"{context} setting/seed does not match its trajectory")
             record_iteration = _iteration_value(record, iterations, context)
-            if trajectory_seed != selected_seed or record.get("decision_status") not in {
-                "invalid_replacement",
-                "duplicate_replacement",
-            }:
+            if trajectory_seed != selected_seed or record.get("decision_status") != "duplicate_replacement":
                 continue
             added_solution = record.get("added_solution")
             if not isinstance(added_solution, dict):
@@ -255,10 +260,11 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
                 )
             )
 
-    fronts = {setting: pareto_front(solutions[setting]) for setting in FIGURE5_SETTINGS}
+    fronts = {setting: pareto_front(solutions[setting]) for setting in selected_settings}
     return Figure5PlotData(
         seed=selected_seed,
         iterations=iterations,
+        settings=selected_settings,
         solutions=solutions,
         pareto_fronts=fronts,
         replacements=replacements,
@@ -275,9 +281,9 @@ def _point_arrays(points: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, np.n
 
 
 def _plot_limits(data: Figure5PlotData, include_replacements: bool) -> dict[str, tuple[float, float]]:
-    points = [point for setting in FIGURE5_SETTINGS for point in data.solutions[setting]]
+    points = [point for setting in data.settings for point in data.solutions[setting]]
     if include_replacements:
-        points.extend(point for setting in FIGURE5_SETTINGS for point in data.replacements[setting])
+        points.extend(point for setting in data.settings for point in data.replacements[setting])
     limits: dict[str, tuple[float, float]] = {}
     for objective in FIGURE5_OBJECTIVES:
         values = np.asarray([float(point[objective]) for point in points], dtype=np.float64)
@@ -350,31 +356,28 @@ def render_figure5(
 
     figure = plt.figure(figsize=(max(14.0, 3.8 * num_windows + 1.0), 12.0))
     outer_grid = figure.add_gridspec(
-        3,
+        1 + len(data.settings),
         1,
-        height_ratios=(1.35, 1.0, 1.0),
+        height_ratios=(1.35, *([1.0] * len(data.settings))),
         hspace=0.18,
         left=0.035,
         right=0.985,
         bottom=0.035,
         top=0.965,
     )
-    top_grid = outer_grid[0].subgridspec(1, 2, wspace=0.04)
+    top_grid = outer_grid[0].subgridspec(1, len(data.settings), wspace=0.04)
     temporal_widths = (0.30, *([1.0] * num_windows))
-    middle_grid = outer_grid[1].subgridspec(
-        1,
-        num_windows + 1,
-        width_ratios=temporal_widths,
-        wspace=0.05,
-    )
-    bottom_grid = outer_grid[2].subgridspec(
-        1,
-        num_windows + 1,
-        width_ratios=temporal_widths,
-        wspace=0.05,
-    )
+    temporal_grids = [
+        outer_grid[row_index + 1].subgridspec(
+            1,
+            num_windows + 1,
+            width_ratios=temporal_widths,
+            wspace=0.05,
+        )
+        for row_index in range(len(data.settings))
+    ]
 
-    for panel_index, setting in enumerate(FIGURE5_SETTINGS):
+    for panel_index, setting in enumerate(data.settings):
         axis = figure.add_subplot(top_grid[0, panel_index], projection="3d")
         _scatter(
             axis,
@@ -403,11 +406,12 @@ def render_figure5(
                 label="Random replacements",
             )
         _configure_axis(axis, limits)
-        axis.set_title(f"{'a' if panel_index == 0 else 'b'}) {SETTING_LABELS[setting]} - seed {data.seed}", pad=8)
+        panel_label = chr(ord("a") + panel_index)
+        axis.set_title(f"{panel_label}) {SETTING_LABELS[setting]} - seed {data.seed}", pad=8)
         axis.legend(loc="upper left", fontsize=8, frameon=False)
 
-    row_specs = ((middle_grid, "w_ddts", "c"), (bottom_grid, "wo_ddts", "d"))
-    for row_grid, setting, panel_label in row_specs:
+    for setting_index, (row_grid, setting) in enumerate(zip(temporal_grids, data.settings)):
+        panel_label = chr(ord("a") + len(data.settings) + setting_index)
         # 行标签使用独立栏位，避免 3D 子图标题参与布局后与相邻行重叠。
         label_axis = figure.add_subplot(row_grid[0, 0])
         label_axis.axis("off")

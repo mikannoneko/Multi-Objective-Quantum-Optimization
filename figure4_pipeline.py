@@ -1,14 +1,13 @@
 """Figure 4 active-learning 主流程。
 
 一条 trajectory 对应固定的 `setting + objective + seed`：从同一个初始数据集出发，
-重复训练 FM、转 QUBO、SA 求解候选、真实物性验证或 random replacement，并记录
+重复训练 FM、转 QUBO、从 SA reads 选择可行候选、处理重复 composition，并记录
 该 objective 的 best-so-far 曲线。
 """
 
 from __future__ import annotations
 
 import importlib
-import json
 import logging
 import random
 from dataclasses import asdict, dataclass, field
@@ -20,14 +19,21 @@ import numpy as np
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_batch, sample_single_objective_design
 from figure4_experiment_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
 from figure4_fm_torch import fit_torch_fm, fm_to_qubo
-from figure4_outputs import checkpoint_payload, figure4_output_layout, load_checkpoint, write_checkpoint
+from figure4_outputs import (
+    checkpoint_payload,
+    figure4_output_layout,
+    load_checkpoint,
+    write_checkpoint,
+    write_json_atomic,
+)
 from figure4_qubo_math import (
     IterationEncoding,
     QuboBuildResult,
     QuboStats,
     build_single_objective_qubo,
     prepare_discrete_composition,
-    simulated_annealing_qubo,
+    select_lowest_energy_feasible_sample,
+    solve_qubo_with_sa,
     validate_candidate_composition,
 )
 from figure4_setting_strategies import (
@@ -36,13 +42,14 @@ from figure4_setting_strategies import (
     get_setting_strategy,
     validate_settings,
 )
+from experiment_runtime import validate_seed_list
 
 
 TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
-SUMMARY_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 3
 TRAINING_BACKEND = "pytorch_fm_lbfgs"
 MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
-CandidateStatus = Literal["accepted", "invalid_replacement", "duplicate_replacement"]
+CandidateStatus = Literal["accepted", "duplicate_replacement"]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -61,10 +68,11 @@ class TrajectoryState:
     fm_metadata: Dict[str, Any] = field(default_factory=dict)
     qubo_stats: QuboStats | None = None
     duplicate_replacements: int = 0
-    invalid_replacements: int = 0
     random_replacements: int = 0
     random_replacement_draws: int = 0
     accepted_sa_candidates: int = 0
+    infeasible_sa_samples_skipped: int = 0
+    max_feasible_candidate_rank: int = 0
 
     @property
     def completed_iterations(self) -> int:
@@ -84,9 +92,11 @@ class TrajectoryResult:
     fm_metadata: Dict[str, Any]
     qubo_stats: QuboStats | None = None
     duplicate_replacements: int = 0
-    invalid_replacements: int = 0
     random_replacements: int = 0
+    random_replacement_draws: int = 0
     accepted_sa_candidates: int = 0
+    infeasible_sa_samples_skipped: int = 0
+    max_feasible_candidate_rank: int = 0
     completed_iterations: int = 0
 
 
@@ -101,6 +111,8 @@ class CandidateDecision:
 class TrainingIterationResult:
     encoding: IterationEncoding
     candidate_bits: np.ndarray
+    feasible_candidate_rank: int
+    infeasible_sa_samples_skipped: int
     fm_metadata: Dict[str, Any]
     qubo_stats: QuboStats
 
@@ -123,7 +135,7 @@ class Figure4Summary:
     config: Dict[str, Any]
     seed_list: List[int]
     objectives: List[str]
-    available_settings: List[str]
+    settings: List[str]
     trajectories: List[TrajectoryResult]
     aggregated: Dict[str, AggregatedTrajectory]
 
@@ -157,8 +169,13 @@ def discretize_rows_for_figure4(rows: Sequence[Dict[str, Any]], num_levels: int)
     return [discretize_row_for_figure4(row, num_levels) for row in rows]
 
 
-def random_replacement_row(sample_id: int, seed: int, rng: random.Random, num_levels: int) -> Dict[str, Any]:
-    """候选非法或重复时使用的随机替代样本，仍然落到同一离散网格。"""
+def _sample_random_replacement_row(
+    sample_id: int,
+    seed: int,
+    rng: random.Random,
+    num_levels: int,
+) -> Dict[str, Any]:
+    """候选与已有 composition 重复时生成同一离散网格上的替代样本。"""
 
     continuous_design = sample_single_objective_design(rng)
     discrete_composition = prepare_discrete_composition(continuous_design, num_levels)
@@ -183,10 +200,11 @@ def _state_from_checkpoint(payload: Dict[str, Any]) -> TrajectoryState:
         fm_metadata=dict(raw_state.get("fm_metadata", {})),
         qubo_stats=qubo_stats,
         duplicate_replacements=int(raw_state.get("duplicate_replacements", 0)),
-        invalid_replacements=int(raw_state.get("invalid_replacements", 0)),
         random_replacements=int(raw_state.get("random_replacements", 0)),
         random_replacement_draws=int(raw_state.get("random_replacement_draws", 0)),
         accepted_sa_candidates=int(raw_state.get("accepted_sa_candidates", 0)),
+        infeasible_sa_samples_skipped=int(raw_state.get("infeasible_sa_samples_skipped", 0)),
+        max_feasible_candidate_rank=int(raw_state.get("max_feasible_candidate_rank", 0)),
     )
 
 
@@ -208,7 +226,7 @@ def _current_best_value(state: TrajectoryState, objective: ObjectiveSpec) -> flo
     return best_value
 
 
-def _generate_unique_replacement_row(
+def _sample_unique_replacement_row(
     *,
     sample_id: int,
     seed: int,
@@ -218,7 +236,7 @@ def _generate_unique_replacement_row(
     max_attempts: int = MAX_RANDOM_REPLACEMENT_ATTEMPTS,
 ) -> tuple[Dict[str, Any], int]:
     for attempt in range(1, max_attempts + 1):
-        row = random_replacement_row(sample_id, seed, rng, num_levels)
+        row = _sample_random_replacement_row(sample_id, seed, rng, num_levels)
         if _row_composition_key(row) not in seen_compositions:
             return row, attempt
     raise RuntimeError(f"Unable to generate a novel random replacement after {max_attempts} attempts")
@@ -256,16 +274,24 @@ def _fit_and_solve_iteration(
         encoding,
         include_system_penalty=strategy.include_system_penalty,
     )
-    candidate_bits, _ = simulated_annealing_qubo(
+    sampling = solve_qubo_with_sa(
         qubo_result.q,
         qubo_result.bias,
-        runs=config.sa_runs,
+        reads=config.sa_reads,
         sweeps=config.sa_sweeps,
         seed=seed + (iteration * 9973),
     )
+
+    def is_feasible(candidate_bits: np.ndarray) -> bool:
+        composition = strategy.decode_candidate(candidate_bits, encoding)
+        return composition is not None and validate_candidate_composition(composition)
+
+    selected = select_lowest_energy_feasible_sample(sampling, is_feasible)
     return TrainingIterationResult(
         encoding=encoding,
-        candidate_bits=candidate_bits,
+        candidate_bits=selected.state,
+        feasible_candidate_rank=selected.rank,
+        infeasible_sa_samples_skipped=selected.infeasible_samples_skipped,
         fm_metadata=dict(fm_metadata),
         qubo_stats=qubo_result.stats,
     )
@@ -282,24 +308,15 @@ def _decide_candidate(
     num_levels: int,
     seen_compositions: set[Tuple[float, float, float, float]],
 ) -> CandidateDecision:
-    """把 SA bit vector 解码为候选 composition，并处理非法或重复候选。"""
+    """校验已筛选的 SA 候选，并在 composition 重复时生成替代样本。"""
 
     candidate_composition = strategy.decode_candidate(candidate_bits, encoding)
-    invalid_candidate = candidate_composition is None or not validate_candidate_composition(candidate_composition)
-    if invalid_candidate:
-        # 非法解不直接丢弃 iteration，而是用唯一 random replacement 保持数据集增长。
-        row, draws = _generate_unique_replacement_row(
-            sample_id=sample_id,
-            seed=seed,
-            rng=replacement_rng,
-            num_levels=num_levels,
-            seen_compositions=seen_compositions,
-        )
-        return CandidateDecision(status="invalid_replacement", row=row, replacement_draws=draws)
+    if candidate_composition is None or not validate_candidate_composition(candidate_composition):
+        raise RuntimeError("Internal error: selected SA candidate is not feasible")
 
     if _composition_key(candidate_composition) in seen_compositions:
         # 重复 composition 也替换，避免 active-learning 数据集里出现同一点。
-        row, draws = _generate_unique_replacement_row(
+        row, draws = _sample_unique_replacement_row(
             sample_id=sample_id,
             seed=seed,
             rng=replacement_rng,
@@ -316,10 +333,6 @@ def _apply_candidate_decision(state: TrajectoryState, decision: CandidateDecisio
 
     if decision.status == "accepted":
         state.accepted_sa_candidates += 1
-    elif decision.status == "invalid_replacement":
-        state.invalid_replacements += 1
-        state.random_replacements += 1
-        state.random_replacement_draws += decision.replacement_draws
     elif decision.status == "duplicate_replacement":
         state.duplicate_replacements += 1
         state.random_replacements += 1
@@ -346,9 +359,11 @@ def _result_from_state(
         fm_metadata=dict(state.fm_metadata),
         qubo_stats=state.qubo_stats,
         duplicate_replacements=state.duplicate_replacements,
-        invalid_replacements=state.invalid_replacements,
         random_replacements=state.random_replacements,
+        random_replacement_draws=state.random_replacement_draws,
         accepted_sa_candidates=state.accepted_sa_candidates,
+        infeasible_sa_samples_skipped=state.infeasible_sa_samples_skipped,
+        max_feasible_candidate_rank=state.max_feasible_candidate_rank,
         completed_iterations=state.completed_iterations,
     )
 
@@ -364,8 +379,8 @@ def run_single_trajectory(
 ) -> TrajectoryResult:
     """运行或恢复一条固定 setting/objective/seed 的 Figure 4 trajectory。"""
 
-    selected_setting = get_setting_strategy(setting).name
-    strategy = get_setting_strategy(selected_setting)
+    strategy = get_setting_strategy(setting)
+    selected_setting = strategy.name
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
     if resume and checkpoint is not None and checkpoint.exists():
@@ -424,6 +439,11 @@ def run_single_trajectory(
         )
         state.fm_metadata = iteration_result.fm_metadata
         state.qubo_stats = iteration_result.qubo_stats
+        state.infeasible_sa_samples_skipped += iteration_result.infeasible_sa_samples_skipped
+        state.max_feasible_candidate_rank = max(
+            state.max_feasible_candidate_rank,
+            iteration_result.feasible_candidate_rank,
+        )
 
         decision = _decide_candidate(
             candidate_bits=iteration_result.candidate_bits,
@@ -443,7 +463,8 @@ def run_single_trajectory(
         LOGGER.info(
             (
                 "Completed iteration setting=%s objective=%s seed=%s iteration=%s/%s "
-                "decision=%s best_so_far=%.12g rows=%s accepted_sa=%s invalid_repl=%s duplicate_repl=%s"
+                "decision=%s best_so_far=%.12g rows=%s accepted_sa=%s duplicate_repl=%s "
+                "feasible_rank=%s skipped_infeasible=%s"
             ),
             selected_setting,
             objective.name,
@@ -454,8 +475,9 @@ def run_single_trajectory(
             best_value,
             len(state.rows),
             state.accepted_sa_candidates,
-            state.invalid_replacements,
             state.duplicate_replacements,
+            iteration_result.feasible_candidate_rank,
+            iteration_result.infeasible_sa_samples_skipped,
         )
 
         if checkpoint is not None:
@@ -516,11 +538,10 @@ def run_figure4_experiment(
     resume: bool = False,
     settings: Sequence[Figure4Setting] = ("wo_cgfm",),
 ) -> Figure4Summary:
-    """运行 Figure 4 的 seed/objective/setting 笛卡尔积，并写出 schema v2 summary。"""
+    """运行 Figure 4 的 seed/objective/setting 笛卡尔积，并写出 schema v3 summary。"""
 
     selected_settings = validate_settings(settings)
-    if not seed_list:
-        raise ValueError("seed_list must not be empty")
+    selected_seeds = validate_seed_list(seed_list)
     if not objectives:
         raise ValueError("At least one objective is required")
 
@@ -529,14 +550,14 @@ def run_figure4_experiment(
     LOGGER.info(
         "Starting Figure 4 experiment output=%s seeds=%s objectives=%s settings=%s",
         output_layout.root,
-        [int(seed) for seed in seed_list],
+        selected_seeds,
         [objective.name for objective in objectives],
         list(selected_settings),
     )
-    dataset_batch = generate_initial_dataset_batch(seed_list=seed_list, num_samples=config.num_samples)
+    dataset_batch = generate_initial_dataset_batch(seed_list=selected_seeds, num_samples=config.num_samples)
 
     trajectory_results: List[TrajectoryResult] = []
-    for seed in seed_list:
+    for seed in selected_seeds:
         initial_rows, _ = dataset_batch[int(seed)]
         for objective in objectives:
             for setting in selected_settings:
@@ -557,13 +578,13 @@ def run_figure4_experiment(
         schema_version=SUMMARY_SCHEMA_VERSION,
         training_backend=TRAINING_BACKEND,
         config=config.to_dict(),
-        seed_list=[int(seed) for seed in seed_list],
+        seed_list=selected_seeds,
         objectives=[objective.name for objective in objectives],
-        available_settings=list(selected_settings),
+        settings=list(selected_settings),
         trajectories=trajectory_results,
         aggregated=aggregate_trajectory_results(trajectory_results),
     )
-    output_layout.summary_path.write_text(json.dumps(summary.to_dict(), indent=2), encoding="utf-8")
+    write_json_atomic(output_layout.summary_path, summary.to_dict())
     LOGGER.info("Wrote Figure 4 summary path=%s", output_layout.summary_path)
     return summary
 

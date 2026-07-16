@@ -48,18 +48,18 @@ def plot_values(objective_name: str, values: list[float] | np.ndarray) -> np.nda
 
 def _required_curve(stats: dict[str, Any], key: str) -> np.ndarray:
     if key not in stats:
-        raise KeyError(f"Summary aggregated entry is missing schema v2 field {key!r}")
+        raise KeyError(f"Summary aggregated entry is missing schema v3 field {key!r}")
     return np.asarray(stats[key], dtype=np.float64)
 
 
 def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
-    """合并一个或多个 schema v2 summary 的 aggregated 曲线。"""
+    """合并一个或多个 schema v3 summary 的 aggregated 曲线。"""
 
     merged: dict[str, dict[str, Any]] = {}
     for path in summary_paths:
         summary = load_summary(path)
-        if summary.get("schema_version") != 2:
-            raise ValueError(f"Unsupported Figure 4 summary schema in {path}: expected schema_version 2")
+        if summary.get("schema_version") != 3:
+            raise ValueError(f"Unsupported Figure 4 summary schema in {path}: expected schema_version 3")
         aggregated = summary.get("aggregated")
         if not isinstance(aggregated, dict) or not aggregated:
             raise ValueError(f"Figure 4 summary has no aggregated results: {path}")
