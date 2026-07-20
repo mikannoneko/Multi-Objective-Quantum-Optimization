@@ -51,6 +51,10 @@ summary 会记录 `infeasible_sa_samples_skipped`、`max_feasible_candidate_rank
 
 命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device 检查、seed 列表校验和 manifest 运行环境元数据。
 
+按照论文补充材料 S1.1，FM-to-QUBO 会丢弃不影响最优 bit 状态的整体偏置 `w0`；各 QUBO 项只按非恒定矩阵系数计算归一化尺度，常数项不得改变 FM 目标与约束惩罚的相对强度。
+
+按照论文 Eq. 18，one-hot 的数值层级固定为 `alpha_i = i / N_bits`，所有 block 使用相同的升序 bit 映射，零值仍由全零 bit-string 表示。补充材料 S7/S8 后所述的逐轮随机化只适用于 CGFM 正反映射中的相变量分配 `phase_permutation`，不打乱 `alpha_i`；Figure 4 的直接编码和 Figure 5 的四相编码因此不随 iteration seed 改变数值层级。
+
 ## 第一部分：Figure 4 复现
 
 ### Figure 4 当前状态
@@ -105,9 +109,9 @@ runner 只做参数解析和编排；active-learning 逻辑只放在 pipeline；
 3. pipeline 对 `seed × objective × setting` 的笛卡尔积运行独立 trajectory；一条 trajectory 的唯一身份为 `(setting, objective, seed)`。
 4. 每轮读取当前数据集的真实 objective。最大化目标先取负，最小化目标保持原值，再做 z-score，使 FM/QUBO 始终按“越小越好”求解。
 5. strategy 创建当轮离散编码并编码训练特征：
-   - `wo_cgfm` 使用四个 composition block，QUBO 需要 `system penalty + one-hot penalty`。
-   - `w_cgfm` 使用三个 CGFM angle block；解码天然得到非负且总和为 1 的四相 composition，因此只加 `one-hot penalty`。
-6. `fit_torch_fm` 训练二阶 FM，`fm_to_qubo` 将常数、线性项和交互项展开为 QUBO；`build_single_objective_qubo` 归一化并叠加所需约束。
+   - `wo_cgfm` 使用四个 composition block；各 block 按 Eq. 18 固定使用升序 `alpha_i`，QUBO 需要 `system penalty + one-hot penalty`。
+   - `w_cgfm` 每轮只随机打乱四个相进入 S7/S8 映射的顺序，再使用三个固定 `alpha_i` 的 CGFM angle block；解码天然得到非负且总和为 1 的四相 composition，因此只加 `one-hot penalty`。
+6. `fit_torch_fm` 训练二阶 FM；`fm_to_qubo` 按补充材料 S1.1 丢弃整体偏置 `w0`，将线性项和交互项展开为 QUBO；`build_single_objective_qubo` 只按非恒定 QUBO 系数归一化，再叠加所需约束。
 7. `solve_qubo_with_sa` 返回全部能量排序后的 reads，`select_lowest_energy_feasible_sample` 选择最低能量可行状态并记录其 rank 和跳过数量。
 8. strategy 解码候选。新 composition 直接加入数据集；重复 composition 保留“重复”判定并加入唯一 random replacement；不可行候选不会进入替换分支。
 9. 用真实性质更新该 objective 的 best-so-far，更新审计计数，并在每轮后原子写入 trajectory checkpoint。
@@ -122,6 +126,7 @@ runner 只做参数解析和编排；active-learning 逻辑只放在 pipeline；
 | 配置 | `ExperimentConfig` | 顶层持有 `EncodingConfig`、`FMConfig`、`SAConfig`，不在 pipeline 中散落独立参数。 |
 | setting | `Figure4Setting` | 只允许 `wo_cgfm`、`w_cgfm`；不得使用大小写变体或显示名称代替机器值。 |
 | 策略 | `SettingStrategy` | 统一接口为 `create_encoding`、`encode_rows`、`decode_candidate`；实现类为 `WOCGFMStrategy`、`WCGFMStrategy`。 |
+| 编码 | `IterationEncoding` | `positive_count_by_bit` 固定实现 Eq. 18；仅 `w_cgfm` 设置逐轮变化的 `phase_permutation`。 |
 | 运行状态 | `TrajectoryState` | 只表示可 checkpoint 的单轨迹可变状态。 |
 | 结果 | `TrajectoryResult`、`AggregatedTrajectory`、`Figure4Summary` | 分别表示单轨迹、跨 seed 曲线和完整 summary；summary 聚合键固定为 `{objective}:{setting}`。 |
 | 输出 | `Figure4OutputLayout` | 统一派生 summary、manifest、日志、图片和 checkpoint 路径。 |
@@ -326,7 +331,7 @@ Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用
      Q = w_kappa * Q_kappa + w_E * Q_E + w_rho * Q_rho
      ```
 
-6. 两条路径都使用四个 composition one-hot block，并对合并后的 QUBO 加 `system penalty + one-hot penalty`。
+6. 两条路径都使用按 Eq. 18 固定升序 `alpha_i` 的四个 composition one-hot block，并对合并后的 QUBO 加 `system penalty + one-hot penalty`；Figure 5 不使用 CGFM，因此没有逐轮 phase permutation。
 7. SA 返回全部 reads；流程选择最低能量可行候选，记录 `sa_energy`、`feasible_candidate_rank` 和跳过的不可行样本数。
 8. 每轮同时保存 `proposed_solution` 与 `added_solution`。新候选两者相同；重复候选的 proposed 保持不变，added 改为唯一 random replacement，状态为 `duplicate_replacement`。
 9. 每轮更新 trajectory state 并原子写 checkpoint；完成后将所有 proposed solution 展平到 summary 的 `solutions`。

@@ -21,9 +21,11 @@ class IterationEncoding:
     """一次 active-learning 迭代使用的离散编码表。
 
     每个 block 对应一个可选离散值；count=0 不占用 bit，count=1..num_levels
-    对应 block 内的一个 one-hot bit。`positive_count_by_bit` 会随 seed 打乱，
-    让同一 composition 在不同迭代中对应不同 bit 位置，符合论文中的随机编码思想。
+    按论文 Eq. 18 固定对应 block 内索引为 count-1 的 one-hot bit，即
+    alpha_i=i/num_levels。该数值映射不随 seed 或迭代改变。
     CGFM 模式下 `value_scale=pi/2` 且只有三个 block，表示三个角度而不是四个相分数。
+    论文 S7/S8 所述的逐轮随机化只记录在 `phase_permutation`，表示相变量进入
+    CGFM 正反映射的顺序。
     """
 
     num_levels: int
@@ -90,42 +92,44 @@ def get_positive_level_values(num_levels: int) -> np.ndarray:
     return np.arange(1, num_levels + 1, dtype=np.int64)
 
 
-def create_iteration_encoding(
+def _create_fixed_one_hot_encoding(
     num_levels: int,
-    seed: int,
-    num_blocks: int = 4,
-    value_scale: float = 1.0,
-    phase_permutation: Optional[np.ndarray] = None,
+    num_blocks: int,
+    value_scale: float,
+    phase_permutation: Optional[np.ndarray],
 ) -> IterationEncoding:
     if num_blocks <= 0:
         raise ValueError("num_blocks must be positive")
-    rng = np.random.default_rng(seed)
+
     counts = get_positive_level_values(num_levels)
-    positive_count_by_bit = []
-    bit_index_by_count = []
-    for _ in range(num_blocks):
-        # 只打乱 positive count；count=0 始终由“该 block 没有 active bit”表示。
-        shuffled = rng.permutation(counts)
-        reverse = np.full(num_levels + 1, -1, dtype=np.int64)
-        for bit_idx, count_value in enumerate(shuffled):
-            reverse[int(count_value)] = int(bit_idx)
-        positive_count_by_bit.append(shuffled.astype(np.int64))
-        bit_index_by_count.append(reverse)
+    bit_indices = np.arange(-1, num_levels, dtype=np.int64)
     return IterationEncoding(
         num_levels=num_levels,
-        positive_count_by_bit=tuple(positive_count_by_bit),
-        bit_index_by_count=tuple(bit_index_by_count),
+        positive_count_by_bit=tuple(counts.copy() for _ in range(num_blocks)),
+        bit_index_by_count=tuple(bit_indices.copy() for _ in range(num_blocks)),
         value_scale=float(value_scale),
         phase_permutation=None if phase_permutation is None else np.asarray(phase_permutation, dtype=np.int64),
     )
 
 
+def create_iteration_encoding(num_levels: int, num_blocks: int = 4) -> IterationEncoding:
+    """创建使用 Eq. 18 固定 alpha 层级的直接 one-hot 编码。"""
+
+    return _create_fixed_one_hot_encoding(
+        num_levels=num_levels,
+        num_blocks=num_blocks,
+        value_scale=1.0,
+        phase_permutation=None,
+    )
+
+
 def create_cgfm_iteration_encoding(num_levels: int, seed: int) -> IterationEncoding:
+    """创建 CGFM 编码；seed 只随机化 S7/S8 中的相变量分配。"""
+
     rng = np.random.default_rng(seed)
     phase_permutation = rng.permutation(4)
-    return create_iteration_encoding(
+    return _create_fixed_one_hot_encoding(
         num_levels=num_levels,
-        seed=seed,
         num_blocks=3,
         value_scale=CGFM_ANGLE_MAX,
         phase_permutation=phase_permutation,
@@ -355,7 +359,9 @@ def build_one_hot_penalty_matrix(encoding: IterationEncoding) -> Tuple[np.ndarra
 
 
 def normalize_qubo_term(q: np.ndarray, bias: float) -> Tuple[np.ndarray, float, float]:
-    scale = max(float(np.max(np.abs(q))), abs(float(bias)))
+    """按影响 bit 状态的 QUBO 系数归一化，常数偏置不参与尺度计算。"""
+
+    scale = float(np.max(np.abs(q)))
     if scale <= 0.0:
         return q.copy(), float(bias), 1.0
     return q / scale, float(bias) / scale, scale

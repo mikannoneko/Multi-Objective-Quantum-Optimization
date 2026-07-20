@@ -334,7 +334,7 @@ def _fit_and_solve_iteration(
 ) -> TrainingIterationResult:
     """Run one Figure 5 preprocessing, FM, QUBO and SA iteration."""
 
-    encoding = create_iteration_encoding(config.num_levels, seed + iteration, num_blocks=4)
+    encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
     features = encode_single_objective_rows(rows, encoding)
     weights = preference_weights_for_iteration(seed, iteration)
     fit_seed = seed + iteration

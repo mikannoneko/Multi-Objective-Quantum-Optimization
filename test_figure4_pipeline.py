@@ -61,6 +61,7 @@ from figure4_qubo_math import (
     encode_cgfm_rows,
     encode_single_objective_rows,
     evaluate_qubo_energy,
+    normalize_qubo_term,
     prepare_discrete_composition,
     select_lowest_energy_feasible_sample,
     solve_qubo_with_sa,
@@ -82,7 +83,7 @@ def _sampling_result(*states: np.ndarray) -> SASamplingResult:
 
 
 def _training_result(config: ExperimentConfig, seed: int, iteration: int) -> TrainingIterationResult:
-    encoding = create_iteration_encoding(config.num_levels, seed + iteration, num_blocks=4)
+    encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
     candidate_bits = encode_single_objective_rows(
         [build_dataset_row(0, seed, [1.0, 0.0, 0.0, 0.0])],
         encoding,
@@ -300,7 +301,7 @@ class Figure4PipelineTests(unittest.TestCase):
         y = model(x)
         self.assertEqual(tuple(y.shape), (1,))
 
-    def test_fm_to_qubo_matches_forward_on_binary_inputs(self) -> None:
+    def test_fm_to_qubo_drops_bias_and_matches_variable_energy(self) -> None:
         model = TorchFMRegressor(num_features=5, init_std=0.1)
         with torch.no_grad():
             model.w0.copy_(torch.tensor([0.7]))
@@ -318,15 +319,30 @@ class Figure4PipelineTests(unittest.TestCase):
                 )
             )
         q, bias = fm_to_qubo(model)
+        self.assertEqual(bias, 0.0)
+
+        model_bias = float(model.w0.detach().cpu().item())
         rng = np.random.default_rng(123)
         for _ in range(20):
             bits = rng.integers(0, 2, size=5).astype(np.float32)
             fm_value = float(model(torch.from_numpy(bits[None, :])).item())
             qubo_value = evaluate_qubo_energy(bits, q, bias)
-            self.assertAlmostEqual(fm_value, qubo_value, places=5)
+            self.assertAlmostEqual(fm_value - model_bias, qubo_value, places=5)
+
+    def test_qubo_normalization_scale_ignores_constant_bias(self) -> None:
+        q = np.array([[2.0, 0.4], [0.4, -1.0]], dtype=np.float64)
+
+        normalized_without_bias, bias_without_bias, scale_without_bias = normalize_qubo_term(q, 0.0)
+        normalized_with_bias, normalized_bias, scale_with_bias = normalize_qubo_term(q, 100.0)
+
+        np.testing.assert_allclose(normalized_without_bias, normalized_with_bias)
+        self.assertEqual(scale_without_bias, 2.0)
+        self.assertEqual(scale_with_bias, scale_without_bias)
+        self.assertEqual(bias_without_bias, 0.0)
+        self.assertEqual(normalized_bias, 50.0)
 
     def test_zero_value_uses_all_zero_block(self) -> None:
-        encoding = create_iteration_encoding(num_levels=10, seed=5)
+        encoding = create_iteration_encoding(num_levels=10)
         row = build_dataset_row(0, 0, np.array([0.0, 0.3, 0.2, 0.5], dtype=np.float64))
         features = encode_single_objective_rows([row], encoding)
         self.assertTrue(np.all(features[0, :10] == 0.0))
@@ -359,27 +375,17 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(cgfm_result.stats.num_variables, 30)
         self.assertEqual(cgfm_result.stats.system_penalty_weight, 0.0)
 
-    def test_iteration_encoding_shuffle_is_reproducible_and_decodable(self) -> None:
-        encoding_a = create_iteration_encoding(10, seed=11)
-        encoding_b = create_iteration_encoding(10, seed=11)
-        encoding_c = create_iteration_encoding(10, seed=12)
+    def test_one_hot_level_weights_follow_paper_eq18_and_are_decodable(self) -> None:
+        encoding = create_iteration_encoding(10)
+        expected_counts = np.arange(1, 11, dtype=np.int64)
+        expected_bit_indices = np.arange(-1, 10, dtype=np.int64)
         for block_idx in range(4):
-            self.assertTrue(
-                np.array_equal(
-                    encoding_a.positive_count_by_bit[block_idx],
-                    encoding_b.positive_count_by_bit[block_idx],
-                )
-            )
-        self.assertTrue(
-            any(
-                not np.array_equal(encoding_a.positive_count_by_bit[idx], encoding_c.positive_count_by_bit[idx])
-                for idx in range(4)
-            )
-        )
+            np.testing.assert_array_equal(encoding.positive_count_by_bit[block_idx], expected_counts)
+            np.testing.assert_array_equal(encoding.bit_index_by_count[block_idx], expected_bit_indices)
 
         row = build_dataset_row(0, 0, np.array([0.0, 0.3, 0.2, 0.5], dtype=np.float64))
-        bits = encode_single_objective_rows([row], encoding_a)[0]
-        decoded = decode_candidate_bits_to_composition(bits, encoding_a)
+        bits = encode_single_objective_rows([row], encoding)[0]
+        decoded = decode_candidate_bits_to_composition(bits, encoding)
         self.assertIsNotNone(decoded)
         self.assertTrue(np.allclose(decoded, np.array([0.0, 0.3, 0.2, 0.5], dtype=np.float64)))
 
@@ -391,6 +397,10 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(encoding_a.num_blocks, 3)
         self.assertTrue(np.array_equal(encoding_a.phase_permutation, encoding_b.phase_permutation))
         self.assertFalse(np.array_equal(encoding_a.phase_permutation, encoding_c.phase_permutation))
+        expected_counts = np.arange(1, 11, dtype=np.int64)
+        for encoding in (encoding_a, encoding_b, encoding_c):
+            for block_idx in range(encoding.num_blocks):
+                np.testing.assert_array_equal(encoding.positive_count_by_bit[block_idx], expected_counts)
 
         angles = cgfm_composition_to_angles(composition, encoding_a.phase_permutation)
         decoded = cgfm_angles_to_composition(angles, encoding_a.phase_permutation)
@@ -415,7 +425,7 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertIsNone(decode_candidate_bits_to_cgfm_composition(invalid, encoding))
 
     def test_penalties_match_paper_zero_or_one_hot_semantics(self) -> None:
-        encoding = create_iteration_encoding(num_levels=5, seed=7)
+        encoding = create_iteration_encoding(num_levels=5)
         system_q, system_bias = build_system_penalty_matrix(encoding)
         one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
 
@@ -526,7 +536,7 @@ class Figure4PipelineTests(unittest.TestCase):
         )
         q = np.zeros((4 * config.num_levels, 4 * config.num_levels), dtype=np.float64)
 
-        encoding = create_iteration_encoding(config.num_levels, seed=8, num_blocks=4)
+        encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
         valid_bits = encode_single_objective_rows(
             [build_dataset_row(0, 8, [1.0, 0.0, 0.0, 0.0])],
             encoding,

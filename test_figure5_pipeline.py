@@ -66,7 +66,7 @@ def _qubo_stats(num_variables: int = 32) -> QuboStats:
 
 
 def _training_result(config: Figure5ExperimentConfig, seed: int, iteration: int) -> TrainingIterationResult:
-    encoding = create_iteration_encoding(config.num_levels, seed + iteration, num_blocks=4)
+    encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
     composition = [1.0, 0.0, 0.0, 0.0] if iteration % 2 == 0 else [0.0, 1.0, 0.0, 0.0]
     return TrainingIterationResult(
         encoding=encoding,
@@ -213,7 +213,7 @@ class Figure5PipelineTests(unittest.TestCase):
         size = 4 * config.num_levels
 
         def fake_sa(q: np.ndarray, bias: float, **_: object) -> SASamplingResult:
-            encoding = create_iteration_encoding(config.num_levels, seed=2, num_blocks=4)
+            encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
             state = encode_discrete_composition([1.0, 0.0, 0.0, 0.0], encoding)
             return _sampling_result(state)
 
@@ -275,7 +275,7 @@ class Figure5PipelineTests(unittest.TestCase):
 
     def test_candidate_decision_separates_proposed_and_replacement(self) -> None:
         config = _test_config(iterations=1)
-        encoding = create_iteration_encoding(config.num_levels, seed=3, num_blocks=4)
+        encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
         composition = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         bits = encode_discrete_composition(composition, encoding)
 

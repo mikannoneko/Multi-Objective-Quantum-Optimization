@@ -233,11 +233,10 @@ def fit_torch_fm(
 
 
 def fm_to_qubo(model: TorchFMRegressor) -> Tuple[np.ndarray, float]:
-    """把训练好的 FM 展开为 QUBO 的二次矩阵和常数项。"""
+    """把训练好的 FM 展开为 QUBO，并按论文补充材料 S1.1 丢弃整体偏置。"""
 
     w = model.w.detach().cpu().numpy().astype(np.float64)
     v = model.V.detach().cpu().numpy().astype(np.float64)
     q = 0.5 * (v @ v.T)
     np.fill_diagonal(q, w)
-    bias = float(model.w0.detach().cpu().item())
-    return q, bias
+    return q, 0.0

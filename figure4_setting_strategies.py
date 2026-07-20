@@ -55,7 +55,8 @@ class WOCGFMStrategy:
     include_system_penalty: bool = True
 
     def create_encoding(self, num_levels: int, seed: int) -> IterationEncoding:
-        return create_iteration_encoding(num_levels, seed)
+        # Eq. 18 的 alpha 层级固定；w/o CGFM 不使用逐轮随机 seed。
+        return create_iteration_encoding(num_levels)
 
     def encode_rows(self, rows: Sequence[dict[str, Any]], encoding: IterationEncoding) -> np.ndarray:
         return encode_single_objective_rows(rows, encoding)
