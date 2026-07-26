@@ -82,17 +82,26 @@ def split_train_validation_test(x: np.ndarray, y: np.ndarray, seed: int) -> FMSp
     if len(x) < 5:
         return FMSplitData(x, y, x, y, x, y)
 
+    num_samples = len(x)
+    train_size = max(1, min(int(num_samples * TRAIN_RATIO), num_samples - 2))
+    temporary_size = num_samples - train_size
+    validation_fraction = VALIDATION_RATIO / (VALIDATION_RATIO + TEST_RATIO)
+    validation_size = max(1, min(int(temporary_size * validation_fraction), temporary_size - 1))
+    test_size = temporary_size - validation_size
+
     train_x, temp_x, train_y, temp_y = train_test_split(
         x,
         y,
-        test_size=1.0 - TRAIN_RATIO,
+        train_size=train_size,
+        test_size=temporary_size,
         random_state=seed,
         shuffle=True,
     )
     validation_x, test_x, validation_y, test_y = train_test_split(
         temp_x,
         temp_y,
-        test_size=TEST_RATIO / (VALIDATION_RATIO + TEST_RATIO),
+        train_size=validation_size,
+        test_size=test_size,
         random_state=seed + 1,
         shuffle=True,
     )
@@ -176,8 +185,8 @@ def tune_fm_hparams(
     optuna_trials: int,
     device: str,
     seed: int,
-) -> Tuple[FMHyperParams, Dict[str, float]]:
-    """用 Optuna 选择 FM 超参数；`optuna_trials <= 0` 时走固定默认值。"""
+) -> FMHyperParams:
+    """只选择并返回 FM 超参数；最终模型由调用方训练一次。"""
 
     default_hparams = FMHyperParams(
         init_std=0.05,
@@ -185,8 +194,7 @@ def tune_fm_hparams(
         l2_reg_v=1e-4,
     )
     if optuna_trials <= 0:
-        _, metrics = _fit_model_once(split_data, default_hparams, device, seed)
-        return default_hparams, metrics
+        return default_hparams
 
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -202,13 +210,11 @@ def tune_fm_hparams(
 
     study.optimize(objective, n_trials=optuna_trials, show_progress_bar=False)
     best = study.best_trial.params
-    best_hparams = FMHyperParams(
+    return FMHyperParams(
         init_std=float(best["init_std"]),
         l2_reg_w=float(best["l2_reg_w"]),
         l2_reg_v=float(best["l2_reg_v"]),
     )
-    _, metrics = _fit_model_once(split_data, best_hparams, device, seed + 10_000)
-    return best_hparams, metrics
 
 
 def fit_torch_fm(
@@ -221,7 +227,7 @@ def fit_torch_fm(
     """训练当前迭代的 FM，并返回可写入 checkpoint/summary 的训练 metadata。"""
 
     split_data = split_train_validation_test(x, y, seed)
-    best_hparams, metrics = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
+    best_hparams = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
     model, final_metrics = _fit_model_once(split_data, best_hparams, device, seed + 20_000)
     metadata: Dict[str, Any] = {
         "tuner": "optuna" if optuna_trials > 0 else "fixed",

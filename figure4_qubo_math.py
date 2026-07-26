@@ -358,13 +358,32 @@ def build_one_hot_penalty_matrix(encoding: IterationEncoding) -> Tuple[np.ndarra
     return q, 0.0
 
 
-def normalize_qubo_term(q: np.ndarray, bias: float) -> Tuple[np.ndarray, float, float]:
-    """按影响 bit 状态的 QUBO 系数归一化，常数偏置不参与尺度计算。"""
+def _maximum_abs_qubo_coefficient(q: np.ndarray) -> float:
+    """返回二元多项式中的最大绝对系数，与 Q 矩阵存储形式无关。"""
 
-    scale = float(np.max(np.abs(q)))
+    q_array = np.asarray(q, dtype=np.float64)
+    if q_array.ndim != 2 or q_array.shape[0] != q_array.shape[1]:
+        raise ValueError("QUBO matrix must be square")
+    if q_array.shape[0] == 0:
+        return 0.0
+
+    linear_scale = float(np.max(np.abs(np.diag(q_array))))
+    row_indices, column_indices = np.triu_indices(q_array.shape[0], k=1)
+    if row_indices.size == 0:
+        return linear_scale
+    quadratic_coefficients = q_array[row_indices, column_indices] + q_array[column_indices, row_indices]
+    quadratic_scale = float(np.max(np.abs(quadratic_coefficients)))
+    return max(linear_scale, quadratic_scale)
+
+
+def normalize_qubo_term(q: np.ndarray, bias: float) -> Tuple[np.ndarray, float, float]:
+    """按实际线性/二次多项式系数归一化，常数偏置不参与尺度计算。"""
+
+    q_array = np.asarray(q, dtype=np.float64)
+    scale = _maximum_abs_qubo_coefficient(q_array)
     if scale <= 0.0:
-        return q.copy(), float(bias), 1.0
-    return q / scale, float(bias) / scale, scale
+        return q_array.copy(), float(bias), 1.0
+    return q_array / scale, float(bias) / scale, scale
 
 
 def build_single_objective_qubo(
@@ -402,7 +421,7 @@ def build_single_objective_qubo(
         system_penalty_weight=float(system_penalty_weight),
         one_hot_penalty_weight=float(ONE_HOT_PENALTY_WEIGHT),
         num_variables=int(total_q.shape[0]),
-        max_abs=float(np.max(np.abs(total_q))),
+        max_abs=_maximum_abs_qubo_coefficient(total_q),
     )
     return QuboBuildResult(q=total_q, bias=float(total_bias), stats=stats)
 

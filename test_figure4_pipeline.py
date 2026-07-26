@@ -8,6 +8,7 @@ from unittest import mock
 import numpy as np
 import torch
 
+import figure4_fm_torch
 import figure4_runner
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_single_objective
 from figure4_experiment_config import (
@@ -301,6 +302,72 @@ class Figure4PipelineTests(unittest.TestCase):
         y = model(x)
         self.assertEqual(tuple(y.shape), (1,))
 
+    def test_five_samples_split_into_non_empty_integer_subsets(self) -> None:
+        x = np.arange(20, dtype=np.float32).reshape(5, 4)
+        y = np.arange(5, dtype=np.float32)
+
+        split = figure4_fm_torch.split_train_validation_test(x, y, seed=7)
+
+        self.assertEqual((len(split.train_y), len(split.validation_y), len(split.test_y)), (3, 1, 1))
+        combined_targets = np.concatenate((split.train_y, split.validation_y, split.test_y))
+        np.testing.assert_array_equal(np.sort(combined_targets), y)
+
+    def test_hparam_tuning_does_not_run_an_extra_final_fit(self) -> None:
+        x = np.arange(24, dtype=np.float32).reshape(6, 4)
+        y = np.linspace(-1.0, 1.0, num=6, dtype=np.float32)
+        split = figure4_fm_torch.split_train_validation_test(x, y, seed=3)
+
+        with mock.patch.object(figure4_fm_torch, "_fit_model_once") as fit_mock:
+            fixed_hparams = figure4_fm_torch.tune_fm_hparams(
+                split,
+                optuna_trials=0,
+                device="cpu",
+                seed=3,
+            )
+        fit_mock.assert_not_called()
+        self.assertIsInstance(fixed_hparams, figure4_fm_torch.FMHyperParams)
+
+        trial_metrics = {"train_loss": 1.0, "validation_loss": 1.0, "test_loss": 1.0}
+        previous_verbosity = figure4_fm_torch.optuna.logging.get_verbosity()
+        figure4_fm_torch.optuna.logging.set_verbosity(figure4_fm_torch.optuna.logging.WARNING)
+        try:
+            with mock.patch.object(
+                figure4_fm_torch,
+                "_fit_model_once",
+                return_value=(object(), trial_metrics),
+            ) as trial_fit_mock:
+                figure4_fm_torch.tune_fm_hparams(split, optuna_trials=2, device="cpu", seed=3)
+        finally:
+            figure4_fm_torch.optuna.logging.set_verbosity(previous_verbosity)
+        self.assertEqual(trial_fit_mock.call_count, 2)
+
+    def test_fit_torch_fm_runs_one_final_fit_after_tuning(self) -> None:
+        x = np.arange(24, dtype=np.float32).reshape(6, 4)
+        y = np.linspace(-1.0, 1.0, num=6, dtype=np.float32)
+        hparams = figure4_fm_torch.FMHyperParams(init_std=0.05, l2_reg_w=1e-4, l2_reg_v=1e-4)
+        trained_model = object()
+        metrics = {"train_loss": 0.3, "validation_loss": 0.4, "test_loss": 0.5}
+
+        with (
+            mock.patch.object(figure4_fm_torch, "tune_fm_hparams", return_value=hparams),
+            mock.patch.object(
+                figure4_fm_torch,
+                "_fit_model_once",
+                return_value=(trained_model, metrics),
+            ) as final_fit_mock,
+        ):
+            model, metadata = figure4_fm_torch.fit_torch_fm(
+                x,
+                y,
+                optuna_trials=0,
+                device="cpu",
+                seed=5,
+            )
+
+        final_fit_mock.assert_called_once()
+        self.assertIs(model, trained_model)
+        self.assertEqual(metadata["test_loss"], 0.5)
+
     def test_fm_to_qubo_drops_bias_and_matches_variable_energy(self) -> None:
         model = TorchFMRegressor(num_features=5, init_std=0.1)
         with torch.no_grad():
@@ -340,6 +407,27 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(scale_with_bias, scale_without_bias)
         self.assertEqual(bias_without_bias, 0.0)
         self.assertEqual(normalized_bias, 50.0)
+
+    def test_qubo_normalization_is_independent_of_matrix_storage(self) -> None:
+        symmetric_q = np.array([[0.0, 0.5], [0.5, 0.0]], dtype=np.float64)
+        upper_triangular_q = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.float64)
+
+        normalized_symmetric, _, symmetric_scale = normalize_qubo_term(symmetric_q, 0.0)
+        normalized_upper, _, upper_scale = normalize_qubo_term(upper_triangular_q, 0.0)
+
+        self.assertEqual(symmetric_scale, 1.0)
+        self.assertEqual(upper_scale, symmetric_scale)
+        bit_vectors = (
+            np.array([0.0, 0.0]),
+            np.array([1.0, 0.0]),
+            np.array([0.0, 1.0]),
+            np.ones(2),
+        )
+        for bits in bit_vectors:
+            self.assertEqual(
+                evaluate_qubo_energy(bits, normalized_symmetric),
+                evaluate_qubo_energy(bits, normalized_upper),
+            )
 
     def test_zero_value_uses_all_zero_block(self) -> None:
         encoding = create_iteration_encoding(num_levels=10)
