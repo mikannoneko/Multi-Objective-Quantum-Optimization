@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING, Literal, Protocol
+from typing import Any, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from figure4_experiment_config import ExperimentConfig
@@ -25,18 +25,7 @@ RUNNER_LOG_FILENAME = "figure4_runner.log"
 PLOT_LOG_FILENAME = "plot_figure4.log"
 CHECKPOINT_DIR_NAME = "trajectories"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-
-OutputCategory = Literal["managed_current", "protected_legacy", "temporary_test", "unknown"]
-
-PROTECTED_LEGACY_OUTPUT_NAMES = frozenset(
-    {
-        "figure4_quick_l50",
-        "figure4_cgfm_quick_l50",
-        "figure4_compare_l50_from_separate",
-    }
-)
-PROTECTED_LEGACY_NAME_FRAGMENTS = ("quick_150", "quick150")
-TEMPORARY_OUTPUT_NAMES = frozenset({".tmp_test", ".pytest_cache", "__pycache__"})
+_CHECKPOINT_FIELDS = frozenset({"schema_version", "objective", "setting", "seed", "config", "state"})
 
 
 class ObjectiveLike(Protocol):
@@ -132,6 +121,27 @@ def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
     return write_json_atomic(path, payload)
 
 
+def _same_json_value(actual: Any, expected: Any) -> bool:
+    """比较 JSON 值，同时保留 bool/int 等类型差异。"""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_json_value(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return bool(actual == expected)
+
+
+def _checkpoint_error(checkpoint: Path, detail: str) -> ValueError:
+    return ValueError(f"Invalid checkpoint {checkpoint}: {detail}")
+
+
 def load_checkpoint(
     path: str | Path,
     *,
@@ -140,23 +150,54 @@ def load_checkpoint(
     config: ExperimentConfig,
     setting: Figure4Setting,
 ) -> dict[str, Any]:
-    """读取并校验 checkpoint 是否属于当前请求的 trajectory。"""
+    """读取 checkpoint，并校验外层 schema、类型和 trajectory 身份。"""
 
     checkpoint = Path(path)
-    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported checkpoint schema in {checkpoint}")
-    if payload.get("objective") != objective.name or int(payload.get("seed")) != int(seed):
-        raise ValueError(f"Checkpoint metadata does not match requested trajectory: {checkpoint}")
-    if payload.get("setting") != setting:
-        raise ValueError(f"Checkpoint setting is not {setting}: {checkpoint}")
-    if payload.get("config") != config.to_dict():
-        raise ValueError(
-            f"Checkpoint config does not match current config: {checkpoint}. "
-            "Use a separate output directory for different run settings."
+    try:
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _checkpoint_error(checkpoint, f"cannot read valid JSON ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise _checkpoint_error(checkpoint, "root must be a JSON object")
+
+    missing_fields = sorted(_CHECKPOINT_FIELDS - payload.keys())
+    if missing_fields:
+        raise _checkpoint_error(checkpoint, f"missing top-level fields: {', '.join(missing_fields)}")
+
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int:
+        raise _checkpoint_error(checkpoint, "field 'schema_version' must be an integer")
+    if schema_version != CHECKPOINT_SCHEMA_VERSION:
+        raise _checkpoint_error(
+            checkpoint,
+            f"unsupported schema_version {schema_version!r}; expected {CHECKPOINT_SCHEMA_VERSION}",
         )
-    if "state" not in payload:
-        raise ValueError(f"Checkpoint is missing state: {checkpoint}")
+
+    checkpoint_objective = payload["objective"]
+    checkpoint_setting = payload["setting"]
+    checkpoint_seed = payload["seed"]
+    if type(checkpoint_objective) is not str:
+        raise _checkpoint_error(checkpoint, "field 'objective' must be a string")
+    if type(checkpoint_setting) is not str:
+        raise _checkpoint_error(checkpoint, "field 'setting' must be a string")
+    if type(checkpoint_seed) is not int:
+        raise _checkpoint_error(checkpoint, "field 'seed' must be an integer")
+    if checkpoint_objective != objective.name or checkpoint_seed != int(seed):
+        raise _checkpoint_error(checkpoint, "objective/seed metadata does not match the requested trajectory")
+    if checkpoint_setting != setting:
+        raise _checkpoint_error(checkpoint, f"setting metadata does not match {setting!r}")
+
+    checkpoint_config = payload["config"]
+    if not isinstance(checkpoint_config, dict):
+        raise _checkpoint_error(checkpoint, "field 'config' must be a JSON object")
+    if not _same_json_value(checkpoint_config, config.to_dict()):
+        raise _checkpoint_error(
+            checkpoint,
+            "config does not match the current run; use a separate output directory for different settings",
+        )
+    if not isinstance(payload["state"], dict):
+        raise _checkpoint_error(checkpoint, "field 'state' must be a JSON object")
     return payload
 
 
@@ -182,30 +223,3 @@ def configure_file_logging_path(log_path: str | Path) -> Path:
     file_handler._figure4_handler = True  # type: ignore[attr-defined]
     root_logger.addHandler(file_handler)
     return output_path
-
-
-def _normalized_path_parts(path: str | Path) -> list[str]:
-    return [part.lower() for part in Path(path).parts]
-
-
-def _looks_like_figure4_output_name(name: str) -> bool:
-    return name.startswith("figure4_") and Path(name).suffix == ""
-
-
-def classify_output_path(path: str | Path) -> OutputCategory:
-    """区分当前受管理输出、历史受保护输出和临时测试输出。"""
-
-    parts = _normalized_path_parts(path)
-    if any(part in PROTECTED_LEGACY_OUTPUT_NAMES for part in parts):
-        return "protected_legacy"
-    if any(fragment in part for part in parts for fragment in PROTECTED_LEGACY_NAME_FRAGMENTS):
-        return "protected_legacy"
-    if any(part in TEMPORARY_OUTPUT_NAMES for part in parts):
-        return "temporary_test"
-    if any(part.startswith("smoke_figure4") for part in parts):
-        return "temporary_test"
-    if any(_looks_like_figure4_output_name(part) and part.endswith("_test") for part in parts):
-        return "temporary_test"
-    if any(_looks_like_figure4_output_name(part) for part in parts):
-        return "managed_current"
-    return "unknown"

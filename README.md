@@ -9,7 +9,7 @@
 - `quick`：Figure 4 和 Figure 5 统一使用的小规模正式验收名称。
 - `test`：单元测试和端到端烟测，只确认最短代码路径可运行。
 - `paper`：论文参数的参考配置；可以显式运行，但不属于本项目验收边界，验收器不会接受 paper-scale summary。
-- 新输出目录统一命名为 `figure4_quick`、`figure5_quick`；`quick_l50`、`quick150`、`quick_150` 等旧名称仅用于识别历史输出，不再用于新调用。
+- 新输出目录统一命名为 `figure4_quick`、`figure5_quick`；`quick_l50`、`quick150`、`quick_150` 等旧名称不再具有运行、识别或保护语义。
 - `validate_reproduction.py` 只验收 canonical `quick` 规模、轨迹完整性、输出结构和候选计数一致性。
 - Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
@@ -57,6 +57,8 @@ Figure 4 和 Figure 5 共用 FM 数据拆分与训练规则：不少于 5 条数
 
 按照论文 Eq. 18，one-hot 的数值层级固定为 `alpha_i = i / N_bits`，所有 block 使用相同的升序 bit 映射，零值仍由全零 bit-string 表示。补充材料 S7/S8 后所述的逐轮随机化只适用于 CGFM 正反映射中的相变量分配 `phase_permutation`，不打乱 `alpha_i`；Figure 4 的直接编码和 Figure 5 的四相编码因此不随 iteration seed 改变数值层级。
 
+`compute_delta_t` 当前按论文 Eq. 15 的舍入系数实现分段线性拟合，并只把精确共晶点 `fSi = 0.128` 设为 `delta_T = 0`。由于两侧舍入后的直线没有严格通过该零点，极窄邻域内可能得到非物理负值；canonical `quick` 的离散网格不会落入该区间，但连续输入或自定义 levels 仍可能触发。后续修正应保留论文系数并将计算结果截断到非负范围，同时增加共晶点两侧的定向测试。
+
 ## 第一部分：Figure 4 复现
 
 ### Figure 4 当前状态
@@ -64,7 +66,7 @@ Figure 4 和 Figure 5 共用 FM 数据拆分与训练规则：不少于 5 条数
 - 已完成 `wo_cgfm`（直接四相编码）和 `w_cgfm`（CGFM 角度编码）两条流程。
 - 已完成 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T` 五个 objective；优化方向由 `ObjectiveSpec` 统一定义。
 - 已完成 PyTorch FM、FM-to-QUBO、SA 全 reads 可行解筛选、重复候选替换、best-so-far 更新及多 seed 聚合。
-- 已完成 per-trajectory checkpoint、`--resume`、manifest、runner/plot 日志、schema v3 summary 和多 summary 合并绘图；旧 schema 不自动迁移。
+- 已完成 per-trajectory checkpoint、两层恢复一致性校验、`--resume`、manifest、runner/plot 日志、schema v3 summary 和多 summary 合并绘图；旧 schema 不自动迁移。
 - `figure4_runner.py` 默认使用 `quick`，`test` 用于烟测，`paper` 只作参数参考。
 - 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 4 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
 
@@ -80,7 +82,7 @@ figure4_setting_strategies.py    wo_cgfm/w_cgfm 编码与解码策略分发
 figure4_qubo_math.py             离散编码、CGFM、QUBO 惩罚、SA 与可行解筛选
 figure4_fm_torch.py              PyTorch FM、Optuna、LBFGS、FM-to-QUBO
 figure4_pipeline.py              trajectory、active learning、checkpoint 恢复与聚合
-figure4_outputs.py               schema v3 checkpoint/summary、标准路径、原子 JSON、日志
+figure4_outputs.py               schema v3 checkpoint 外层校验、标准路径、原子 JSON、日志
 figure4_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
 plot_figure4.py                  读取一个或多个 schema v3 summary 并绘图
 validate_reproduction.py         canonical quick 结构验收与非阻断 diagnostics
@@ -102,7 +104,7 @@ figure4_runner
 plot_figure4 / validate_reproduction -> figure4_summary.json
 ```
 
-runner 只做参数解析和编排；active-learning 逻辑只放在 pipeline；编码差异只放在 strategy；路径和 JSON 写入只由 outputs 模块管理。
+runner 是唯一受支持的运行入口；active-learning 逻辑只放在 pipeline；编码差异只放在 strategy；路径和 JSON 写入只由 outputs 模块管理。
 
 ### Figure 4 算法流程
 
@@ -135,29 +137,11 @@ runner 只做参数解析和编排；active-learning 逻辑只放在 pipeline；
 
 调用规则：
 
-1. 完整实验优先调用 `figure4_runner.py`，因为它会执行依赖/device 检查并写 manifest。
-2. 程序化调用依次使用 `resolve_experiment_config(...)` 和 `run_figure4_experiment(...)`；直接调用 pipeline 不会自动写 manifest。
-3. `run_single_trajectory(...)` 只用于聚焦测试或高级编排；普通调用者不应自行拼接 checkpoint payload。
-4. 以 `_` 开头的函数和未列入模块 `__all__` 的迭代中间对象属于模块内部实现，不作为跨模块调用接口。
-5. setting 和 seed 列表必须非空、无重复；seed 必须是非负整数。objective 子集会按 canonical `OBJECTIVES` 顺序执行，而不是按 CLI 输入顺序执行。
-6. 路径必须通过 `figure4_output_layout(...)` / `Figure4OutputLayout` 获取；同一输出目录不得混用不同 config、setting、objective 或 seed 身份后继续 `--resume`。
-
-程序化调用示例：
-
-```python
-from figure4_experiment_config import OBJECTIVES, resolve_experiment_config
-from figure4_pipeline import run_figure4_experiment
-
-config = resolve_experiment_config(preset="quick", device="cpu")
-summary = run_figure4_experiment(
-    seed_list=[0, 1, 2],
-    config=config,
-    output_dir="figure4_quick",
-    objectives=OBJECTIVES,
-    settings=("wo_cgfm", "w_cgfm"),
-    resume=True,
-)
-```
+1. Figure 4 实验只支持通过 `figure4_runner.py` 启动；pipeline 中的实验和单 trajectory 函数只供 runner 与白盒测试使用，不提供程序化 API 或跨版本兼容承诺。
+2. runner 统一执行依赖/device 检查、配置解析、manifest 写入以及 objective/setting/seed 公共契约；pipeline 不重复校验 objective 列表。
+3. setting 和 seed 列表必须非空、无重复；seed 必须是非负整数。objective 子集由 runner 去重并按 canonical `OBJECTIVES` 顺序执行，而不是按 CLI 输入顺序执行。
+4. 用户通过必填的 `--output-dir` 明确选择输出位置；内部路径统一由 `figure4_output_layout(...)` / `Figure4OutputLayout` 派生。同一输出目录不得混用不同 config、setting、objective 或 seed 身份后继续 `--resume`。
+5. 恢复时先由 outputs 校验 checkpoint 外层 schema、字段类型和 trajectory 身份，再由 pipeline 校验 `TrajectoryState` 的 rows、best 曲线、计数、SA 审计和 QUBO 元数据；任何不一致都在完成跳过或随机数回放前失败。
 
 ### Figure 4 配置规则
 
@@ -243,7 +227,7 @@ conda run -n env_torch python validate_reproduction.py figure4 `
 | 输出 | 规则 |
 | --- | --- |
 | `manifest.json` | 记录命令、preset、resolved config、runtime、seed/objective/setting 选择和标准输出路径。 |
-| trajectory checkpoint | schema v3；绑定 `setting + objective + seed + config`，只在全部身份字段精确匹配时恢复。 |
+| trajectory checkpoint | schema v3；绑定 `setting + objective + seed + config`。恢复要求外层字段和内部 `TrajectoryState` 同时一致，格式不变但不迁移损坏状态。 |
 | `figure4_summary.json` | schema v3；包含 config、seed/objective/setting、所有 `trajectories` 和 `{objective}:{setting}` 聚合曲线。 |
 | `figure4.png` | 由 `plot_figure4.py` 从一个或多个 schema v3 summary 生成；不是训练输入。 |
 | 日志 | runner 和 plot 分文件记录；不得用日志替代机器可读 summary/validation report。 |

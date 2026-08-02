@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import figure4_fm_torch
+import figure4_pipeline
 import figure4_runner
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_single_objective
 from figure4_experiment_config import (
@@ -29,7 +30,6 @@ from figure4_outputs import (
     PLOT_LOG_FILENAME,
     RUNNER_LOG_FILENAME,
     SUMMARY_FILENAME,
-    classify_output_path,
     configure_file_logging_path,
     checkpoint_payload,
     figure4_output_layout,
@@ -40,6 +40,7 @@ from figure4_outputs import (
 from figure4_pipeline import (
     TrainingIterationResult,
     TrajectoryResult,
+    TrajectoryState,
     aggregate_trajectory_results,
     discretize_rows_for_figure4,
     ensure_training_dependencies,
@@ -169,8 +170,6 @@ class Figure4PipelineTests(unittest.TestCase):
             solve_qubo_with_sa(q, 0.0, reads=0, sweeps=1, seed=0)
 
     def test_checkpoint_manager_rules(self) -> None:
-        from figure4_pipeline import TrajectoryState
-
         config = ExperimentConfig(
             num_samples=4,
             iterations=1,
@@ -208,7 +207,55 @@ class Figure4PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "config"):
             load_checkpoint(path, objective=OBJECTIVES[0], seed=4, config=changed_config, setting="wo_cgfm")
 
-    def test_output_layout_and_path_classification_rules(self) -> None:
+    def test_checkpoint_outer_schema_rejects_malformed_payloads(self) -> None:
+        config = ExperimentConfig(
+            num_samples=4,
+            iterations=1,
+            encoding=EncodingConfig(num_levels=5),
+            fm=FMConfig(optuna_trials=0),
+            sa=SAConfig(reads=2, sweeps=12),
+        )
+        layout = figure4_output_layout(WORKSPACE_TMP_ROOT / "checkpoint_outer_validation")
+        path = layout.checkpoint_path("wo_cgfm", "kappa", 4)
+        row = build_dataset_row(0, 4, np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64))
+        valid_payload = checkpoint_payload(
+            objective=OBJECTIVES[0],
+            setting="wo_cgfm",
+            seed=4,
+            state=TrajectoryState(rows=[row]),
+            config=config,
+        )
+        malformed_payloads = (
+            ("root", [], "root"),
+            (
+                "missing state",
+                {key: value for key, value in valid_payload.items() if key != "state"},
+                "missing top-level fields.*state",
+            ),
+            ("boolean schema", {**valid_payload, "schema_version": True}, "schema_version"),
+            ("numeric objective", {**valid_payload, "objective": 1}, "objective"),
+            ("string seed", {**valid_payload, "seed": "4"}, "seed"),
+            ("list config", {**valid_payload, "config": []}, "config"),
+            ("list state", {**valid_payload, "state": []}, "state"),
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for label, malformed_payload, error_pattern in malformed_payloads:
+            with self.subTest(label=label):
+                path.write_text(json.dumps(malformed_payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error_pattern):
+                    load_checkpoint(
+                        path,
+                        objective=OBJECTIVES[0],
+                        seed=4,
+                        config=config,
+                        setting="wo_cgfm",
+                    )
+
+        path.write_text("{not-json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "valid JSON"):
+            load_checkpoint(path, objective=OBJECTIVES[0], seed=4, config=config, setting="wo_cgfm")
+
+    def test_output_layout_rules(self) -> None:
         output_dir = WORKSPACE_TMP_ROOT / "figure4_layout_rules"
         layout = figure4_output_layout(output_dir)
         self.assertEqual(layout.summary_path, output_dir / SUMMARY_FILENAME)
@@ -220,19 +267,6 @@ class Figure4PipelineTests(unittest.TestCase):
             layout.checkpoint_path("w_cgfm", "delta_T", 7),
             output_dir / CHECKPOINT_DIR_NAME / "w_cgfm_delta_T_seed_7.json",
         )
-
-        self.assertEqual(classify_output_path(Path("figure4_quick_l50")), "protected_legacy")
-        self.assertEqual(
-            classify_output_path(Path("figure4_cgfm_quick_l50") / CHECKPOINT_DIR_NAME),
-            "protected_legacy",
-        )
-        self.assertEqual(classify_output_path(Path("figure4_compare_l50_from_separate")), "protected_legacy")
-        self.assertEqual(classify_output_path(Path("figure4_quick_150")), "protected_legacy")
-        self.assertEqual(classify_output_path(Path("figure4_quick150")), "protected_legacy")
-        self.assertEqual(classify_output_path(WORKSPACE_TMP_ROOT), "temporary_test")
-        self.assertEqual(classify_output_path(Path("figure4_refactor_test")), "temporary_test")
-        self.assertEqual(classify_output_path(Path("figure4_compare_l50")), "managed_current")
-        self.assertEqual(classify_output_path(Path("notes")), "unknown")
 
         summary_payload = {"schema_version": 3, "aggregated": {}}
         layout.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +286,17 @@ class Figure4PipelineTests(unittest.TestCase):
             experiment_runtime.ensure_compute_device_available("cpu")
         with self.assertRaisesRegex(ValueError, "device"):
             experiment_runtime.ensure_compute_device_available("tpu")
+
+    def test_runner_owns_objective_selection_contract(self) -> None:
+        self.assertEqual(figure4_runner._selected_objectives(None), OBJECTIVES)
+        self.assertEqual(figure4_runner._selected_objectives([]), OBJECTIVES)
+        selected = figure4_runner._selected_objectives(["delta_T", "kappa", "delta_T"])
+        self.assertEqual([objective.name for objective in selected], ["kappa", "delta_T"])
+        with self.assertRaisesRegex(ValueError, "Unknown objectives"):
+            figure4_runner._selected_objectives(["kappa", "not_an_objective"])
+
+        self.assertNotIn("run_figure4_experiment", figure4_pipeline.__all__)
+        self.assertNotIn("run_single_trajectory", figure4_pipeline.__all__)
 
     def test_workflow_documentation_exists(self) -> None:
         repo_root = Path(__file__).resolve().parent
@@ -287,7 +332,7 @@ class Figure4PipelineTests(unittest.TestCase):
             self.assertNotIn(obsolete_heading, content)
         for figure4_keyword in ("figure4_experiment_config.py", "figure4_setting_strategies.py"):
             self.assertIn(figure4_keyword, content)
-        for figure4_object in ("ExperimentConfig", "Figure4Summary", "run_figure4_experiment"):
+        for figure4_object in ("ExperimentConfig", "Figure4Summary", "figure4_runner.py"):
             self.assertIn(figure4_object, content)
         for figure5_keyword in ("w_ddts", "wo_ddts", "weighted-sum", "Pareto front", "figure5_runner.py"):
             self.assertIn(figure5_keyword, content)
@@ -295,6 +340,9 @@ class Figure4PipelineTests(unittest.TestCase):
             self.assertIn(figure5_object, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
         self.assertFalse((repo_root / legacy_document_name).exists())
+        figure4_section = content.split("## 第二部分：Figure 5 复现", 1)[0]
+        self.assertNotIn("run_figure4_experiment", figure4_section)
+        self.assertNotIn("程序化调用示例", figure4_section)
 
     def test_torch_fm_forward_shape(self) -> None:
         model = TorchFMRegressor(num_features=8, init_std=0.1)
@@ -715,16 +763,109 @@ class Figure4PipelineTests(unittest.TestCase):
             unique.tolist(),
         )
 
-    def test_resume_skips_completed_and_continues_partial_checkpoint(self) -> None:
-        from figure4_pipeline import TrajectoryState
+    def test_resume_rejects_inconsistent_completed_state_before_skip(self) -> None:
+        seed = 21
+        initial_rows, _ = generate_initial_dataset_single_objective(num_samples=4, seed=seed)
+        config = ExperimentConfig(
+            num_samples=4,
+            iterations=1,
+            encoding=EncodingConfig(num_levels=5),
+            fm=FMConfig(optuna_trials=0),
+            sa=SAConfig(reads=2, sweeps=12),
+        )
+        prepared_rows = discretize_rows_for_figure4(initial_rows, config.num_levels)
+        added_row = build_dataset_row(4, seed, np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64))
+        rows = [*prepared_rows, added_row]
+        state = TrajectoryState(
+            rows=rows,
+            best_so_far=[max(float(row["kappa"]) for row in rows)],
+            fm_metadata={"mock": True},
+            qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 20, 650.0),
+            accepted_sa_candidates=1,
+            max_feasible_candidate_rank=1,
+        )
+        checkpoint = figure4_output_layout(
+            WORKSPACE_TMP_ROOT / "checkpoint_internal_validation"
+        ).checkpoint_path("wo_cgfm", "kappa", seed)
+        valid_payload = checkpoint_payload(
+            objective=OBJECTIVES[0],
+            setting="wo_cgfm",
+            seed=seed,
+            state=state,
+            config=config,
+        )
 
+        corruptions = (
+            (
+                "missing state field",
+                lambda payload: payload["state"].pop("random_replacement_draws"),
+                "missing fields.*random_replacement_draws",
+            ),
+            ("row count", lambda payload: payload["state"]["rows"].pop(), "rows has length"),
+            (
+                "row seed",
+                lambda payload: payload["state"]["rows"][0].__setitem__("seed", seed + 1),
+                r"rows\[0\]\.seed",
+            ),
+            (
+                "composition",
+                lambda payload: payload["state"]["rows"][0].__setitem__("f1_norm", 1.2),
+                "composition",
+            ),
+            (
+                "best curve",
+                lambda payload: payload["state"]["best_so_far"].__setitem__(
+                    0, payload["state"]["best_so_far"][0] + 1.0
+                ),
+                "best_so_far",
+            ),
+            (
+                "candidate accounting",
+                lambda payload: payload["state"].__setitem__("accepted_sa_candidates", 0),
+                "accepted_sa_candidates",
+            ),
+            (
+                "SA rank",
+                lambda payload: payload["state"].__setitem__("max_feasible_candidate_rank", 3),
+                "max_feasible_candidate_rank",
+            ),
+            (
+                "QUBO variable count",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__("num_variables", 19),
+                "num_variables",
+            ),
+            (
+                "missing QUBO stats",
+                lambda payload: payload["state"].__setitem__("qubo_stats", None),
+                "contain qubo_stats",
+            ),
+        )
+        for label, corrupt, error_pattern in corruptions:
+            with self.subTest(label=label):
+                payload = json.loads(json.dumps(valid_payload))
+                corrupt(payload)
+                write_checkpoint(checkpoint, payload)
+                with mock.patch("figure4_pipeline._fit_and_solve_iteration") as fit_mock:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        run_single_trajectory(
+                            initial_rows,
+                            OBJECTIVES[0],
+                            seed=seed,
+                            config=config,
+                            setting="wo_cgfm",
+                            checkpoint_path=checkpoint,
+                            resume=True,
+                        )
+                    fit_mock.assert_not_called()
+
+    def test_resume_skips_completed_and_continues_partial_checkpoint(self) -> None:
         rows, _ = generate_initial_dataset_single_objective(num_samples=6, seed=9)
         config = ExperimentConfig(
             num_samples=6,
             iterations=3,
             encoding=EncodingConfig(num_levels=5),
             fm=FMConfig(optuna_trials=0),
-            sa=SAConfig(reads=1, sweeps=1),
+            sa=SAConfig(reads=2, sweeps=1),
         )
         output_dir = WORKSPACE_TMP_ROOT / "resume_output_v3"
         checkpoint = figure4_output_layout(output_dir).checkpoint_path("wo_cgfm", "kappa", 9)
@@ -737,6 +878,7 @@ class Figure4PipelineTests(unittest.TestCase):
             best_so_far=[partial_best],
             fm_metadata={"mock": True},
             qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 20, 650.0),
+            duplicate_replacements=1,
             random_replacements=1,
             random_replacement_draws=1,
             infeasible_sa_samples_skipped=1,

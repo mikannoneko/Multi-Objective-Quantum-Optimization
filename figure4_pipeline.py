@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Sequence, Tuple
 
 import numpy as np
 
-from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_batch, sample_single_objective_design
+from alloy_dataset_generator import (
+    CSV_FIELDNAMES,
+    build_dataset_row,
+    generate_initial_dataset_batch,
+    sample_single_objective_design,
+)
 from figure4_experiment_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
 from figure4_fm_torch import fit_torch_fm, fm_to_qubo
 from figure4_outputs import (
@@ -28,8 +34,10 @@ from figure4_outputs import (
 )
 from figure4_qubo_math import (
     IterationEncoding,
+    ONE_HOT_PENALTY_WEIGHT,
     QuboBuildResult,
     QuboStats,
+    SYSTEM_PENALTY_WEIGHT,
     build_single_objective_qubo,
     prepare_discrete_composition,
     select_lowest_energy_feasible_sample,
@@ -51,6 +59,24 @@ TRAINING_BACKEND = "pytorch_fm_lbfgs"
 MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
 CandidateStatus = Literal["accepted", "duplicate_replacement"]
 LOGGER = logging.getLogger(__name__)
+_STATE_COUNTER_FIELDS = (
+    "duplicate_replacements",
+    "random_replacements",
+    "random_replacement_draws",
+    "accepted_sa_candidates",
+    "infeasible_sa_samples_skipped",
+    "max_feasible_candidate_rank",
+)
+_QUBO_FLOAT_FIELDS = (
+    "fm_scale",
+    "system_scale",
+    "one_hot_scale",
+    "system_penalty_weight",
+    "one_hot_penalty_weight",
+    "max_abs",
+)
+_DATASET_ROW_FIELDS = frozenset(CSV_FIELDNAMES)
+_DATASET_NUMERIC_FIELDS = tuple(name for name in CSV_FIELDNAMES if name not in {"sample_id", "seed"})
 
 
 def ensure_training_dependencies() -> None:
@@ -190,22 +216,237 @@ def _row_composition_key(row: Dict[str, Any]) -> Tuple[float, float, float, floa
     return _composition_key(normalized_composition_from_row(row))
 
 
-def _state_from_checkpoint(payload: Dict[str, Any]) -> TrajectoryState:
-    raw_state = dict(payload["state"])
-    raw_qubo_stats = raw_state.get("qubo_stats")
-    qubo_stats = QuboStats(**raw_qubo_stats) if raw_qubo_stats is not None else None
+def _checkpoint_state_error(checkpoint: Path, detail: str) -> ValueError:
+    return ValueError(f"Invalid checkpoint state {checkpoint}: {detail}")
+
+
+def _is_json_number(value: Any) -> bool:
+    return type(value) in {int, float}
+
+
+def _state_from_checkpoint(payload: Dict[str, Any], checkpoint: Path) -> TrajectoryState:
+    """严格反序列化 schema v3 state，不为缺失字段提供默认值。"""
+
+    raw_state = payload["state"]
+    expected_fields = {item.name for item in dataclass_fields(TrajectoryState)}
+    missing_fields = sorted(expected_fields - raw_state.keys())
+    unexpected_fields = sorted(raw_state.keys() - expected_fields)
+    if missing_fields:
+        raise _checkpoint_state_error(checkpoint, f"missing fields: {', '.join(missing_fields)}")
+    if unexpected_fields:
+        raise _checkpoint_state_error(checkpoint, f"unexpected fields: {', '.join(unexpected_fields)}")
+
+    if not isinstance(raw_state["rows"], list) or any(not isinstance(row, dict) for row in raw_state["rows"]):
+        raise _checkpoint_state_error(checkpoint, "field 'rows' must be a list of JSON objects")
+    if not isinstance(raw_state["best_so_far"], list) or any(
+        not _is_json_number(value) for value in raw_state["best_so_far"]
+    ):
+        raise _checkpoint_state_error(checkpoint, "field 'best_so_far' must be a list of numbers")
+    if not isinstance(raw_state["fm_metadata"], dict):
+        raise _checkpoint_state_error(checkpoint, "field 'fm_metadata' must be a JSON object")
+    for counter_name in _STATE_COUNTER_FIELDS:
+        if type(raw_state[counter_name]) is not int:
+            raise _checkpoint_state_error(checkpoint, f"field {counter_name!r} must be an integer")
+
+    raw_qubo_stats = raw_state["qubo_stats"]
+    if raw_qubo_stats is None:
+        qubo_stats = None
+    else:
+        if not isinstance(raw_qubo_stats, dict):
+            raise _checkpoint_state_error(checkpoint, "field 'qubo_stats' must be null or a JSON object")
+        expected_qubo_fields = {item.name for item in dataclass_fields(QuboStats)}
+        missing_qubo_fields = sorted(expected_qubo_fields - raw_qubo_stats.keys())
+        unexpected_qubo_fields = sorted(raw_qubo_stats.keys() - expected_qubo_fields)
+        if missing_qubo_fields:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"field 'qubo_stats' is missing: {', '.join(missing_qubo_fields)}",
+            )
+        if unexpected_qubo_fields:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"field 'qubo_stats' has unexpected fields: {', '.join(unexpected_qubo_fields)}",
+            )
+        for field_name in _QUBO_FLOAT_FIELDS:
+            if not _is_json_number(raw_qubo_stats[field_name]):
+                raise _checkpoint_state_error(
+                    checkpoint,
+                    f"field 'qubo_stats.{field_name}' must be a number",
+                )
+        if type(raw_qubo_stats["num_variables"]) is not int:
+            raise _checkpoint_state_error(checkpoint, "field 'qubo_stats.num_variables' must be an integer")
+        qubo_stats = QuboStats(
+            fm_scale=float(raw_qubo_stats["fm_scale"]),
+            system_scale=float(raw_qubo_stats["system_scale"]),
+            one_hot_scale=float(raw_qubo_stats["one_hot_scale"]),
+            system_penalty_weight=float(raw_qubo_stats["system_penalty_weight"]),
+            one_hot_penalty_weight=float(raw_qubo_stats["one_hot_penalty_weight"]),
+            num_variables=int(raw_qubo_stats["num_variables"]),
+            max_abs=float(raw_qubo_stats["max_abs"]),
+        )
+
     return TrajectoryState(
-        rows=[dict(row) for row in raw_state.get("rows", [])],
-        best_so_far=[float(value) for value in raw_state.get("best_so_far", [])],
-        fm_metadata=dict(raw_state.get("fm_metadata", {})),
+        rows=[dict(row) for row in raw_state["rows"]],
+        best_so_far=[float(value) for value in raw_state["best_so_far"]],
+        fm_metadata=dict(raw_state["fm_metadata"]),
         qubo_stats=qubo_stats,
-        duplicate_replacements=int(raw_state.get("duplicate_replacements", 0)),
-        random_replacements=int(raw_state.get("random_replacements", 0)),
-        random_replacement_draws=int(raw_state.get("random_replacement_draws", 0)),
-        accepted_sa_candidates=int(raw_state.get("accepted_sa_candidates", 0)),
-        infeasible_sa_samples_skipped=int(raw_state.get("infeasible_sa_samples_skipped", 0)),
-        max_feasible_candidate_rank=int(raw_state.get("max_feasible_candidate_rank", 0)),
+        duplicate_replacements=raw_state["duplicate_replacements"],
+        random_replacements=raw_state["random_replacements"],
+        random_replacement_draws=raw_state["random_replacement_draws"],
+        accepted_sa_candidates=raw_state["accepted_sa_candidates"],
+        infeasible_sa_samples_skipped=raw_state["infeasible_sa_samples_skipped"],
+        max_feasible_candidate_rank=raw_state["max_feasible_candidate_rank"],
     )
+
+
+def _validate_trajectory_state(
+    state: TrajectoryState,
+    *,
+    objective: ObjectiveSpec,
+    setting: Figure4Setting,
+    seed: int,
+    config: ExperimentConfig,
+    checkpoint: Path,
+) -> None:
+    """验证恢复状态的行、曲线、计数和最后一轮 QUBO 元数据彼此一致。"""
+
+    completed = state.completed_iterations
+    if completed > config.iterations:
+        raise _checkpoint_state_error(
+            checkpoint,
+            f"completed_iterations={completed} exceeds configured iterations={config.iterations}",
+        )
+
+    expected_row_count = config.num_samples + completed
+    if len(state.rows) != expected_row_count:
+        raise _checkpoint_state_error(
+            checkpoint,
+            f"rows has length {len(state.rows)}; expected num_samples + completed_iterations = {expected_row_count}",
+        )
+
+    for row_index, row in enumerate(state.rows):
+        missing_row_fields = sorted(_DATASET_ROW_FIELDS - row.keys())
+        if missing_row_fields:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"rows[{row_index}] is missing fields: {', '.join(missing_row_fields)}",
+            )
+        if type(row["sample_id"]) is not int or row["sample_id"] != row_index:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"rows[{row_index}].sample_id must equal its row index {row_index}",
+            )
+        if type(row["seed"]) is not int or row["seed"] != int(seed):
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"rows[{row_index}].seed must equal trajectory seed {int(seed)}",
+            )
+        for field_name in _DATASET_NUMERIC_FIELDS:
+            value = row[field_name]
+            if not _is_json_number(value) or not math.isfinite(float(value)):
+                raise _checkpoint_state_error(
+                    checkpoint,
+                    f"rows[{row_index}].{field_name} must be a finite number",
+                )
+        composition = normalized_composition_from_row(row)
+        if np.any(composition < 0.0) or abs(float(np.sum(composition)) - 1.0) > 1e-10:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"rows[{row_index}] composition must be non-negative and sum to 1",
+            )
+
+    expected_best = objective.initial_best()
+    for row in state.rows[: config.num_samples]:
+        expected_best = objective.update_best(expected_best, float(row[objective.name]))
+    for iteration, actual_best in enumerate(state.best_so_far):
+        if not math.isfinite(actual_best):
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"best_so_far[{iteration}] must be finite",
+            )
+        added_row = state.rows[config.num_samples + iteration]
+        expected_best = objective.update_best(expected_best, float(added_row[objective.name]))
+        if not math.isclose(actual_best, expected_best, rel_tol=1e-12, abs_tol=1e-12):
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"best_so_far[{iteration}]={actual_best!r} does not match rows-derived value {expected_best!r}",
+            )
+
+    for counter_name in _STATE_COUNTER_FIELDS:
+        if getattr(state, counter_name) < 0:
+            raise _checkpoint_state_error(checkpoint, f"counter {counter_name!r} must be non-negative")
+    if state.accepted_sa_candidates + state.duplicate_replacements != completed:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "accepted_sa_candidates + duplicate_replacements must equal completed_iterations",
+        )
+    if state.random_replacements != state.duplicate_replacements:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "random_replacements must equal duplicate_replacements",
+        )
+    if state.random_replacement_draws < state.random_replacements:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "random_replacement_draws must be at least random_replacements",
+        )
+    maximum_replacement_draws = state.duplicate_replacements * MAX_RANDOM_REPLACEMENT_ATTEMPTS
+    if state.random_replacement_draws > maximum_replacement_draws:
+        raise _checkpoint_state_error(
+            checkpoint,
+            f"random_replacement_draws exceeds the maximum {maximum_replacement_draws}",
+        )
+
+    if completed == 0:
+        if state.infeasible_sa_samples_skipped != 0 or state.max_feasible_candidate_rank != 0:
+            raise _checkpoint_state_error(checkpoint, "zero-iteration state must have zero SA audit counters")
+        if state.qubo_stats is not None or state.fm_metadata:
+            raise _checkpoint_state_error(checkpoint, "zero-iteration state must not contain training metadata")
+        return
+
+    if not 1 <= state.max_feasible_candidate_rank <= config.sa_reads:
+        raise _checkpoint_state_error(
+            checkpoint,
+            f"max_feasible_candidate_rank must be between 1 and sa_reads={config.sa_reads}",
+        )
+    minimum_skipped = state.max_feasible_candidate_rank - 1
+    maximum_skipped = completed * (config.sa_reads - 1)
+    if not minimum_skipped <= state.infeasible_sa_samples_skipped <= maximum_skipped:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "infeasible_sa_samples_skipped is inconsistent with completed iterations and feasible rank",
+        )
+
+    stats = state.qubo_stats
+    if stats is None:
+        raise _checkpoint_state_error(checkpoint, "completed state must contain qubo_stats")
+    for field_name in _QUBO_FLOAT_FIELDS:
+        value = float(getattr(stats, field_name))
+        if not math.isfinite(value) or value < 0.0:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"qubo_stats.{field_name} must be finite and non-negative",
+            )
+    if stats.fm_scale <= 0.0 or stats.one_hot_scale <= 0.0:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "qubo_stats FM and one-hot normalization scales must be positive",
+        )
+    expected_num_variables = (4 if setting == "wo_cgfm" else 3) * config.num_levels
+    if stats.num_variables != expected_num_variables:
+        raise _checkpoint_state_error(
+            checkpoint,
+            f"qubo_stats.num_variables={stats.num_variables}; expected {expected_num_variables} for {setting}",
+        )
+    if not math.isclose(stats.one_hot_penalty_weight, ONE_HOT_PENALTY_WEIGHT, abs_tol=1e-12):
+        raise _checkpoint_state_error(checkpoint, "qubo_stats.one_hot_penalty_weight is inconsistent")
+    expected_system_weight = SYSTEM_PENALTY_WEIGHT if setting == "wo_cgfm" else 0.0
+    if not math.isclose(stats.system_penalty_weight, expected_system_weight, abs_tol=1e-12):
+        raise _checkpoint_state_error(checkpoint, "qubo_stats.system_penalty_weight is inconsistent with setting")
+    if setting == "wo_cgfm" and stats.system_scale <= 0.0:
+        raise _checkpoint_state_error(checkpoint, "wo_cgfm qubo_stats.system_scale must be positive")
+    if setting == "w_cgfm" and not math.isclose(stats.system_scale, 0.0, abs_tol=1e-12):
+        raise _checkpoint_state_error(checkpoint, "w_cgfm qubo_stats.system_scale must be zero")
 
 
 def _advance_replacement_rng(rng: random.Random, replacement_draws: int) -> None:
@@ -377,7 +618,7 @@ def run_single_trajectory(
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
 ) -> TrajectoryResult:
-    """运行或恢复一条固定 setting/objective/seed 的 Figure 4 trajectory。"""
+    """供 Figure 4 runner 和白盒测试使用的内部单 trajectory 编排函数。"""
 
     strategy = get_setting_strategy(setting)
     selected_setting = strategy.name
@@ -399,8 +640,16 @@ def run_single_trajectory(
             config=config,
             setting=selected_setting,
         )
-        state = _state_from_checkpoint(loaded_checkpoint)
-        if state.completed_iterations >= config.iterations:
+        state = _state_from_checkpoint(loaded_checkpoint, checkpoint)
+        _validate_trajectory_state(
+            state,
+            objective=objective,
+            setting=selected_setting,
+            seed=int(seed),
+            config=config,
+            checkpoint=checkpoint,
+        )
+        if state.completed_iterations == config.iterations:
             LOGGER.info(
                 "Skipping completed trajectory setting=%s objective=%s seed=%s completed=%s",
                 selected_setting,
@@ -538,12 +787,10 @@ def run_figure4_experiment(
     resume: bool = False,
     settings: Sequence[Figure4Setting] = ("wo_cgfm",),
 ) -> Figure4Summary:
-    """运行 Figure 4 的 seed/objective/setting 笛卡尔积，并写出 schema v3 summary。"""
+    """供 Figure 4 runner 和白盒测试使用的内部实验编排函数。"""
 
     selected_settings = validate_settings(settings)
     selected_seeds = validate_seed_list(seed_list)
-    if not objectives:
-        raise ValueError("At least one objective is required")
 
     output_layout = figure4_output_layout(output_dir)
     output_layout.root.mkdir(parents=True, exist_ok=True)
@@ -597,6 +844,4 @@ __all__ = [
     "discretize_row_for_figure4",
     "discretize_rows_for_figure4",
     "ensure_training_dependencies",
-    "run_figure4_experiment",
-    "run_single_trajectory",
 ]
