@@ -25,6 +25,7 @@ from figure5_pipeline import (
     run_figure5_experiment,
     validate_settings,
 )
+from figure5_scalarization import FIGURE5_OBJECTIVES
 from experiment_runtime import collect_runtime_metadata, ensure_compute_device_available, resolve_contiguous_seeds
 
 
@@ -112,7 +113,7 @@ def _write_manifest(
         },
         "resume": bool(args.resume),
         "seed_list": seed_list,
-        "objectives": ["kappa", "E", "rho"],
+        "objectives": list(FIGURE5_OBJECTIVES),
         "settings": settings,
     }
     return write_json_atomic(output_layout.manifest_path, manifest)

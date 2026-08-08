@@ -20,7 +20,7 @@ from figure5_pareto import pareto_front
 from figure5_scalarization import FIGURE5_OBJECTIVES
 
 
-SUMMARY_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 3
 FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
 FIGURE5_AXIS_OBJECTIVES = ("kappa", "rho", "E")
 SETTING_LABELS = {"w_ddts": "w/ DDTS", "wo_ddts": "w/o DDTS"}
@@ -49,7 +49,7 @@ def _strict_int(value: Any, context: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot the Figure 5 multi-objective reproduction summary.")
-    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v2 JSON file.")
+    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v3 JSON file.")
     parser.add_argument("--output", type=Path, required=True, help="Output PNG path.")
     parser.add_argument(
         "--seed",
@@ -135,6 +135,15 @@ def _finite_float(point: Mapping[str, Any], key: str, context: str) -> float:
     return value
 
 
+def _finite_numeric_value(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} must be numeric and finite")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{context} must be finite")
+    return result
+
+
 def _iteration_value(point: Mapping[str, Any], iterations: int, context: str) -> int:
     if "iteration" not in point:
         raise ValueError(f"{context} is missing 'iteration'")
@@ -152,10 +161,24 @@ def _validated_plot_point(
     iteration: int,
     context: str,
 ) -> dict[str, Any]:
+    sample_id = _strict_int(point.get("sample_id"), f"{context} sample_id")
+    raw_composition = point.get("composition")
+    if not isinstance(raw_composition, list) or len(raw_composition) != 4:
+        raise ValueError(f"{context} composition must contain four fractions")
+    composition = [
+        _finite_numeric_value(value, f"{context} composition[{index}]")
+        for index, value in enumerate(raw_composition)
+    ]
+    if any(value < 0.0 for value in composition) or not math.isclose(
+        sum(composition), 1.0, rel_tol=0.0, abs_tol=1e-10
+    ):
+        raise ValueError(f"{context} composition must be non-negative and sum to 1")
     return {
         "setting": setting,
         "seed": int(seed),
         "iteration": int(iteration),
+        "sample_id": sample_id,
+        "composition": composition,
         "kappa": _finite_float(point, "kappa", context),
         "E": _finite_float(point, "E", context),
         "rho": _finite_float(point, "rho", context),
@@ -193,9 +216,17 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
     raw_solutions = summary.get("solutions")
     if not isinstance(raw_solutions, list):
         raise ValueError("Figure 5 summary solutions must be a list")
-    solutions: dict[str, list[dict[str, Any]]] = {setting: [] for setting in selected_settings}
-    available_seeds = {
+    available_seeds = [
         _strict_int(value, f"seed_list[{index}]") for index, value in enumerate(summary["seed_list"])
+    ]
+    available_seed_set = set(available_seeds)
+    all_solutions: dict[tuple[str, int], list[dict[str, Any]]] = {
+        (setting, available_seed): []
+        for available_seed in available_seeds
+        for setting in selected_settings
+    }
+    raw_solutions_by_key: dict[tuple[str, int], list[Mapping[str, Any]]] = {
+        key: [] for key in all_solutions
     }
     for index, raw_point in enumerate(raw_solutions):
         context = f"solution {index}"
@@ -205,7 +236,7 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
         if setting not in selected_settings:
             raise ValueError(f"{context} setting {setting!r} is not declared in summary settings")
         point_seed = _strict_int(raw_point.get("seed"), f"{context} seed")
-        if point_seed not in available_seeds:
+        if point_seed not in available_seed_set:
             raise ValueError(f"{context} seed {point_seed} is not declared in seed_list")
         iteration = _iteration_value(raw_point, iterations, context)
         point = _validated_plot_point(
@@ -215,12 +246,16 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
             iteration=iteration,
             context=context,
         )
-        if point_seed == selected_seed:
-            solutions[setting].append(point)
+        all_solutions[(setting, point_seed)].append(point)
+        raw_solutions_by_key[(setting, point_seed)].append(raw_point)
 
-    for setting in selected_settings:
-        if not solutions[setting]:
-            raise ValueError(f"No proposed QUBO solutions for setting {setting!r} and seed {selected_seed}")
+    for (setting, point_seed), points in all_solutions.items():
+        if not points:
+            raise ValueError(f"No proposed QUBO solutions for setting {setting!r} and seed {point_seed}")
+    solutions = {
+        setting: all_solutions[(setting, selected_seed)]
+        for setting in selected_settings
+    }
 
     replacements: dict[str, list[dict[str, Any]]] = {setting: [] for setting in selected_settings}
     trajectories = summary.get("trajectories")
@@ -231,7 +266,7 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
             raise ValueError(f"trajectory {trajectory_index} must be an object")
         trajectory_setting = str(trajectory.get("setting"))
         trajectory_seed = _strict_int(trajectory.get("seed"), f"trajectory {trajectory_index} seed")
-        if trajectory_setting not in selected_settings or trajectory_seed not in available_seeds:
+        if trajectory_setting not in selected_settings or trajectory_seed not in available_seed_set:
             raise ValueError(f"trajectory {trajectory_index} has invalid setting or seed")
         records = trajectory.get("iteration_records")
         if not isinstance(records, list):
@@ -260,7 +295,69 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
                 )
             )
 
-    fronts = {setting: pareto_front(solutions[setting]) for setting in selected_settings}
+    raw_fronts = summary.get("pareto_fronts")
+    if not isinstance(raw_fronts, list):
+        raise ValueError("Figure 5 summary pareto_fronts must be a list")
+    expected_front_keys = set(all_solutions)
+    stored_fronts: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for front_index, raw_front in enumerate(raw_fronts):
+        context = f"pareto_fronts[{front_index}]"
+        if not isinstance(raw_front, dict):
+            raise ValueError(f"{context} must be an object")
+        front_setting = raw_front.get("setting")
+        if type(front_setting) is not str or front_setting not in selected_settings:
+            raise ValueError(f"{context} has invalid setting")
+        front_seed = _strict_int(raw_front.get("seed"), f"{context} seed")
+        front_key = (front_setting, front_seed)
+        if front_key not in expected_front_keys:
+            raise ValueError(f"{context} setting/seed is not declared by the summary")
+        if front_key in stored_fronts:
+            raise ValueError(f"duplicate Pareto front for setting {front_setting!r} and seed {front_seed}")
+        raw_front_solutions = raw_front.get("solutions")
+        if not isinstance(raw_front_solutions, list):
+            raise ValueError(f"{context}.solutions must be a list")
+        validated_front: list[dict[str, Any]] = []
+        for point_index, raw_point in enumerate(raw_front_solutions):
+            point_context = f"{context}.solutions[{point_index}]"
+            if not isinstance(raw_point, dict):
+                raise ValueError(f"{point_context} must be an object")
+            if raw_point.get("setting") != front_setting:
+                raise ValueError(f"{point_context} setting does not match its front")
+            point_seed = _strict_int(raw_point.get("seed"), f"{point_context} seed")
+            if point_seed != front_seed:
+                raise ValueError(f"{point_context} seed does not match its front")
+            point_iteration = _iteration_value(raw_point, iterations, point_context)
+            validated_front.append(
+                _validated_plot_point(
+                    raw_point,
+                    setting=front_setting,
+                    seed=front_seed,
+                    iteration=point_iteration,
+                    context=point_context,
+                )
+            )
+        expected_raw_front = pareto_front(raw_solutions_by_key[front_key])
+        if raw_front_solutions != expected_raw_front:
+            raise ValueError(
+                f"Stored Pareto front for setting {front_setting!r} and seed {front_seed} "
+                "does not match exactly the proposed solutions"
+            )
+        stored_fronts[front_key] = validated_front
+
+    if set(stored_fronts) != expected_front_keys:
+        missing = sorted(expected_front_keys - set(stored_fronts))
+        raise ValueError(f"Figure 5 summary is missing Pareto fronts: {missing}")
+    for front_key, points in all_solutions.items():
+        recomputed = pareto_front(points)
+        if stored_fronts[front_key] != recomputed:
+            raise ValueError(
+                f"Stored Pareto front for setting {front_key[0]!r} and seed {front_key[1]} "
+                "does not match proposed solutions"
+            )
+    fronts = {
+        setting: stored_fronts[(setting, selected_seed)]
+        for setting in selected_settings
+    }
     return Figure5PlotData(
         seed=selected_seed,
         iterations=iterations,

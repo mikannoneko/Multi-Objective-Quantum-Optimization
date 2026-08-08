@@ -3,15 +3,15 @@ import random
 import unittest
 
 import numpy as np
+import figure5_scalarization as scalarization
 
 from figure5_scalarization import (
     FIGURE5_OBJECTIVE_SENSES,
     FIGURE5_OBJECTIVES,
     compute_ddts_targets,
     compute_individual_objective_targets,
-    compute_weighted_sum_targets,
+    compute_weighted_sum_reference_targets,
     sample_preference_weights,
-    scalarize_training_targets,
     validate_preference_weights,
 )
 
@@ -32,9 +32,9 @@ class Figure5ScalarizationTests(unittest.TestCase):
         )
 
     def test_weighted_sum_single_objective_weights_follow_objective_direction(self) -> None:
-        kappa_only = compute_weighted_sum_targets(self.rows, [1.0, 0.0, 0.0])
-        e_only = compute_weighted_sum_targets(self.rows, [0.0, 1.0, 0.0])
-        rho_only = compute_weighted_sum_targets(self.rows, [0.0, 0.0, 1.0])
+        kappa_only = compute_weighted_sum_reference_targets(self.rows, [1.0, 0.0, 0.0])
+        e_only = compute_weighted_sum_reference_targets(self.rows, [0.0, 1.0, 0.0])
+        rho_only = compute_weighted_sum_reference_targets(self.rows, [0.0, 0.0, 1.0])
 
         self.assertEqual(int(np.argmin(kappa_only.targets)), 1)
         self.assertEqual(int(np.argmin(e_only.targets)), 2)
@@ -45,7 +45,7 @@ class Figure5ScalarizationTests(unittest.TestCase):
 
     def test_weighted_sum_matches_manual_zscore_dot_product(self) -> None:
         weights = np.array([0.2, 0.3, 0.5], dtype=np.float64)
-        result = compute_weighted_sum_targets(self.rows, weights)
+        result = compute_weighted_sum_reference_targets(self.rows, weights)
 
         raw = np.array([[10.0, 100.0, 3.0], [20.0, 90.0, 2.5], [15.0, 110.0, 2.8]], dtype=np.float64)
         transformed = np.column_stack((-raw[:, 0], -raw[:, 1], raw[:, 2]))
@@ -139,20 +139,17 @@ class Figure5ScalarizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_objectives"):
             sample_preference_weights(random.Random(1), num_objectives=0)
 
-    def test_scalarization_dispatch_maps_settings(self) -> None:
-        wo_result = scalarize_training_targets(self.rows, [0.2, 0.3, 0.5], "wo_ddts")
-        w_result = scalarize_training_targets(self.rows, [0.2, 0.3, 0.5], "w_ddts")
-
-        self.assertEqual(wo_result.method, "weighted_sum")
-        self.assertEqual(w_result.method, "ddts")
-        with self.assertRaisesRegex(ValueError, "setting"):
-            scalarize_training_targets(self.rows, [0.2, 0.3, 0.5], "unknown")  # type: ignore[arg-type]
+    def test_weighted_sum_reference_api_cannot_dispatch_training(self) -> None:
+        self.assertIn("compute_weighted_sum_reference_targets", scalarization.__all__)
+        self.assertNotIn("compute_weighted_sum_targets", scalarization.__all__)
+        self.assertNotIn("scalarize_training_targets", scalarization.__all__)
+        self.assertFalse(hasattr(scalarization, "scalarize_training_targets"))
 
     def test_invalid_rows_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "empty"):
-            compute_weighted_sum_targets([], [0.2, 0.3, 0.5])
+            compute_weighted_sum_reference_targets([], [0.2, 0.3, 0.5])
         with self.assertRaisesRegex(ValueError, "missing objective"):
-            compute_weighted_sum_targets([{"kappa": 1.0, "E": 2.0}], [0.2, 0.3, 0.5])
+            compute_weighted_sum_reference_targets([{"kappa": 1.0, "E": 2.0}], [0.2, 0.3, 0.5])
         with self.assertRaisesRegex(ValueError, "finite"):
             compute_ddts_targets([{"kappa": 1.0, "E": 2.0, "rho": math.inf}], [0.2, 0.3, 0.5])
 

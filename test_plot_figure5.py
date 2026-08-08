@@ -11,6 +11,7 @@ import numpy as np
 
 import plot_figure5 as plot_module
 from figure5_outputs import figure5_output_layout
+from figure5_pareto import pareto_front
 from plot_figure5 import (
     FIGURE5_AXIS_OBJECTIVES,
     default_iteration_boundaries,
@@ -25,7 +26,15 @@ WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test" / "plot_figur
 WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def _point(setting: str, seed: int, iteration: int, kappa: float, e_value: float, rho: float) -> dict[str, object]:
+def _point(
+    setting: str,
+    seed: int,
+    iteration: int,
+    kappa: float,
+    e_value: float,
+    rho: float,
+    composition: list[float] | None = None,
+) -> dict[str, object]:
     return {
         "setting": setting,
         "seed": seed,
@@ -33,7 +42,7 @@ def _point(setting: str, seed: int, iteration: int, kappa: float, e_value: float
         "status": "accepted",
         "weights": [0.2, 0.3, 0.5],
         "sample_id": 100 + iteration,
-        "composition": [0.4, 0.3, 0.2, 0.1],
+        "composition": [0.4, 0.3, 0.2, 0.1] if composition is None else composition,
         "kappa": kappa,
         "E": e_value,
         "rho": rho,
@@ -53,9 +62,25 @@ def _summary(
         for setting in settings:
             setting_shift = 0.0 if setting == "w_ddts" else -2.0
             points = [
-                _point(setting, seed, 0, 100.0 + setting_shift + seed_shift, 70.0, 3.0),
-                _point(setting, seed, min(60, iterations - 1), 110.0 + setting_shift + seed_shift, 80.0, 2.8),
-                _point(setting, seed, min(120, iterations - 1), 120.0 + setting_shift + seed_shift, 72.0, 2.7),
+                _point(setting, seed, 0, 100.0 + setting_shift + seed_shift, 70.0, 3.0, [1.0, 0.0, 0.0, 0.0]),
+                _point(
+                    setting,
+                    seed,
+                    min(60, iterations - 1),
+                    110.0 + setting_shift + seed_shift,
+                    80.0,
+                    2.8,
+                    [0.0, 1.0, 0.0, 0.0],
+                ),
+                _point(
+                    setting,
+                    seed,
+                    min(120, iterations - 1),
+                    120.0 + setting_shift + seed_shift,
+                    72.0,
+                    2.7,
+                    [0.0, 0.0, 1.0, 0.0],
+                ),
             ]
             duplicate = dict(points[1])
             duplicate["sample_id"] = 999
@@ -85,8 +110,19 @@ def _summary(
                 }
             )
 
+    pareto_fronts = [
+        {
+            "setting": setting,
+            "seed": seed,
+            "solutions": pareto_front(
+                [point for point in solutions if point["setting"] == setting and point["seed"] == seed]
+            ),
+        }
+        for seed in seeds
+        for setting in settings
+    ]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "training_backend": "pytorch_fm_lbfgs",
         "config": {"iterations": iterations},
         "seed_list": seeds,
@@ -94,8 +130,7 @@ def _summary(
         "settings": list(settings),
         "trajectories": trajectories,
         "solutions": solutions,
-        # Deliberately wrong: the plotter must recompute the front for the selected seed.
-        "pareto_front": {setting: [] for setting in settings},
+        "pareto_fronts": pareto_fronts,
     }
 
 
@@ -143,7 +178,7 @@ class PlotFigure5Tests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_iteration_boundaries(boundaries, 150)
 
-    def test_single_seed_is_automatic_and_front_is_recomputed(self) -> None:
+    def test_single_seed_is_automatic_and_stored_front_is_verified(self) -> None:
         summary_path = _write_summary("single_seed", _summary())
         data = load_figure5_plot_data(summary_path)
 
@@ -171,7 +206,7 @@ class PlotFigure5Tests(unittest.TestCase):
         cases: list[tuple[str, dict[str, object], str]] = []
 
         wrong_schema = _summary()
-        wrong_schema["schema_version"] = 1
+        wrong_schema["schema_version"] = 2
         cases.append(("wrong_schema", wrong_schema, "schema"))
 
         non_finite = _summary()
@@ -195,6 +230,18 @@ class PlotFigure5Tests(unittest.TestCase):
             point for point in empty_setting["solutions"] if point["setting"] == "w_ddts"  # type: ignore[index]
         ]
         cases.append(("empty_setting", empty_setting, "No proposed"))
+
+        stale_front = _summary()
+        stale_front["pareto_fronts"][0]["solutions"] = []  # type: ignore[index]
+        cases.append(("stale_front", stale_front, "does not match"))
+
+        stale_front_record = json.loads(json.dumps(_summary()))
+        stale_front_record["pareto_fronts"][0]["solutions"][0]["status"] = "duplicate_replacement"
+        cases.append(("stale_front_record", stale_front_record, "does not match exactly"))
+
+        duplicate_front = _summary()
+        duplicate_front["pareto_fronts"].append(duplicate_front["pareto_fronts"][0])  # type: ignore[index]
+        cases.append(("duplicate_front", duplicate_front, "duplicate Pareto front"))
 
         for name, payload, message in cases:
             with self.subTest(name=name):

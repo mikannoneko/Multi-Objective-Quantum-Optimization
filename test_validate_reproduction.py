@@ -5,6 +5,7 @@ import io
 import json
 import unittest
 
+from figure5_pareto import pareto_front
 from validate_reproduction import (
     exact_figure5_front,
     figure5_front_metrics,
@@ -112,16 +113,20 @@ def _figure5_summary() -> dict[str, object]:
         for setting in FIGURE5_SETTINGS
     ]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "settings": list(FIGURE5_SETTINGS),
         "config": {"num_samples": 500, "iterations": iterations, "encoding": {"num_levels": 25}},
         "seed_list": [0],
         "trajectories": trajectories,
         "solutions": solutions,
-        "pareto_front": {
-            setting: [next(point for point in solutions if point["setting"] == setting)]
+        "pareto_fronts": [
+            {
+                "setting": setting,
+                "seed": 0,
+                "solutions": pareto_front([point for point in solutions if point["setting"] == setting]),
+            }
             for setting in FIGURE5_SETTINGS
-        },
+        ],
     }
 
 
@@ -205,6 +210,17 @@ class ReproductionValidationTests(unittest.TestCase):
 
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["quick_scale"]["passed"])
+
+    def test_figure5_rejects_schema_v2_and_inconsistent_stored_front(self) -> None:
+        old_summary = _figure5_summary()
+        old_summary["schema_version"] = 2
+        old_report = validate_figure5_summary(old_summary)
+        self.assertFalse(old_report["checks"]["schema"]["passed"])
+
+        stale_summary = _figure5_summary()
+        stale_summary["pareto_fronts"][0]["solutions"] = []  # type: ignore[index]
+        stale_report = validate_figure5_summary(stale_summary)
+        self.assertFalse(stale_report["checks"]["summary_pareto_front"]["passed"])
 
     def test_cli_exposes_no_paper_acceptance_profile(self) -> None:
         args = parse_args(["figure4", "--summary", "summary.json"])

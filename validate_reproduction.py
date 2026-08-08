@@ -12,10 +12,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from alloy_dataset_generator import build_dataset_row
+from figure5_pareto import pareto_front
 
 
 FIGURE4_SCHEMA_VERSION = 3
-FIGURE5_SCHEMA_VERSION = 2
+FIGURE5_SCHEMA_VERSION = 3
 FIGURE4_OBJECTIVES = ("kappa", "E", "rho", "delta_alpha", "delta_T")
 FIGURE4_SETTINGS = ("w_cgfm", "wo_cgfm")
 FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
@@ -256,7 +257,8 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
 def _composition_key(values: Sequence[float]) -> tuple[float, float, float, float]:
     if len(values) != 4:
         raise ValueError("composition must contain four values")
-    return tuple(round(float(value), 10) for value in values)  # type: ignore[return-value]
+    rounded = tuple(round(float(value), 10) for value in values)
+    return rounded[0], rounded[1], rounded[2], rounded[3]
 
 
 @lru_cache(maxsize=8)
@@ -448,15 +450,42 @@ def validate_figure5_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
         {"actual_count": len(solutions), "expected_count": len(expected_solution_ids)},
     )
 
-    summary_fronts = summary.get("pareto_front") if isinstance(summary.get("pareto_front"), Mapping) else {}
-    fronts_passed = all(
-        isinstance(summary_fronts.get(setting), list) and bool(summary_fronts[setting])
-        for setting in FIGURE5_SETTINGS
+    raw_fronts = summary.get("pareto_fronts") if isinstance(summary.get("pareto_fronts"), list) else []
+    expected_front_keys = {(_as_int(seed), setting) for seed in seeds for setting in FIGURE5_SETTINGS}
+    actual_front_keys: set[tuple[int, str]] = set()
+    front_sizes: dict[str, int | None] = {}
+    fronts_passed = isinstance(summary.get("pareto_fronts"), list)
+    for front in raw_fronts:
+        if not isinstance(front, Mapping):
+            fronts_passed = False
+            continue
+        front_seed = _as_int(front.get("seed"))
+        front_setting = str(front.get("setting", ""))
+        front_key = (front_seed, front_setting)
+        front_solutions = front.get("solutions")
+        detail_key = f"{front_setting}:seed_{front_seed}"
+        front_sizes[detail_key] = len(front_solutions) if isinstance(front_solutions, list) else None
+        if front_key in actual_front_keys or front_key not in expected_front_keys or not isinstance(front_solutions, list):
+            fronts_passed = False
+            continue
+        actual_front_keys.add(front_key)
+        source_solutions = [
+            point
+            for point in solutions
+            if isinstance(point, Mapping)
+            and _as_int(point.get("seed")) == front_seed
+            and point.get("setting") == front_setting
+        ]
+        try:
+            expected_front = pareto_front(source_solutions)
+        except (TypeError, ValueError):
+            fronts_passed = False
+            continue
+        if not expected_front or list(front_solutions) != expected_front:
+            fronts_passed = False
+    fronts_passed = fronts_passed and actual_front_keys == expected_front_keys and len(raw_fronts) == len(
+        expected_front_keys
     )
-    front_sizes = {
-        str(key): len(value) if isinstance(value, list) else None
-        for key, value in summary_fronts.items()
-    }
     _check(checks, "summary_pareto_front", fronts_passed, front_sizes)
 
     metrics: dict[str, Any] | None = None

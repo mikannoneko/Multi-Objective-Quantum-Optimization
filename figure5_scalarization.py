@@ -76,7 +76,10 @@ def validate_preference_weights(weights: Sequence[float], num_objectives: int = 
     return array / total
 
 
-def compute_weighted_sum_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[float]) -> ScalarizationResult:
+def compute_weighted_sum_reference_targets(
+    rows: Sequence[Mapping[str, Any]],
+    weights: Sequence[float],
+) -> ScalarizationResult:
     """构造 weighted-sum 数学参考目标。
 
     该函数保留用于单元测试和数学对照。论文 Figure 5 baseline 不使用该
@@ -165,20 +168,6 @@ def compute_ddts_targets(rows: Sequence[Mapping[str, Any]], weights: Sequence[fl
     )
 
 
-def scalarize_training_targets(
-    rows: Sequence[Mapping[str, Any]],
-    weights: Sequence[float],
-    setting: Figure5Setting,
-) -> ScalarizationResult:
-    """数学工具分发；pipeline 的 `wo_ddts` 会改用三 FM QUBO 合并。"""
-
-    if setting == "wo_ddts":
-        return compute_weighted_sum_targets(rows, weights)
-    if setting == "w_ddts":
-        return compute_ddts_targets(rows, weights)
-    raise ValueError("setting must be 'wo_ddts' or 'w_ddts'")
-
-
 def _objective_matrix(rows: Sequence[Mapping[str, Any]]) -> np.ndarray:
     """从 dataset rows 中抽取固定顺序的 `kappa/E/rho` 矩阵。"""
 
@@ -223,8 +212,7 @@ __all__ = [
     "ScalarizationResult",
     "compute_ddts_targets",
     "compute_individual_objective_targets",
-    "compute_weighted_sum_targets",
+    "compute_weighted_sum_reference_targets",
     "sample_preference_weights",
-    "scalarize_training_targets",
     "validate_preference_weights",
 ]

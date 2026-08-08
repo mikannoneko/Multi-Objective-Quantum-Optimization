@@ -252,7 +252,7 @@ Figure 4 canonical `quick` 只检查：
 - 已完成 `w_ddts` 和 `wo_ddts`（weighted-sum baseline）两条多目标流程。
 - 已完成最大化 `kappa`、最大化 `E`、最小化 `rho` 的统一方向处理、可复现 preference weights、DDTS 人工目标、三 FM QUBO 合并和 Pareto front。
 - 已完成每轮 proposed solution 与实际 added solution 的分别记录；重复 proposed solution 会保留，random replacement 不进入 Pareto front。
-- 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、schema v2 checkpoint/summary、`--resume`、manifest 和 runner/plot 日志；旧 schema 不自动迁移。
+- 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、schema v2 checkpoint、schema v3 summary、两层恢复一致性校验、`--resume`、manifest 和 runner/plot 日志；旧 schema 不自动迁移。
 - 已完成单/双 setting 绘图、3D 总览、迭代窗口及多 seed 显式选择；canonical `quick` 要求两个 setting 完整对比。
 - 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 5 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
 
@@ -270,7 +270,7 @@ figure5_experiment_config.py     Figure 5 配置与 paper/quick/test preset
 figure5_scalarization.py         preference weights、DDTS、三目标标准化与数学对照
 figure5_pareto.py                mixed-sense 支配关系与 Pareto front
 figure5_pipeline.py              多目标 active learning、checkpoint、solutions 与 summary
-figure5_outputs.py               schema v2 checkpoint/summary、标准路径、原子 JSON、日志
+figure5_outputs.py               schema v2 checkpoint 外层校验、标准路径、原子 JSON、日志
 figure5_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
 plot_figure5.py                  单/双 setting、seed 选择、3D 总览和迭代窗口
 validate_reproduction.py         canonical quick 结构验收与精确 front diagnostics
@@ -320,9 +320,10 @@ Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用
 6. 两条路径都使用按 Eq. 18 固定升序 `alpha_i` 的四个 composition one-hot block，并对合并后的 QUBO 加 `system penalty + one-hot penalty`；Figure 5 不使用 CGFM，因此没有逐轮 phase permutation。
 7. SA 返回全部 reads；流程选择最低能量可行候选，记录 `sa_energy`、`feasible_candidate_rank` 和跳过的不可行样本数。
 8. 每轮同时保存 `proposed_solution` 与 `added_solution`。新候选两者相同；重复候选的 proposed 保持不变，added 改为唯一 random replacement，状态为 `duplicate_replacement`。
-9. 每轮更新 trajectory state 并原子写 checkpoint；完成后将所有 proposed solution 展平到 summary 的 `solutions`。
-10. `pareto_front` 按 setting 从 proposed solutions 计算非支配集：A 支配 B 当且仅当 `A.kappa >= B.kappa`、`A.E >= B.E`、`A.rho <= B.rho`，且至少一个目标严格更优。
-11. 绘图器对选定 seed 重新校验并计算展示 front；验收器枚举 25-level 离散设计空间，计算精确 front coverage、precision 和 spacing diagnostics。
+9. 每轮更新 trajectory state 并原子写 checkpoint；恢复时先由 outputs 校验外层 schema、字段类型和 trajectory 身份，再由 pipeline 校验 rows、iteration records、候选决策、计数、SA 审计、最新 scalarization 元数据和 QUBO 元数据，任何不一致都在完成跳过或 RNG 回放前失败。
+10. 完成后将所有 proposed solution（包括重复 proposal）展平到 summary 的 `solutions`；random replacement 不进入该列表。
+11. `pareto_front` 先按 composition 去除重复 proposal并保留首次记录，再按 `setting × seed` 独立计算非支配集：A 支配 B 当且仅当 `A.kappa >= B.kappa`、`A.E >= B.E`、`A.rho <= B.rho`，且至少一个目标严格更优。
+12. summary 的 `pareto_fronts` 为 `{setting, seed, solutions}` 记录列表；绘图器读取指定 seed 的 stored front 并用 proposed solutions 重算核对，验收器同时检查 front 身份、去重和精确 front diagnostics。
 
 ### Figure 5 对象命名与调用规则
 
@@ -335,34 +336,19 @@ Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用
 | scalarization | `ScalarizationResult`、`ObjectiveTargetsResult` | 分别表示单人工 target 和三目标独立 target；权重顺序必须与 `FIGURE5_OBJECTIVES` 一致。 |
 | 迭代记录 | `SolutionPoint`、`IterationRecord` | 分别表示一个设计点和一轮 proposed/added 决策；iteration 使用从 0 开始的整数。 |
 | 运行状态 | `Figure5TrajectoryState`、`Figure5TrajectoryResult` | 分别表示可恢复状态和完整单轨迹结果。 |
-| 总结果 | `Figure5Summary` | 保存 trajectories、展平后的 proposed `solutions` 和按 setting 分组的 `pareto_front`。 |
+| Pareto 结果 | `Figure5ParetoFront` | 保存一个固定 `setting + seed` 的去重非支配 solutions。 |
+| 总结果 | `Figure5Summary` | 保存 trajectories、展平后的 proposed `solutions` 和按 `setting × seed` 分组的 `pareto_fronts`。 |
 | 输出 | `Figure5OutputLayout` | 统一派生 summary、manifest、日志、图片和 checkpoint 路径。 |
 
 调用规则：
 
-1. 完整实验优先调用 `figure5_runner.py`；程序化调用依次使用 `resolve_experiment_config(...)` 和 `run_figure5_experiment(...)`。
-2. pipeline 的 `w_ddts` 路径调用 `compute_ddts_targets(...)`；`wo_ddts` 路径必须调用 `compute_individual_objective_targets(...)` 后训练三个 FM，并在 QUBO 层合并。
-3. `compute_weighted_sum_targets(...)` 和 `scalarize_training_targets(...)` 保留为数学对照/测试工具，不代表生产 pipeline 的三 FM baseline 调用路径。
-4. `run_single_trajectory(...)` 只用于聚焦测试或高级编排；以 `_` 开头的函数和未公开的训练中间对象不作为跨模块 API。
+1. Figure 5 完整实验只支持通过 `figure5_runner.py` 启动；pipeline 中的实验和单 trajectory 函数只供 runner 与白盒测试使用，不提供程序化 API 或跨版本兼容承诺。
+2. runner 统一执行 settings/seed 公共契约、固定 objectives、依赖/device 检查、配置解析和 manifest 写入。
+3. pipeline 的 `w_ddts` 路径调用 `compute_ddts_targets(...)`；`wo_ddts` 路径必须调用 `compute_individual_objective_targets(...)` 后训练三个 FM，并在 QUBO 层合并。
+4. `compute_weighted_sum_reference_targets(...)` 只用于 weighted-sum 数学对照，不表示生产 pipeline 的训练调用路径；不存在按 setting 分发单 FM target 的公共函数。
 5. `decision_status` 只允许 `accepted` 或 `duplicate_replacement`；Pareto front 只读取 `proposed_solution`，不得把 random replacement 当成优化器提出的点。
 6. setting 和 seed 列表必须非空、无重复；seed 必须为非负整数。同一 seed/iteration 的权重由函数确定，不允许调用方为两个 setting 分别随机采样。
-7. 路径必须通过 `figure5_output_layout(...)` / `Figure5OutputLayout` 获取；多 seed summary 绘图必须用 `--seed` 明确选择一条 seed，避免隐式混合轨迹。
-
-程序化调用示例：
-
-```python
-from figure5_experiment_config import resolve_experiment_config
-from figure5_pipeline import run_figure5_experiment
-
-config = resolve_experiment_config(preset="quick", device="cpu")
-summary = run_figure5_experiment(
-    seed_list=[0],
-    config=config,
-    output_dir="figure5_quick",
-    settings=("w_ddts", "wo_ddts"),
-    resume=True,
-)
-```
+7. 路径必须通过 `figure5_output_layout(...)` / `Figure5OutputLayout` 获取；多 seed summary 绘图必须用 `--seed` 明确选择一条 seed，stored front 不跨 seed 混合。
 
 ### Figure 5 配置规则
 
@@ -460,9 +446,9 @@ conda run -n env_torch python validate_reproduction.py figure5 `
 | 输出 | 规则 |
 | --- | --- |
 | `manifest.json` | 记录命令、preset、resolved config、runtime、seed/setting 选择、固定 objectives 和标准输出路径。 |
-| trajectory checkpoint | schema v2；绑定 `setting + seed + config`，只在全部身份字段精确匹配时恢复。 |
-| `figure5_summary.json` | schema v2；包含 config、trajectories、proposed `solutions` 和每个 setting 的 `pareto_front`。 |
-| `figure5.png` | 由 `plot_figure5.py` 从 schema v2 summary 生成；多 seed 时必须显式传 `--seed`。 |
+| trajectory checkpoint | schema v2；绑定 `setting + seed + config`。恢复要求外层字段和内部 `Figure5TrajectoryState` 同时一致，格式不变但不迁移损坏状态。 |
+| `figure5_summary.json` | schema v3；包含 config、trajectories、全部 proposed `solutions` 和每个 `setting × seed` 的 `pareto_fronts` 记录。 |
+| `figure5.png` | 由 `plot_figure5.py` 从 schema v3 summary 生成；多 seed 时必须显式传 `--seed`，stored front 必须与重算结果一致。 |
 | 日志 | runner 和 plot 分文件记录；验收结论只来自 validation report。 |
 
 每条轨迹必须满足：`completed_iterations == iterations`、`len(iteration_records) == iterations`、`final_dataset_size == num_samples + iterations`，并且 `accepted_sa_candidates + duplicate_replacements == iterations`。每条 `IterationRecord` 必须同时保留 setting、seed、iteration、weights、scalarization method、decision status、proposed/added solution 和 SA 诊断字段。
@@ -474,6 +460,6 @@ Figure 5 canonical `quick` 只检查：
 - 配置为 500 条初始数据、150 次迭代、25 levels、seed 0。
 - `w_ddts` 和 `wo_ddts` 两条 trajectory 均完整，共有 300 条 proposed solution records。
 - composition、真实目标值、iteration identity 和候选计数一致。
-- 两个 summary Pareto fronts 非空，并且精确离散 Pareto front 指标可成功计算。
+- 两个 `setting × seed` summary Pareto fronts 非空、无重复 composition且与 proposed solutions 一致，并且精确离散 Pareto front 指标可成功计算。
 
 验收器仍会枚举 25-level 离散设计空间，报告精确 front coverage、precision、spacing CV 及两种 setting 的比值。这些数据只位于 `metrics` 和 `diagnostics`，不设置覆盖率或均匀性通过阈值。

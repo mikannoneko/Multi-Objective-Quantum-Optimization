@@ -25,6 +25,7 @@ RUNNER_LOG_FILENAME = "figure5_runner.log"
 PLOT_LOG_FILENAME = "plot_figure5.log"
 CHECKPOINT_DIR_NAME = "trajectories"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+_CHECKPOINT_FIELDS = frozenset({"schema_version", "setting", "seed", "config", "state"})
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,27 @@ def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
     return write_json_atomic(path, payload)
 
 
+def _same_json_value(actual: Any, expected: Any) -> bool:
+    """Compare JSON values without accepting bool/int or other type coercions."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_json_value(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_json_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return bool(actual == expected)
+
+
+def _checkpoint_error(checkpoint: Path, detail: str) -> ValueError:
+    return ValueError(f"Invalid checkpoint {checkpoint}: {detail}")
+
+
 def load_checkpoint(
     path: str | Path,
     *,
@@ -116,21 +138,51 @@ def load_checkpoint(
     seed: int,
     config: Figure5ExperimentConfig,
 ) -> dict[str, Any]:
-    """Load a checkpoint only when all trajectory identity fields match."""
+    """Load a checkpoint after validating its outer schema and identity."""
 
     checkpoint = Path(path)
-    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported checkpoint schema in {checkpoint}")
-    if payload.get("setting") != setting or int(payload.get("seed")) != int(seed):
-        raise ValueError(f"Checkpoint metadata does not match requested trajectory: {checkpoint}")
-    if payload.get("config") != config.to_dict():
-        raise ValueError(
-            f"Checkpoint config does not match current config: {checkpoint}. "
-            "Use a separate output directory for different run settings."
+    try:
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _checkpoint_error(checkpoint, f"cannot read valid JSON ({exc})") from exc
+
+    if not isinstance(payload, dict):
+        raise _checkpoint_error(checkpoint, "root must be a JSON object")
+
+    missing_fields = sorted(_CHECKPOINT_FIELDS - payload.keys())
+    if missing_fields:
+        raise _checkpoint_error(checkpoint, f"missing top-level fields: {', '.join(missing_fields)}")
+
+    schema_version = payload["schema_version"]
+    if type(schema_version) is not int:
+        raise _checkpoint_error(checkpoint, "field 'schema_version' must be an integer")
+    if schema_version != CHECKPOINT_SCHEMA_VERSION:
+        raise _checkpoint_error(
+            checkpoint,
+            f"unsupported schema_version {schema_version!r}; expected {CHECKPOINT_SCHEMA_VERSION}",
         )
-    if "state" not in payload:
-        raise ValueError(f"Checkpoint is missing state: {checkpoint}")
+
+    checkpoint_setting = payload["setting"]
+    checkpoint_seed = payload["seed"]
+    if type(checkpoint_setting) is not str:
+        raise _checkpoint_error(checkpoint, "field 'setting' must be a string")
+    if type(checkpoint_seed) is not int:
+        raise _checkpoint_error(checkpoint, "field 'seed' must be an integer")
+    if checkpoint_setting != setting:
+        raise _checkpoint_error(checkpoint, f"setting metadata does not match {setting!r}")
+    if checkpoint_seed != int(seed):
+        raise _checkpoint_error(checkpoint, f"seed metadata does not match {int(seed)!r}")
+
+    checkpoint_config = payload["config"]
+    if not isinstance(checkpoint_config, dict):
+        raise _checkpoint_error(checkpoint, "field 'config' must be a JSON object")
+    if not _same_json_value(checkpoint_config, config.to_dict()):
+        raise _checkpoint_error(
+            checkpoint,
+            "config does not match the current run; use a separate output directory for different settings",
+        )
+    if not isinstance(payload["state"], dict):
+        raise _checkpoint_error(checkpoint, "field 'state' must be a JSON object")
     return payload
 
 

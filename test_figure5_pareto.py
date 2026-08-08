@@ -17,13 +17,31 @@ class Figure5ParetoTests(unittest.TestCase):
         self.assertFalse(is_dominated(candidate, worse_e))
         self.assertFalse(is_dominated(candidate, worse_rho))
 
-    def test_identical_points_do_not_strictly_dominate_each_other(self) -> None:
+    def test_identical_objective_points_are_deduplicated_without_changing_dominance(self) -> None:
         point_a = {"kappa": 120.0, "E": 90.0, "rho": 2.7}
         point_b = {"kappa": 120.0, "E": 90.0, "rho": 2.7}
 
         self.assertFalse(is_dominated(point_a, point_b))
         self.assertFalse(is_dominated(point_b, point_a))
+        self.assertEqual(pareto_front([point_a, point_b]), [point_a])
+
+    def test_equal_objectives_with_distinct_compositions_remain_distinct_solutions(self) -> None:
+        point_a = {"composition": [1.0, 0.0, 0.0, 0.0], "kappa": 120.0, "E": 90.0, "rho": 2.7}
+        point_b = {"composition": [0.0, 1.0, 0.0, 0.0], "kappa": 120.0, "E": 90.0, "rho": 2.7}
+
         self.assertEqual(pareto_front([point_a, point_b]), [point_a, point_b])
+
+    def test_repeated_composition_keeps_the_first_record(self) -> None:
+        first = {
+            "iteration": 1,
+            "composition": [0.25, 0.25, 0.25, 0.25],
+            "kappa": 120.0,
+            "E": 90.0,
+            "rho": 2.7,
+        }
+        repeated = {**first, "iteration": 4}
+
+        self.assertEqual(pareto_front([first, repeated]), [first])
 
     def test_pareto_front_removes_clearly_dominated_points(self) -> None:
         strong = {"id": "strong", "kappa": 130.0, "E": 100.0, "rho": 2.4}

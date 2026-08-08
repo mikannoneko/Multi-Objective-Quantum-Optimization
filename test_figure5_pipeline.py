@@ -10,7 +10,7 @@ import numpy as np
 
 import figure5_pipeline as pipeline
 import figure5_runner
-from alloy_dataset_generator import generate_initial_dataset_multi_objective
+from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_multi_objective
 from figure4_experiment_config import EncodingConfig, FMConfig, SAConfig
 from figure4_qubo_math import (
     QuboStats,
@@ -28,6 +28,7 @@ from figure5_outputs import (
     load_checkpoint,
     write_checkpoint,
 )
+from figure5_scalarization import FIGURE5_OBJECTIVES
 from figure5_pipeline import (
     Figure5TrajectoryResult,
     IterationRecord,
@@ -65,16 +66,22 @@ def _qubo_stats(num_variables: int = 32) -> QuboStats:
     )
 
 
-def _training_result(config: Figure5ExperimentConfig, seed: int, iteration: int) -> TrainingIterationResult:
+def _training_result(
+    config: Figure5ExperimentConfig,
+    seed: int,
+    iteration: int,
+    rows: list[dict[str, object]],
+) -> TrainingIterationResult:
     encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
     composition = [1.0, 0.0, 0.0, 0.0] if iteration % 2 == 0 else [0.0, 1.0, 0.0, 0.0]
+    scalarization = pipeline.compute_ddts_targets(rows, preference_weights_for_iteration(seed, iteration))
     return TrainingIterationResult(
         encoding=encoding,
         candidate_bits=encode_discrete_composition(composition, encoding),
         weights=preference_weights_for_iteration(seed, iteration),
         scalarization_method="ddts",
-        fm_metadata={"mock": True},
-        scalarization_metadata={"mock": True},
+        fm_metadata={"artificial_target": {"mock": True}},
+        scalarization_metadata=dict(scalarization.metadata),
         qubo_stats=_qubo_stats(4 * config.num_levels),
         sa_energy=0.0,
         feasible_candidate_rank=1,
@@ -89,6 +96,18 @@ def _sampling_result(*states: np.ndarray) -> SASamplingResult:
             for index, state in enumerate(states)
         )
     )
+
+
+def _novel_grid_composition(rows: list[dict[str, object]], num_levels: int) -> list[float]:
+    seen = {pipeline._row_composition_key(row) for row in rows}
+    for first in range(num_levels + 1):
+        for second in range(num_levels - first + 1):
+            for third in range(num_levels - first - second + 1):
+                fourth = num_levels - first - second - third
+                composition = [value / num_levels for value in (first, second, third, fourth)]
+                if pipeline._composition_key(composition) not in seen:
+                    return composition
+    raise AssertionError("test grid unexpectedly contains every composition")
 
 
 class Figure5PipelineTests(unittest.TestCase):
@@ -149,6 +168,15 @@ class Figure5PipelineTests(unittest.TestCase):
             [4, 5, 6],
         )
 
+    def test_runner_is_the_only_supported_experiment_entrypoint(self) -> None:
+        self.assertNotIn("run_figure5_experiment", pipeline.__all__)
+        self.assertNotIn("run_single_trajectory", pipeline.__all__)
+        self.assertEqual(tuple(FIGURE5_OBJECTIVES), ("kappa", "E", "rho"))
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            pipeline.validate_settings(["unknown"])
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            pipeline.validate_settings(["w_ddts", "w_ddts"])
+
     def test_explicit_multi_seed_runs_setting_seed_cartesian_product(self) -> None:
         config = _test_config(iterations=1)
 
@@ -196,6 +224,69 @@ class Figure5PipelineTests(unittest.TestCase):
                 run_mock.call_args_list[call_index].kwargs["initial_rows"],
                 run_mock.call_args_list[call_index + 1].kwargs["initial_rows"],
             )
+
+    def test_summary_fronts_are_per_seed_and_deduplicate_compositions(self) -> None:
+        config = _test_config(iterations=2)
+
+        def fake_run(*_: object, **kwargs: object) -> Figure5TrajectoryResult:
+            setting = str(kwargs["setting"])
+            seed = int(kwargs["seed"])
+            if seed == 0:
+                first = SolutionPoint(10, [1.0, 0.0, 0.0, 0.0], 100.0, 80.0, 3.0)
+                second = SolutionPoint(11, [1.0, 0.0, 0.0, 0.0], 100.0, 80.0, 3.0)
+            else:
+                first = SolutionPoint(10, [0.0, 1.0, 0.0, 0.0], 120.0, 100.0, 2.5)
+                second = SolutionPoint(11, [0.0, 0.0, 1.0, 0.0], 110.0, 90.0, 2.8)
+            records = [
+                IterationRecord(setting, seed, 0, [0.2, 0.3, 0.5], "ddts", "accepted", first, first, 0, -1.0),
+                IterationRecord(
+                    setting,
+                    seed,
+                    1,
+                    [0.2, 0.3, 0.5],
+                    "ddts",
+                    "accepted",
+                    second,
+                    second,
+                    0,
+                    -2.0,
+                ),
+            ]
+            return Figure5TrajectoryResult(
+                setting=setting,
+                seed=seed,
+                iteration_records=records,
+                final_dataset_size=config.num_samples + config.iterations,
+                training_backend=pipeline.TRAINING_BACKEND,
+                latest_weights=[0.2, 0.3, 0.5],
+                latest_fm_metadata={"artificial_target": {}},
+                latest_scalarization_metadata={},
+                qubo_stats=_qubo_stats(),
+                duplicate_replacements=0,
+                random_replacements=0,
+                random_replacement_draws=0,
+                accepted_sa_candidates=2,
+                completed_iterations=2,
+            )
+
+        output_dir = WORKSPACE_TMP_ROOT / "figure5_per_seed_fronts"
+        with mock.patch("figure5_pipeline.run_single_trajectory", side_effect=fake_run):
+            summary = run_figure5_experiment(
+                seed_list=[0, 1],
+                config=config,
+                output_dir=output_dir,
+                settings=("w_ddts",),
+            )
+
+        self.assertEqual(
+            [(front.setting, front.seed) for front in summary.pareto_fronts],
+            [("w_ddts", 0), ("w_ddts", 1)],
+        )
+        self.assertEqual(len(summary.pareto_fronts[0].solutions), 1)
+        self.assertEqual(summary.pareto_fronts[0].solutions[0]["seed"], 0)
+        self.assertEqual(summary.pareto_fronts[0].solutions[0]["iteration"], 0)
+        self.assertEqual(len(summary.pareto_fronts[1].solutions), 1)
+        self.assertEqual(summary.pareto_fronts[1].solutions[0]["seed"], 1)
 
     def test_preference_weights_are_shared_and_deterministic(self) -> None:
         weights_a = preference_weights_for_iteration(seed=4, iteration=7)
@@ -318,15 +409,257 @@ class Figure5PipelineTests(unittest.TestCase):
                 seen_compositions=set(),
             )
 
+    def test_resume_rejects_inconsistent_completed_state_before_skip(self) -> None:
+        seed = 21
+        config = _test_config(iterations=1)
+        initial_rows, _ = generate_initial_dataset_multi_objective(num_samples=config.num_samples, seed=seed)
+        prepared_rows = pipeline.discretize_rows_for_figure5(initial_rows, config.num_levels)
+        composition = _novel_grid_composition(prepared_rows, config.num_levels)
+        added_row = dict(build_dataset_row(config.num_samples, seed, composition))
+        weights = preference_weights_for_iteration(seed, 0)
+        scalarization = pipeline.compute_ddts_targets(prepared_rows, weights)
+        solution = pipeline._solution_point_from_row(added_row)
+        state = pipeline.Figure5TrajectoryState(
+            rows=[*prepared_rows, added_row],
+            iteration_records=[
+                IterationRecord(
+                    setting="w_ddts",
+                    seed=seed,
+                    iteration=0,
+                    weights=list(weights),
+                    scalarization_method="ddts",
+                    decision_status="accepted",
+                    proposed_solution=solution,
+                    added_solution=solution,
+                    replacement_draws=0,
+                    sa_energy=-1.0,
+                    feasible_candidate_rank=1,
+                    infeasible_sa_samples_skipped=0,
+                )
+            ],
+            latest_weights=list(weights),
+            latest_fm_metadata={"artificial_target": {"mock": True}},
+            latest_scalarization_metadata=dict(scalarization.metadata),
+            qubo_stats=_qubo_stats(4 * config.num_levels),
+            accepted_sa_candidates=1,
+            max_feasible_candidate_rank=1,
+        )
+        checkpoint = figure5_output_layout(
+            WORKSPACE_TMP_ROOT / "checkpoint_internal_validation"
+        ).checkpoint_path("w_ddts", seed)
+        valid_payload = checkpoint_payload(
+            setting="w_ddts",
+            seed=seed,
+            state=state,
+            config=config,
+        )
+
+        write_checkpoint(checkpoint, valid_payload)
+        with mock.patch("figure5_pipeline._fit_and_solve_iteration") as fit_mock:
+            result = run_single_trajectory(
+                initial_rows,
+                "w_ddts",
+                seed=seed,
+                config=config,
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+        fit_mock.assert_not_called()
+        self.assertEqual(result.completed_iterations, 1)
+
+        corruptions = (
+            (
+                "missing state field",
+                lambda payload: payload["state"].pop("random_replacement_draws"),
+                "missing fields.*random_replacement_draws",
+            ),
+            (
+                "unexpected state field",
+                lambda payload: payload["state"].__setitem__("unknown", 1),
+                "unexpected fields.*unknown",
+            ),
+            (
+                "missing record field",
+                lambda payload: payload["state"]["iteration_records"][0].pop("weights"),
+                "missing fields.*weights",
+            ),
+            (
+                "unexpected solution field",
+                lambda payload: payload["state"]["iteration_records"][0]["added_solution"].__setitem__(
+                    "unknown", 1
+                ),
+                "unexpected fields.*unknown",
+            ),
+            ("row count", lambda payload: payload["state"]["rows"].pop(), "rows has length"),
+            (
+                "row seed",
+                lambda payload: payload["state"]["rows"][0].__setitem__("seed", seed + 1),
+                r"rows\[0\]\.seed",
+            ),
+            (
+                "composition",
+                lambda payload: payload["state"]["rows"][0].__setitem__("f1_norm", 1.2),
+                "composition",
+            ),
+            (
+                "record identity",
+                lambda payload: payload["state"]["iteration_records"][0].__setitem__("seed", seed + 1),
+                "setting/seed/iteration",
+            ),
+            (
+                "weights",
+                lambda payload: payload["state"]["iteration_records"][0]["weights"].__setitem__(0, 0.0),
+                "weights",
+            ),
+            (
+                "method",
+                lambda payload: payload["state"]["iteration_records"][0].__setitem__(
+                    "scalarization_method", "weighted_sum"
+                ),
+                "scalarization_method",
+            ),
+            (
+                "solution id",
+                lambda payload: payload["state"]["iteration_records"][0]["added_solution"].__setitem__(
+                    "sample_id", 99
+                ),
+                "sample_id",
+            ),
+            (
+                "accepted draws",
+                lambda payload: payload["state"]["iteration_records"][0].__setitem__("replacement_draws", 1),
+                "zero draws",
+            ),
+            (
+                "candidate accounting",
+                lambda payload: payload["state"].__setitem__("accepted_sa_candidates", 0),
+                "accepted_sa_candidates",
+            ),
+            (
+                "SA rank",
+                lambda payload: payload["state"]["iteration_records"][0].__setitem__(
+                    "feasible_candidate_rank", 2
+                ),
+                "rank",
+            ),
+            (
+                "latest weights",
+                lambda payload: payload["state"]["latest_weights"].__setitem__(0, 0.0),
+                "latest_weights",
+            ),
+            (
+                "FM metadata",
+                lambda payload: payload["state"].__setitem__("latest_fm_metadata", {"mock": True}),
+                "latest_fm_metadata",
+            ),
+            (
+                "scalarization metadata",
+                lambda payload: payload["state"]["latest_scalarization_metadata"]["utopian_point"].__setitem__(
+                    "kappa", 999.0
+                ),
+                "latest_scalarization_metadata",
+            ),
+            (
+                "QUBO variable count",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__("num_variables", 31),
+                "num_variables",
+            ),
+            (
+                "QUBO zero maximum coefficient",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__("max_abs", 0.0),
+                "max_abs",
+            ),
+            (
+                "missing QUBO stats",
+                lambda payload: payload["state"].__setitem__("qubo_stats", None),
+                "contain qubo_stats",
+            ),
+        )
+        for label, corrupt, error_pattern in corruptions:
+            with self.subTest(label=label):
+                payload = json.loads(json.dumps(valid_payload))
+                corrupt(payload)
+                write_checkpoint(checkpoint, payload)
+                with mock.patch("figure5_pipeline._fit_and_solve_iteration") as fit_mock:
+                    with self.assertRaisesRegex(ValueError, error_pattern):
+                        run_single_trajectory(
+                            initial_rows,
+                            "w_ddts",
+                            seed=seed,
+                            config=config,
+                            checkpoint_path=checkpoint,
+                            resume=True,
+                        )
+                    fit_mock.assert_not_called()
+
+    def test_completed_weighted_sum_checkpoint_validates_setting_metadata(self) -> None:
+        seed = 22
+        config = _test_config(iterations=1)
+        initial_rows, _ = generate_initial_dataset_multi_objective(num_samples=config.num_samples, seed=seed)
+        prepared_rows = pipeline.discretize_rows_for_figure5(initial_rows, config.num_levels)
+        composition = _novel_grid_composition(prepared_rows, config.num_levels)
+        added_row = dict(build_dataset_row(config.num_samples, seed, composition))
+        weights = preference_weights_for_iteration(seed, 0)
+        individual = pipeline.compute_individual_objective_targets(prepared_rows)
+        scalarization_metadata = {
+            **individual.metadata,
+            "merge_weights": dict(zip(FIGURE5_OBJECTIVES, weights)),
+            "merge_stage": "qubo",
+        }
+        solution = pipeline._solution_point_from_row(added_row)
+        state = pipeline.Figure5TrajectoryState(
+            rows=[*prepared_rows, added_row],
+            iteration_records=[
+                IterationRecord(
+                    "wo_ddts",
+                    seed,
+                    0,
+                    list(weights),
+                    "weighted_sum",
+                    "accepted",
+                    solution,
+                    solution,
+                    0,
+                    -1.0,
+                )
+            ],
+            latest_weights=list(weights),
+            latest_fm_metadata={objective: {"mock": True} for objective in FIGURE5_OBJECTIVES},
+            latest_scalarization_metadata=scalarization_metadata,
+            qubo_stats=_qubo_stats(4 * config.num_levels),
+            accepted_sa_candidates=1,
+            max_feasible_candidate_rank=1,
+        )
+        checkpoint = figure5_output_layout(
+            WORKSPACE_TMP_ROOT / "checkpoint_weighted_sum_validation"
+        ).checkpoint_path("wo_ddts", seed)
+        write_checkpoint(
+            checkpoint,
+            checkpoint_payload(setting="wo_ddts", seed=seed, state=state, config=config),
+        )
+
+        with mock.patch("figure5_pipeline._fit_and_solve_iteration") as fit_mock:
+            result = run_single_trajectory(
+                initial_rows,
+                "wo_ddts",
+                seed=seed,
+                config=config,
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+        fit_mock.assert_not_called()
+        self.assertEqual(result.completed_iterations, 1)
+
     def test_partial_resume_and_completed_skip(self) -> None:
         config = _test_config(iterations=2)
         initial_rows, _ = generate_initial_dataset_multi_objective(num_samples=config.num_samples, seed=6)
+        discretized_initial_rows = pipeline.discretize_rows_for_figure5(initial_rows, config.num_levels)
         output_dir = WORKSPACE_TMP_ROOT / "figure5_resume"
         checkpoint = figure5_output_layout(output_dir).checkpoint_path("w_ddts", 6)
 
         with mock.patch(
             "figure5_pipeline._fit_and_solve_iteration",
-            side_effect=[_training_result(config, 6, 0), RuntimeError("interrupt")],
+            side_effect=[_training_result(config, 6, 0, discretized_initial_rows), RuntimeError("interrupt")],
         ):
             with self.assertRaisesRegex(RuntimeError, "interrupt"):
                 run_single_trajectory(
@@ -343,7 +676,7 @@ class Figure5PipelineTests(unittest.TestCase):
 
         with mock.patch(
             "figure5_pipeline._fit_and_solve_iteration",
-            return_value=_training_result(config, 6, 1),
+            return_value=_training_result(config, 6, 1, payload["state"]["rows"]),
         ) as fit_mock:
             resumed = run_single_trajectory(
                 initial_rows,
@@ -381,6 +714,110 @@ class Figure5PipelineTests(unittest.TestCase):
                 checkpoint_path=checkpoint,
                 resume=True,
             )
+
+    def test_partial_resume_replays_replacement_rng_exactly(self) -> None:
+        seed = 23
+        config = _test_config(iterations=2)
+        initial_rows, _ = generate_initial_dataset_multi_objective(num_samples=config.num_samples, seed=seed)
+        prepared_rows = pipeline.discretize_rows_for_figure5(initial_rows, config.num_levels)
+        seen = {pipeline._row_composition_key(row) for row in prepared_rows}
+        first_rng = random.Random(seed + 17)
+        first_added, first_draws = pipeline._sample_unique_replacement_row(
+            sample_id=config.num_samples,
+            seed=seed,
+            rng=first_rng,
+            num_levels=config.num_levels,
+            seen_compositions=seen,
+        )
+        proposed_composition = pipeline.normalized_composition_from_row(prepared_rows[0])
+        first_proposed = dict(build_dataset_row(config.num_samples, seed, proposed_composition))
+        first_weights = preference_weights_for_iteration(seed, 0)
+        first_scalarization = pipeline.compute_ddts_targets(prepared_rows, first_weights)
+        state = pipeline.Figure5TrajectoryState(
+            rows=[*prepared_rows, first_added],
+            iteration_records=[
+                IterationRecord(
+                    "w_ddts",
+                    seed,
+                    0,
+                    list(first_weights),
+                    "ddts",
+                    "duplicate_replacement",
+                    pipeline._solution_point_from_row(first_proposed),
+                    pipeline._solution_point_from_row(first_added),
+                    first_draws,
+                    -1.0,
+                )
+            ],
+            latest_weights=list(first_weights),
+            latest_fm_metadata={"artificial_target": {"mock": True}},
+            latest_scalarization_metadata=dict(first_scalarization.metadata),
+            qubo_stats=_qubo_stats(4 * config.num_levels),
+            duplicate_replacements=1,
+            random_replacements=1,
+            random_replacement_draws=first_draws,
+            max_feasible_candidate_rank=1,
+        )
+        checkpoint = figure5_output_layout(
+            WORKSPACE_TMP_ROOT / "checkpoint_rng_replay"
+        ).checkpoint_path("w_ddts", seed)
+        write_checkpoint(
+            checkpoint,
+            checkpoint_payload(setting="w_ddts", seed=seed, state=state, config=config),
+        )
+
+        expected_rng = random.Random(seed + 17)
+        replayed_first, replayed_first_draws = pipeline._sample_unique_replacement_row(
+            sample_id=config.num_samples,
+            seed=seed,
+            rng=expected_rng,
+            num_levels=config.num_levels,
+            seen_compositions=seen,
+        )
+        self.assertEqual(replayed_first_draws, first_draws)
+        self.assertEqual(pipeline._row_composition_key(replayed_first), pipeline._row_composition_key(first_added))
+        expected_seen = {*seen, pipeline._row_composition_key(first_added)}
+        expected_second, expected_second_draws = pipeline._sample_unique_replacement_row(
+            sample_id=config.num_samples + 1,
+            seed=seed,
+            rng=expected_rng,
+            num_levels=config.num_levels,
+            seen_compositions=expected_seen,
+        )
+
+        encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
+        second_weights = preference_weights_for_iteration(seed, 1)
+        second_scalarization = pipeline.compute_ddts_targets(state.rows, second_weights)
+        training = TrainingIterationResult(
+            encoding=encoding,
+            candidate_bits=encode_discrete_composition(proposed_composition, encoding),
+            weights=second_weights,
+            scalarization_method="ddts",
+            fm_metadata={"artificial_target": {"mock": True}},
+            scalarization_metadata=dict(second_scalarization.metadata),
+            qubo_stats=_qubo_stats(4 * config.num_levels),
+            sa_energy=-2.0,
+            feasible_candidate_rank=1,
+            infeasible_sa_samples_skipped=0,
+        )
+        with mock.patch("figure5_pipeline._fit_and_solve_iteration", return_value=training):
+            result = run_single_trajectory(
+                initial_rows,
+                "w_ddts",
+                seed=seed,
+                config=config,
+                checkpoint_path=checkpoint,
+                resume=True,
+            )
+
+        final_record = result.iteration_records[-1]
+        self.assertEqual(final_record.decision_status, "duplicate_replacement")
+        self.assertEqual(final_record.replacement_draws, expected_second_draws)
+        self.assertEqual(
+            pipeline._composition_key(final_record.added_solution.composition),
+            pipeline._row_composition_key(expected_second),
+        )
+        self.assertEqual(result.random_replacement_draws, first_draws + expected_second_draws)
 
     def test_summary_uses_proposed_solutions_and_excludes_replacements(self) -> None:
         config = _test_config(iterations=3)
@@ -447,11 +884,16 @@ class Figure5PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(summary.solutions), 6)
         self.assertTrue(all(solution["composition"] != replacement.composition for solution in summary.solutions))
-        self.assertEqual(len(summary.pareto_front["w_ddts"]), 1)
-        self.assertEqual(summary.pareto_front["w_ddts"][0]["composition"], strong.composition)
+        self.assertEqual(
+            [(front.setting, front.seed) for front in summary.pareto_fronts],
+            [("w_ddts", 0), ("wo_ddts", 0)],
+        )
+        self.assertEqual(len(summary.pareto_fronts[0].solutions), 1)
+        self.assertEqual(summary.pareto_fronts[0].solutions[0]["composition"], strong.composition)
         payload = json.loads(figure5_output_layout(output_dir).summary_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertEqual(payload["settings"], ["w_ddts", "wo_ddts"])
+        self.assertNotIn("pareto_front", payload)
 
     def test_output_checkpoint_and_manifest_schema(self) -> None:
         config = _test_config(iterations=1)
@@ -484,6 +926,55 @@ class Figure5PipelineTests(unittest.TestCase):
         paper_metadata = manifest["runtime"]["reference_paper"]
         self.assertTrue(paper_metadata["path"].endswith("paper_2512_11479.pdf"))
         self.assertEqual(paper_metadata["sha256"] is not None, paper_metadata["exists"])
+
+    def test_checkpoint_outer_schema_rejects_malformed_payloads(self) -> None:
+        config = _test_config(iterations=1)
+        layout = figure5_output_layout(WORKSPACE_TMP_ROOT / "checkpoint_outer_validation")
+        checkpoint = layout.checkpoint_path("w_ddts", 4)
+        valid_payload = checkpoint_payload(
+            setting="w_ddts",
+            seed=4,
+            state=pipeline.Figure5TrajectoryState(rows=[]),
+            config=config,
+        )
+        malformed_payloads = (
+            ("root", [], "root"),
+            (
+                "missing state",
+                {key: value for key, value in valid_payload.items() if key != "state"},
+                "missing top-level fields.*state",
+            ),
+            ("boolean schema", {**valid_payload, "schema_version": True}, "schema_version"),
+            ("numeric setting", {**valid_payload, "setting": 1}, "setting"),
+            ("string seed", {**valid_payload, "seed": "4"}, "seed"),
+            ("list config", {**valid_payload, "config": []}, "config"),
+            ("list state", {**valid_payload, "state": []}, "state"),
+            ("wrong schema", {**valid_payload, "schema_version": 1}, "schema_version"),
+            ("wrong setting", {**valid_payload, "setting": "wo_ddts"}, "setting metadata"),
+            ("wrong seed", {**valid_payload, "seed": 5}, "seed metadata"),
+            (
+                "wrong config",
+                {**valid_payload, "config": {**valid_payload["config"], "iterations": 2}},
+                "config",
+            ),
+            (
+                "type-coerced config",
+                {**valid_payload, "config": {**valid_payload["config"], "iterations": True}},
+                "config",
+            ),
+        )
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        for label, malformed_payload, error_pattern in malformed_payloads:
+            with self.subTest(label=label):
+                checkpoint.write_text(json.dumps(malformed_payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error_pattern) as caught:
+                    load_checkpoint(checkpoint, setting="w_ddts", seed=4, config=config)
+                self.assertIn(str(checkpoint), str(caught.exception))
+
+        checkpoint.write_text("{not-json", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "valid JSON") as caught:
+            load_checkpoint(checkpoint, setting="w_ddts", seed=4, config=config)
+        self.assertIn(str(checkpoint), str(caught.exception))
 
     def test_runner_rejects_unavailable_cuda(self) -> None:
         import experiment_runtime

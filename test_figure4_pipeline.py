@@ -336,13 +336,21 @@ class Figure4PipelineTests(unittest.TestCase):
             self.assertIn(figure4_object, content)
         for figure5_keyword in ("w_ddts", "wo_ddts", "weighted-sum", "Pareto front", "figure5_runner.py"):
             self.assertIn(figure5_keyword, content)
-        for figure5_object in ("Figure5ExperimentConfig", "Figure5Summary", "run_figure5_experiment"):
+        for figure5_object in (
+            "Figure5ExperimentConfig",
+            "Figure5Summary",
+            "Figure5ParetoFront",
+            "compute_weighted_sum_reference_targets",
+        ):
             self.assertIn(figure5_object, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
         self.assertFalse((repo_root / legacy_document_name).exists())
         figure4_section = content.split("## 第二部分：Figure 5 复现", 1)[0]
         self.assertNotIn("run_figure4_experiment", figure4_section)
         self.assertNotIn("程序化调用示例", figure4_section)
+        figure5_section = content.split("## 第二部分：Figure 5 复现", 1)[1]
+        self.assertNotIn("run_figure5_experiment", figure5_section)
+        self.assertNotIn("程序化调用示例", figure5_section)
 
     def test_torch_fm_forward_shape(self) -> None:
         model = TorchFMRegressor(num_features=8, init_std=0.1)
