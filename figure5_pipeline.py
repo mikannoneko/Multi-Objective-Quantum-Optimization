@@ -57,7 +57,7 @@ from figure5_scalarization import (
     sample_preference_weights,
     validate_preference_weights,
 )
-from experiment_runtime import validate_seed_list
+from experiment_runtime import SA_SEED_ITERATION_STRIDE, validate_seed_list
 
 
 TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
@@ -899,7 +899,7 @@ def _fit_and_solve_iteration(
         qubo_result.bias,
         reads=config.sa_reads,
         sweeps=config.sa_sweeps,
-        seed=seed + (iteration * 9973),
+        seed=seed + (iteration * SA_SEED_ITERATION_STRIDE),
     )
 
     def is_feasible_candidate(state: np.ndarray) -> bool:
@@ -1119,7 +1119,7 @@ def run_figure5_experiment(
     """Internal runner/test orchestration that writes Figure 5 summary schema v3."""
 
     selected_settings = validate_settings(settings)
-    selected_seeds = validate_seed_list(seed_list)
+    selected_seeds = validate_seed_list(seed_list, iterations=config.iterations)
 
     output_layout = figure5_output_layout(output_dir)
     output_layout.root.mkdir(parents=True, exist_ok=True)

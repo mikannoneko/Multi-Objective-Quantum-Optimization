@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field, replace
+from numbers import Integral
 from typing import Any, Literal
 
 
@@ -47,14 +48,22 @@ OBJECTIVES: tuple[ObjectiveSpec, ...] = (
 )
 
 
-def _require_positive(name: str, value: int) -> None:
-    if int(value) <= 0:
+def _require_positive(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")
+    normalized = int(value)
+    if normalized <= 0:
         raise ValueError(f"{name} must be positive")
+    return normalized
 
 
-def _require_non_negative(name: str, value: int) -> None:
-    if int(value) < 0:
+def _require_non_negative(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")
+    normalized = int(value)
+    if normalized < 0:
         raise ValueError(f"{name} must be non-negative")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -64,8 +73,10 @@ class EncodingConfig:
     num_levels: int = 50
 
     def __post_init__(self) -> None:
-        if int(self.num_levels) <= 1:
+        num_levels = _require_positive("num_levels", self.num_levels)
+        if num_levels <= 1:
             raise ValueError("num_levels must be greater than 1")
+        object.__setattr__(self, "num_levels", num_levels)
 
 
 @dataclass(frozen=True)
@@ -76,7 +87,11 @@ class FMConfig:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
-        _require_non_negative("optuna_trials", self.optuna_trials)
+        object.__setattr__(
+            self,
+            "optuna_trials",
+            _require_non_negative("optuna_trials", self.optuna_trials),
+        )
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("device must be 'cpu' or 'cuda'")
 
@@ -89,8 +104,8 @@ class SAConfig:
     sweeps: int = 3000
 
     def __post_init__(self) -> None:
-        _require_positive("sa_reads", self.reads)
-        _require_positive("sa_sweeps", self.sweeps)
+        object.__setattr__(self, "reads", _require_positive("sa_reads", self.reads))
+        object.__setattr__(self, "sweeps", _require_positive("sa_sweeps", self.sweeps))
 
 
 @dataclass(frozen=True)
@@ -104,8 +119,8 @@ class ExperimentConfig:
     sa: SAConfig = field(default_factory=SAConfig)
 
     def __post_init__(self) -> None:
-        _require_positive("num_samples", self.num_samples)
-        _require_positive("iterations", self.iterations)
+        object.__setattr__(self, "num_samples", _require_positive("num_samples", self.num_samples))
+        object.__setattr__(self, "iterations", _require_positive("iterations", self.iterations))
 
     @property
     def num_levels(self) -> int:
@@ -172,19 +187,19 @@ def resolve_experiment_config(
     if num_samples is not None or iterations is not None:
         config = replace(
             config,
-            num_samples=config.num_samples if num_samples is None else int(num_samples),
-            iterations=config.iterations if iterations is None else int(iterations),
+            num_samples=config.num_samples if num_samples is None else num_samples,
+            iterations=config.iterations if iterations is None else iterations,
         )
     if num_levels is not None:
-        config = replace(config, encoding=EncodingConfig(num_levels=int(num_levels)))
+        config = replace(config, encoding=EncodingConfig(num_levels=num_levels))
     if optuna_trials is not None:
-        config = replace(config, fm=replace(config.fm, optuna_trials=int(optuna_trials)))
+        config = replace(config, fm=replace(config.fm, optuna_trials=optuna_trials))
     if sa_reads is not None or sa_sweeps is not None:
         config = replace(
             config,
             sa=SAConfig(
-                reads=config.sa.reads if sa_reads is None else int(sa_reads),
-                sweeps=config.sa.sweeps if sa_sweeps is None else int(sa_sweeps),
+                reads=config.sa.reads if sa_reads is None else sa_reads,
+                sweeps=config.sa.sweeps if sa_sweeps is None else sa_sweeps,
             ),
         )
     return config

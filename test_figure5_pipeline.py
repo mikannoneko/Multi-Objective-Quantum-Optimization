@@ -168,6 +168,76 @@ class Figure5PipelineTests(unittest.TestCase):
             [4, 5, 6],
         )
 
+    def test_config_integer_contract_and_seed_schedule_match_figure4(self) -> None:
+        config = Figure5ExperimentConfig(
+            num_samples=np.int64(5),
+            iterations=np.int64(2),
+            encoding=EncodingConfig(np.int64(4)),
+            fm=FMConfig(np.int64(0)),
+            sa=SAConfig(np.int64(3), np.int64(4)),
+        )
+        for value in (
+            config.num_samples,
+            config.iterations,
+            config.num_levels,
+            config.optuna_trials,
+            config.sa_reads,
+            config.sa_sweeps,
+        ):
+            self.assertIs(type(value), int)
+
+        for invalid in (True, 2.0, "2"):
+            with self.subTest(num_samples=invalid):
+                with self.assertRaisesRegex(ValueError, "integer"):
+                    Figure5ExperimentConfig(num_samples=invalid)  # type: ignore[arg-type]
+            with self.subTest(iterations=invalid):
+                with self.assertRaisesRegex(ValueError, "integer"):
+                    Figure5ExperimentConfig(iterations=invalid)  # type: ignore[arg-type]
+            with self.subTest(override=invalid):
+                with self.assertRaisesRegex(ValueError, "iterations"):
+                    resolve_experiment_config(
+                        preset="test",
+                        device="cpu",
+                        iterations=invalid,  # type: ignore[arg-type]
+                    )
+
+        from experiment_runtime import NEAL_SEED_MAX
+
+        manifest_mock = mock.Mock()
+        run_mock = mock.Mock()
+        with (
+            mock.patch("figure5_runner.configure_file_logging_path", return_value=Path("runner.log")),
+            mock.patch("figure5_runner.ensure_training_dependencies"),
+            mock.patch("figure5_runner.ensure_compute_device_available"),
+            mock.patch("figure5_runner._write_manifest", manifest_mock),
+            mock.patch("figure5_runner.run_figure5_experiment", run_mock),
+        ):
+            with self.assertRaisesRegex(ValueError, "derived SA seed"):
+                figure5_runner.main(
+                    [
+                        "--output-dir",
+                        "invalid_figure5_seed_schedule",
+                        "--settings",
+                        "w_ddts",
+                        "--iterations",
+                        "2",
+                        "--seed-start",
+                        str(NEAL_SEED_MAX),
+                    ]
+                )
+        manifest_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+        with mock.patch("figure5_pipeline.generate_initial_dataset_multi_objective_batch") as dataset_mock:
+            with self.assertRaisesRegex(ValueError, "derived SA seed"):
+                run_figure5_experiment(
+                    seed_list=[NEAL_SEED_MAX],
+                    config=config,
+                    output_dir=WORKSPACE_TMP_ROOT / "invalid_seed_schedule",
+                    settings=("w_ddts",),
+                )
+        dataset_mock.assert_not_called()
+
     def test_runner_is_the_only_supported_experiment_entrypoint(self) -> None:
         self.assertNotIn("run_figure5_experiment", pipeline.__all__)
         self.assertNotIn("run_single_trajectory", pipeline.__all__)

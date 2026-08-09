@@ -7,8 +7,11 @@ import math
 import random
 import statistics
 from dataclasses import dataclass
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
+
+from experiment_runtime import validate_seed_list
 
 
 AL_MATRIX_VOLUME_FRACTION = 0.8
@@ -18,6 +21,7 @@ DEFAULT_NUM_SAMPLES = 100
 DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES = 500
 DEFAULT_TOLERANCE = 1e-12
 MAX_HILL_ITERATIONS = 10_000
+COMPOSITION_SUM_TOLERANCE = 1e-10
 
 
 PHASE_ORDER = (
@@ -73,10 +77,44 @@ DELTA_T_N2 = 177.8
 EUTECTIC_SI_VOLUME_FRACTION = 0.128
 
 
+def _validate_integer(name: str, value: int, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")
+    normalized = int(value)
+    if normalized < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return normalized
+
+
+def _validated_fraction_vector(
+    fractions: Sequence[float],
+    *,
+    expected_total: float,
+    name: str,
+) -> Tuple[float, float, float, float]:
+    try:
+        raw_values = tuple(fractions)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain four finite real numbers") from exc
+    if len(raw_values) != 4:
+        raise ValueError(f"{name} must contain four values")
+    if any(isinstance(value, bool) or not isinstance(value, Real) for value in raw_values):
+        raise ValueError(f"{name} must contain finite real numbers")
+    values = tuple(float(value) for value in raw_values)
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError(f"{name} must contain finite real numbers")
+    if any(value < 0.0 for value in values):
+        raise ValueError(f"{name} must be non-negative")
+    total = sum(values)
+    if not math.isclose(total, expected_total, rel_tol=0.0, abs_tol=COMPOSITION_SUM_TOLERANCE):
+        raise ValueError(f"{name} must sum to {expected_total}, got {total}")
+    return values  # type: ignore[return-value]
+
+
 def _validate_seed(seed: int | None) -> int:
     if seed is None:
         raise ValueError("seed is required")
-    return int(seed)
+    return validate_seed_list([seed])[0]
 
 
 def sample_single_objective_design(rng: random.Random) -> Tuple[float, float, float, float]:
@@ -108,10 +146,20 @@ def sample_multi_objective_design(rng: random.Random) -> Tuple[float, float, flo
 
 
 def normalized_to_volume_fractions(normalized_fractions: Sequence[float]) -> Tuple[float, float, float, float]:
-    return tuple(SECONDARY_PHASE_TOTAL_VOLUME_FRACTION * fk for fk in normalized_fractions)  # type: ignore[return-value]
+    fractions = _validated_fraction_vector(
+        normalized_fractions,
+        expected_total=1.0,
+        name="normalized_fractions",
+    )
+    return tuple(SECONDARY_PHASE_TOTAL_VOLUME_FRACTION * fk for fk in fractions)  # type: ignore[return-value]
 
 
 def compute_kappa(volume_fractions: Sequence[float]) -> float:
+    volume_fractions = _validated_fraction_vector(
+        volume_fractions,
+        expected_total=SECONDARY_PHASE_TOTAL_VOLUME_FRACTION,
+        name="volume_fractions",
+    )
     phase_al = PHASE_PROPERTIES["al_matrix"]
     q_value = 0.0
     for phase_name, fk in zip(PHASE_ORDER, volume_fractions):
@@ -121,6 +169,11 @@ def compute_kappa(volume_fractions: Sequence[float]) -> float:
 
 
 def compute_youngs_modulus(volume_fractions: Sequence[float], tolerance: float = DEFAULT_TOLERANCE) -> float:
+    volume_fractions = _validated_fraction_vector(
+        volume_fractions,
+        expected_total=SECONDARY_PHASE_TOTAL_VOLUME_FRACTION,
+        name="volume_fractions",
+    )
     phase_al = PHASE_PROPERTIES["al_matrix"]
     e_reuss = 1.0 / (
         (AL_MATRIX_VOLUME_FRACTION / phase_al.youngs_modulus)
@@ -145,6 +198,11 @@ def compute_youngs_modulus(volume_fractions: Sequence[float], tolerance: float =
 
 
 def compute_density(volume_fractions: Sequence[float]) -> float:
+    volume_fractions = _validated_fraction_vector(
+        volume_fractions,
+        expected_total=SECONDARY_PHASE_TOTAL_VOLUME_FRACTION,
+        name="volume_fractions",
+    )
     phase_al = PHASE_PROPERTIES["al_matrix"]
     return (AL_MATRIX_VOLUME_FRACTION * phase_al.density) + sum(
         fk * PHASE_PROPERTIES[phase_name].density for phase_name, fk in zip(PHASE_ORDER, volume_fractions)
@@ -152,6 +210,11 @@ def compute_density(volume_fractions: Sequence[float]) -> float:
 
 
 def compute_alpha(volume_fractions: Sequence[float]) -> float:
+    volume_fractions = _validated_fraction_vector(
+        volume_fractions,
+        expected_total=SECONDARY_PHASE_TOTAL_VOLUME_FRACTION,
+        name="volume_fractions",
+    )
     phase_al = PHASE_PROPERTIES["al_matrix"]
     numerator = AL_MATRIX_VOLUME_FRACTION * phase_al.alpha * phase_al.bulk_modulus
     denominator = AL_MATRIX_VOLUME_FRACTION * phase_al.bulk_modulus
@@ -163,6 +226,15 @@ def compute_alpha(volume_fractions: Sequence[float]) -> float:
 
 
 def compute_delta_t(si_fraction_volume: float) -> float:
+    if isinstance(si_fraction_volume, bool) or not isinstance(si_fraction_volume, Real):
+        raise ValueError("si_fraction_volume must be a finite real number")
+    si_fraction_volume = float(si_fraction_volume)
+    if not math.isfinite(si_fraction_volume):
+        raise ValueError("si_fraction_volume must be a finite real number")
+    if not 0.0 <= si_fraction_volume <= SECONDARY_PHASE_TOTAL_VOLUME_FRACTION:
+        raise ValueError(
+            f"si_fraction_volume must be between 0 and {SECONDARY_PHASE_TOTAL_VOLUME_FRACTION}"
+        )
     if abs(si_fraction_volume - EUTECTIC_SI_VOLUME_FRACTION) <= DEFAULT_TOLERANCE:
         return 0.0
     if si_fraction_volume < EUTECTIC_SI_VOLUME_FRACTION:
@@ -171,6 +243,11 @@ def compute_delta_t(si_fraction_volume: float) -> float:
 
 
 def compute_properties(volume_fractions: Sequence[float]) -> Dict[str, float]:
+    volume_fractions = _validated_fraction_vector(
+        volume_fractions,
+        expected_total=SECONDARY_PHASE_TOTAL_VOLUME_FRACTION,
+        name="volume_fractions",
+    )
     alpha = compute_alpha(volume_fractions)
     return {
         "kappa": compute_kappa(volume_fractions),
@@ -187,13 +264,13 @@ def compute_properties_from_normalized_composition(normalized_fractions: Sequenc
 
 
 def build_dataset_row(sample_id: int, seed: int, normalized_fractions: Sequence[float]) -> Dict[str, float | int]:
-    if len(normalized_fractions) != 4:
-        raise ValueError("Expected four normalized fractions")
-    if any(fk < 0.0 for fk in normalized_fractions):
-        raise ValueError("Normalized fractions must be non-negative")
-    total = sum(normalized_fractions)
-    if abs(total - 1.0) > 1e-10:
-        raise ValueError(f"Normalized fractions must sum to 1, got {total}")
+    sample_id = _validate_integer("sample_id", sample_id)
+    seed = _validate_seed(seed)
+    normalized_fractions = _validated_fraction_vector(
+        normalized_fractions,
+        expected_total=1.0,
+        name="normalized_fractions",
+    )
 
     volume_fractions = normalized_to_volume_fractions(normalized_fractions)
     properties = compute_properties(volume_fractions)
@@ -267,8 +344,7 @@ def generate_initial_dataset_single_objective(
     output_path: str | Path | None = None,
 ) -> Tuple[List[Dict[str, float | int]], Dict[str, object]]:
     seed = _validate_seed(seed)
-    if num_samples <= 0:
-        raise ValueError("num_samples must be positive")
+    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
 
     rng = random.Random(seed)
     rows = [
@@ -289,8 +365,7 @@ def generate_initial_dataset_multi_objective(
     output_path: str | Path | None = None,
 ) -> Tuple[List[Dict[str, float | int]], Dict[str, object]]:
     seed = _validate_seed(seed)
-    if num_samples <= 0:
-        raise ValueError("num_samples must be positive")
+    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
 
     rng = random.Random(seed)
     rows = [
@@ -309,9 +384,11 @@ def generate_initial_dataset_batch(
     seed_list: Sequence[int],
     num_samples: int = DEFAULT_NUM_SAMPLES,
 ) -> Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]]:
+    normalized_seeds = validate_seed_list(seed_list)
+    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
     datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
-    for seed in seed_list:
-        datasets[int(seed)] = generate_initial_dataset_single_objective(num_samples=num_samples, seed=int(seed))
+    for seed in normalized_seeds:
+        datasets[seed] = generate_initial_dataset_single_objective(num_samples=num_samples, seed=seed)
     return datasets
 
 
@@ -319,9 +396,11 @@ def generate_initial_dataset_multi_objective_batch(
     seed_list: Sequence[int],
     num_samples: int = DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES,
 ) -> Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]]:
+    normalized_seeds = validate_seed_list(seed_list)
+    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
     datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
-    for seed in seed_list:
-        datasets[int(seed)] = generate_initial_dataset_multi_objective(num_samples=num_samples, seed=int(seed))
+    for seed in normalized_seeds:
+        datasets[seed] = generate_initial_dataset_multi_objective(num_samples=num_samples, seed=seed)
     return datasets
 
 

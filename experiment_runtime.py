@@ -24,6 +24,15 @@ PACKAGE_DISTRIBUTIONS = (
     "dwave-neal",
 )
 
+NEAL_SEED_MAX = (2**31) - 1
+SA_SEED_ITERATION_STRIDE = 9_973
+
+
+def _require_integer(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")
+    return int(value)
+
 
 def ensure_compute_device_available(device: str) -> None:
     """Fail before an experiment starts when its requested device is unavailable."""
@@ -37,17 +46,29 @@ def ensure_compute_device_available(device: str) -> None:
 def resolve_contiguous_seeds(default_count: int, requested_count: int | None, seed_start: int) -> list[int]:
     """Build a validated non-negative contiguous seed list."""
 
-    count = int(default_count if requested_count is None else requested_count)
-    start = int(seed_start)
+    count = _require_integer(
+        "num_seeds",
+        default_count if requested_count is None else requested_count,
+    )
+    start = _require_integer("seed_start", seed_start)
     if count <= 0:
         raise ValueError("num_seeds must be positive")
     if start < 0:
         raise ValueError("seed_start must be non-negative")
+    final_seed = start + count - 1
+    if final_seed > NEAL_SEED_MAX:
+        raise ValueError(
+            f"contiguous seed range ends at {final_seed}, above the neal maximum {NEAL_SEED_MAX}"
+        )
     return validate_seed_list(range(start, start + count))
 
 
-def validate_seed_list(seed_list: Sequence[int]) -> list[int]:
-    """Normalize a non-empty seed list and reject negative or duplicate seeds."""
+def validate_seed_list(
+    seed_list: Sequence[int],
+    *,
+    iterations: int | None = None,
+) -> list[int]:
+    """Normalize seeds and validate the complete per-iteration SA seed schedule."""
 
     if len(seed_list) == 0:
         raise ValueError("seed_list must not be empty")
@@ -56,8 +77,23 @@ def validate_seed_list(seed_list: Sequence[int]) -> list[int]:
     normalized = [int(seed) for seed in seed_list]
     if any(seed < 0 for seed in normalized):
         raise ValueError("seeds must be non-negative")
+    if any(seed > NEAL_SEED_MAX for seed in normalized):
+        raise ValueError(f"seeds must not exceed the neal maximum {NEAL_SEED_MAX}")
     if len(set(normalized)) != len(normalized):
         raise ValueError("seed_list must not contain duplicates")
+    if iterations is not None:
+        normalized_iterations = _require_integer("iterations", iterations)
+        if normalized_iterations <= 0:
+            raise ValueError("iterations must be positive")
+        maximum_derived_seed = max(normalized) + (
+            (normalized_iterations - 1) * SA_SEED_ITERATION_STRIDE
+        )
+        if maximum_derived_seed > NEAL_SEED_MAX:
+            raise ValueError(
+                "derived SA seed exceeds the neal maximum: "
+                f"max_seed + (iterations - 1) * {SA_SEED_ITERATION_STRIDE} "
+                f"= {maximum_derived_seed} > {NEAL_SEED_MAX}"
+            )
     return normalized
 
 
@@ -130,6 +166,8 @@ def collect_runtime_metadata(
 
 
 __all__ = [
+    "NEAL_SEED_MAX",
+    "SA_SEED_ITERATION_STRIDE",
     "collect_runtime_metadata",
     "ensure_compute_device_available",
     "resolve_contiguous_seeds",

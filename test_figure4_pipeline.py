@@ -147,6 +147,105 @@ class Figure4PipelineTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_seed_list(invalid_seeds)
 
+    def test_config_integer_contract_rejects_coercion_and_normalizes_numpy_values(self) -> None:
+        config = ExperimentConfig(
+            num_samples=np.int64(5),
+            iterations=np.int64(2),
+            encoding=EncodingConfig(np.int64(4)),
+            fm=FMConfig(np.int64(0)),
+            sa=SAConfig(np.int64(3), np.int64(4)),
+        )
+        for value in (
+            config.num_samples,
+            config.iterations,
+            config.num_levels,
+            config.optuna_trials,
+            config.sa_reads,
+            config.sa_sweeps,
+        ):
+            self.assertIs(type(value), int)
+
+        constructors = (
+            lambda value: ExperimentConfig(num_samples=value),
+            lambda value: ExperimentConfig(iterations=value),
+            lambda value: EncodingConfig(num_levels=value),
+            lambda value: FMConfig(optuna_trials=value),
+            lambda value: SAConfig(reads=value, sweeps=1),
+            lambda value: SAConfig(reads=1, sweeps=value),
+        )
+        for invalid in (True, 2.0, "2"):
+            for constructor in constructors:
+                with self.subTest(value=invalid, constructor=constructor):
+                    with self.assertRaisesRegex(ValueError, "integer"):
+                        constructor(invalid)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(ValueError, "iterations"):
+            resolve_experiment_config(preset="test", device="cpu", iterations=1.5)  # type: ignore[arg-type]
+
+    def test_seed_schedule_is_validated_before_runner_or_pipeline_work(self) -> None:
+        from experiment_runtime import (
+            NEAL_SEED_MAX,
+            SA_SEED_ITERATION_STRIDE,
+            resolve_contiguous_seeds,
+            validate_seed_list,
+        )
+
+        last_valid_start = NEAL_SEED_MAX - SA_SEED_ITERATION_STRIDE
+        self.assertEqual(validate_seed_list([last_valid_start], iterations=2), [last_valid_start])
+        with self.assertRaisesRegex(ValueError, "derived SA seed"):
+            validate_seed_list([last_valid_start + 1], iterations=2)
+        with self.assertRaisesRegex(ValueError, "neal maximum"):
+            validate_seed_list([NEAL_SEED_MAX + 1])
+        with self.assertRaisesRegex(ValueError, "contiguous seed range"):
+            resolve_contiguous_seeds(2, None, NEAL_SEED_MAX)
+        for invalid in (True, 1.0, "1"):
+            with self.subTest(value=invalid):
+                with self.assertRaisesRegex(ValueError, "integer"):
+                    resolve_contiguous_seeds(1, invalid, 0)  # type: ignore[arg-type]
+
+        manifest_mock = mock.Mock()
+        run_mock = mock.Mock()
+        with (
+            mock.patch("figure4_runner.configure_file_logging_path", return_value=Path("runner.log")),
+            mock.patch("figure4_runner.ensure_training_dependencies"),
+            mock.patch("figure4_runner.ensure_compute_device_available"),
+            mock.patch("figure4_runner._write_manifest", manifest_mock),
+            mock.patch("figure4_runner.run_figure4_experiment", run_mock),
+        ):
+            with self.assertRaisesRegex(ValueError, "derived SA seed"):
+                figure4_runner.main(
+                    [
+                        "--output-dir",
+                        "invalid_seed_schedule",
+                        "--settings",
+                        "wo_cgfm",
+                        "--iterations",
+                        "2",
+                        "--num-seeds",
+                        "1",
+                        "--seed-start",
+                        str(NEAL_SEED_MAX),
+                    ]
+                )
+        manifest_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+        config = ExperimentConfig(
+            num_samples=1,
+            iterations=2,
+            encoding=EncodingConfig(2),
+            fm=FMConfig(0),
+            sa=SAConfig(1, 1),
+        )
+        with mock.patch("figure4_pipeline.generate_initial_dataset_batch") as dataset_mock:
+            with self.assertRaisesRegex(ValueError, "derived SA seed"):
+                run_figure4_experiment(
+                    seed_list=[NEAL_SEED_MAX],
+                    config=config,
+                    output_dir=WORKSPACE_TMP_ROOT / "invalid_seed_schedule",
+                )
+        dataset_mock.assert_not_called()
+
     def test_sa_batch_is_energy_sorted_and_feasible_selection_is_auditable(self) -> None:
         q = np.asarray([[-1.0]], dtype=np.float64)
         sampling = solve_qubo_with_sa(q, 0.0, reads=5, sweeps=10, seed=3)
@@ -168,6 +267,68 @@ class Figure4PipelineTests(unittest.TestCase):
             select_lowest_energy_feasible_sample(controlled, lambda _: False)
         with self.assertRaisesRegex(ValueError, "reads"):
             solve_qubo_with_sa(q, 0.0, reads=0, sweeps=1, seed=0)
+        for parameter, kwargs in (
+            ("reads", {"reads": 1.5, "sweeps": 1, "seed": 0}),
+            ("sweeps", {"reads": 1, "sweeps": "1", "seed": 0}),
+            ("seed", {"reads": 1, "sweeps": 1, "seed": True}),
+        ):
+            with self.subTest(parameter=parameter):
+                with self.assertRaisesRegex(ValueError, parameter):
+                    solve_qubo_with_sa(q, 0.0, **kwargs)  # type: ignore[arg-type]
+
+        from experiment_runtime import NEAL_SEED_MAX
+
+        with self.assertRaisesRegex(ValueError, "seed"):
+            solve_qubo_with_sa(q, 0.0, reads=1, sweeps=1, seed=NEAL_SEED_MAX + 1)
+
+    def test_fm_seed_and_integer_boundaries_fail_before_training(self) -> None:
+        x = np.zeros((2, 2), dtype=np.float32)
+        y = np.zeros(2, dtype=np.float32)
+        split = figure4_fm_torch.split_train_validation_test(
+            x,
+            y,
+            seed=figure4_fm_torch.NUMPY_SEED_MAX - 1,
+        )
+        self.assertEqual(len(split.train_y), 2)
+
+        with self.assertRaisesRegex(ValueError, "seed"):
+            figure4_fm_torch.split_train_validation_test(
+                x,
+                y,
+                seed=figure4_fm_torch.NUMPY_SEED_MAX,
+            )
+        with self.assertRaisesRegex(ValueError, "seed"):
+            figure4_fm_torch.tune_fm_hparams(
+                split,
+                optuna_trials=2,
+                device="cpu",
+                seed=figure4_fm_torch.NUMPY_SEED_MAX,
+            )
+        with self.assertRaisesRegex(ValueError, "seed"):
+            figure4_fm_torch.fit_torch_fm(
+                x,
+                y,
+                optuna_trials=0,
+                device="cpu",
+                seed=figure4_fm_torch.NUMPY_SEED_MAX,
+            )
+        for invalid_trials in (True, 1.0, "1"):
+            with self.subTest(optuna_trials=invalid_trials):
+                with self.assertRaisesRegex(ValueError, "optuna_trials"):
+                    figure4_fm_torch.tune_fm_hparams(
+                        split,
+                        optuna_trials=invalid_trials,  # type: ignore[arg-type]
+                        device="cpu",
+                        seed=0,
+                    )
+
+        for invalid in (True, 2.0, "2"):
+            with self.subTest(num_levels=invalid):
+                with self.assertRaisesRegex(ValueError, "num_levels"):
+                    create_iteration_encoding(invalid)  # type: ignore[arg-type]
+            with self.subTest(num_blocks=invalid):
+                with self.assertRaisesRegex(ValueError, "num_blocks"):
+                    create_iteration_encoding(2, num_blocks=invalid)  # type: ignore[arg-type]
 
     def test_checkpoint_manager_rules(self) -> None:
         config = ExperimentConfig(

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import dimod
 import numpy as np
 from neal import SimulatedAnnealingSampler
+
+from experiment_runtime import NEAL_SEED_MAX
 
 
 SYSTEM_PENALTY_WEIGHT = 650.0
@@ -87,6 +90,9 @@ class FeasibleSASolution:
 
 
 def get_positive_level_values(num_levels: int) -> np.ndarray:
+    if isinstance(num_levels, bool) or not isinstance(num_levels, Integral):
+        raise ValueError("num_levels must be an integer")
+    num_levels = int(num_levels)
     if num_levels <= 1:
         raise ValueError("num_levels must be greater than 1")
     return np.arange(1, num_levels + 1, dtype=np.int64)
@@ -98,10 +104,14 @@ def _create_fixed_one_hot_encoding(
     value_scale: float,
     phase_permutation: Optional[np.ndarray],
 ) -> IterationEncoding:
+    if isinstance(num_blocks, bool) or not isinstance(num_blocks, Integral):
+        raise ValueError("num_blocks must be an integer")
+    num_blocks = int(num_blocks)
     if num_blocks <= 0:
         raise ValueError("num_blocks must be positive")
 
     counts = get_positive_level_values(num_levels)
+    num_levels = int(num_levels)
     bit_indices = np.arange(-1, num_levels, dtype=np.int64)
     return IterationEncoding(
         num_levels=num_levels,
@@ -126,6 +136,11 @@ def create_iteration_encoding(num_levels: int, num_blocks: int = 4) -> Iteration
 def create_cgfm_iteration_encoding(num_levels: int, seed: int) -> IterationEncoding:
     """创建 CGFM 编码；seed 只随机化 S7/S8 中的相变量分配。"""
 
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise ValueError("seed must be an integer")
+    seed = int(seed)
+    if not 0 <= seed <= NEAL_SEED_MAX:
+        raise ValueError(f"seed must be between 0 and {NEAL_SEED_MAX}")
     rng = np.random.default_rng(seed)
     phase_permutation = rng.permutation(4)
     return _create_fixed_one_hot_encoding(
@@ -155,6 +170,8 @@ def _discrete_error(count: int, target: float, num_levels: int) -> float:
 
 
 def cure_discrete_counts(composition: Sequence[float], num_levels: int) -> np.ndarray:
+    get_positive_level_values(num_levels)
+    num_levels = int(num_levels)
     composition_array = np.asarray(composition, dtype=np.float64)
     counts = _quantize_composition_to_counts(composition_array, num_levels)
     deficit = int(num_levels - int(np.sum(counts)))
@@ -197,6 +214,8 @@ def cure_discrete_counts(composition: Sequence[float], num_levels: int) -> np.nd
 
 
 def counts_to_composition(counts: Sequence[int], num_levels: int) -> np.ndarray:
+    get_positive_level_values(num_levels)
+    num_levels = int(num_levels)
     return np.asarray(counts, dtype=np.float64) / float(num_levels)
 
 
@@ -496,13 +515,24 @@ def solve_qubo_with_sa(
     feasible state without replacing an optimization result with random data.
     """
 
-    if int(reads) <= 0:
+    if isinstance(reads, bool) or not isinstance(reads, Integral):
+        raise ValueError("reads must be an integer")
+    if isinstance(sweeps, bool) or not isinstance(sweeps, Integral):
+        raise ValueError("sweeps must be an integer")
+    if isinstance(seed, bool) or not isinstance(seed, Integral):
+        raise ValueError("seed must be an integer")
+    reads = int(reads)
+    sweeps = int(sweeps)
+    seed = int(seed)
+    if reads <= 0:
         raise ValueError("reads must be positive")
-    if int(sweeps) <= 0:
+    if sweeps <= 0:
         raise ValueError("sweeps must be positive")
+    if not 0 <= seed <= NEAL_SEED_MAX:
+        raise ValueError(f"seed must be between 0 and {NEAL_SEED_MAX}")
     bqm = _qubo_to_bqm(q, bias)
     sampler = SimulatedAnnealingSampler()
-    sample_set = sampler.sample(bqm, num_reads=int(reads), num_sweeps=int(sweeps), seed=seed)
+    sample_set = sampler.sample(bqm, num_reads=reads, num_sweeps=sweeps, seed=seed)
     variables = [int(variable) for variable in sample_set.variables]
     order = np.argsort(sample_set.record.energy, kind="stable")
     samples = []

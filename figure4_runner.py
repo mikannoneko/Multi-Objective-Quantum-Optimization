@@ -29,7 +29,12 @@ from figure4_outputs import (
 )
 from figure4_pipeline import ensure_training_dependencies, run_figure4_experiment
 from figure4_setting_strategies import SUPPORTED_SETTINGS, validate_settings
-from experiment_runtime import collect_runtime_metadata, ensure_compute_device_available, resolve_contiguous_seeds
+from experiment_runtime import (
+    collect_runtime_metadata,
+    ensure_compute_device_available,
+    resolve_contiguous_seeds,
+    validate_seed_list,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -152,7 +157,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         sa_sweeps=args.sa_sweeps,
     )
     ensure_compute_device_available(config.device)
-    seed_list = resolve_contiguous_seeds(PRESET_NUM_SEEDS[args.preset], args.num_seeds, args.seed_start)
+    seed_list = validate_seed_list(
+        resolve_contiguous_seeds(PRESET_NUM_SEEDS[args.preset], args.num_seeds, args.seed_start),
+        iterations=config.iterations,
+    )
     LOGGER.info("Resolved config: %s", json.dumps(config.to_dict(), sort_keys=True))
     LOGGER.info(
         "Run selection: preset=%s seeds=%s objectives=%s settings=%s resume=%s",

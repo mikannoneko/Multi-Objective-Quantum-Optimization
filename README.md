@@ -49,7 +49,9 @@ Figure 4 和 Figure 5 共用 `figure4_qubo_math.py` 中的退火求解逻辑：
 
 summary 会记录 `infeasible_sa_samples_skipped`、`max_feasible_candidate_rank`、`duplicate_replacements`、`random_replacements` 和 `random_replacement_draws`。旧版 `invalid_replacement` 路径已移除。
 
-命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device 检查、seed 列表校验和 manifest 运行环境元数据。
+命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device 检查、seed 列表校验和 manifest 运行环境元数据。所有整数配置接受 Python/NumPy 整数并规范化为 Python `int`，但不把 `bool`、浮点数或字符串静默转换成整数。
+
+项目 seed 必须位于 `0 <= seed <= 2**31 - 1`。第 `iteration` 轮 SA 使用 `seed + iteration * 9973`，因此 runner 会在 manifest、数据生成和训练前验证 `max(seed) + (iterations - 1) * 9973 <= 2**31 - 1`；越界时直接失败，不取模或重映射。
 
 按照论文补充材料 S1.1，FM-to-QUBO 会丢弃不影响最优 bit 状态的整体偏置 `w0`。各 QUBO 项按实际二元多项式系数计算归一化尺度：线性项使用 `q[i,i]`，二次项使用 `q[i,j] + q[j,i]`；因此对称半系数矩阵和上三角全系数矩阵得到相同尺度，常数项及矩阵存储形式都不得改变 FM 目标与约束惩罚的相对强度。
 
@@ -139,7 +141,7 @@ runner 是唯一受支持的运行入口；active-learning 逻辑只放在 pipel
 
 1. Figure 4 实验只支持通过 `figure4_runner.py` 启动；pipeline 中的实验和单 trajectory 函数只供 runner 与白盒测试使用，不提供程序化 API 或跨版本兼容承诺。
 2. runner 统一执行依赖/device 检查、配置解析、manifest 写入以及 objective/setting/seed 公共契约；pipeline 不重复校验 objective 列表。
-3. setting 和 seed 列表必须非空、无重复；seed 必须是非负整数。objective 子集由 runner 去重并按 canonical `OBJECTIVES` 顺序执行，而不是按 CLI 输入顺序执行。
+3. setting 和 seed 列表必须非空、无重复；seed 必须满足共同的整数、范围和逐轮派生规则。objective 子集由 runner 去重并按 canonical `OBJECTIVES` 顺序执行，而不是按 CLI 输入顺序执行。
 4. 用户通过必填的 `--output-dir` 明确选择输出位置；内部路径统一由 `figure4_output_layout(...)` / `Figure4OutputLayout` 派生。同一输出目录不得混用不同 config、setting、objective 或 seed 身份后继续 `--resume`。
 5. 恢复时先由 outputs 校验 checkpoint 外层 schema、字段类型和 trajectory 身份，再由 pipeline 校验 `TrajectoryState` 的 rows、best 曲线、计数、SA 审计和 QUBO 元数据；任何不一致都在完成跳过或随机数回放前失败。
 
@@ -163,10 +165,10 @@ ExperimentConfig
 | `paper` | 100 | 600 | 50 | 20 | 1000 | 3000 | 20 | 参数参考，不验收 |
 
 - 配置先由 `preset_config` 解析，再由 `resolve_experiment_config` 应用 CLI 显式覆盖；未覆盖字段保留 preset 值。
-- `num_samples`、`iterations`、SA reads/sweeps 必须为正数；`num_levels > 1`；`optuna_trials >= 0`；device 只允许 `cpu` 或 `cuda`。
+- `num_samples`、`iterations`、SA reads/sweeps 必须为严格正整数；`num_levels` 必须是大于 1 的整数；`optuna_trials` 必须是非负整数；device 只允许 `cpu` 或 `cuda`。
 - CLI 可覆盖 `--num-samples`、`--iterations`、`--num-levels`、`--optuna-trials`、`--sa-reads`、`--sa-sweeps`。
 - `--settings` 必填；`--objectives` 省略或传空时运行全部五个目标。
-- `--seed-start` 必须非负，`--num-seeds` 必须为正；默认 seed 为从 0 开始的连续列表。
+- `--seed-start` 必须非负，`--num-seeds` 必须为正；默认 seed 为从 0 开始的连续列表，列表末端和最后一轮派生 SA seed 都不得超过 `2**31 - 1`。
 - 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
 - canonical `quick` 验收要求表中精确配置、3 个默认 seed、全部 setting 和 objective；任何数值或 seed 覆盖都可运行，但不属于 canonical 验收结果。
 
@@ -347,7 +349,7 @@ Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用
 3. pipeline 的 `w_ddts` 路径调用 `compute_ddts_targets(...)`；`wo_ddts` 路径必须调用 `compute_individual_objective_targets(...)` 后训练三个 FM，并在 QUBO 层合并。
 4. `compute_weighted_sum_reference_targets(...)` 只用于 weighted-sum 数学对照，不表示生产 pipeline 的训练调用路径；不存在按 setting 分发单 FM target 的公共函数。
 5. `decision_status` 只允许 `accepted` 或 `duplicate_replacement`；Pareto front 只读取 `proposed_solution`，不得把 random replacement 当成优化器提出的点。
-6. setting 和 seed 列表必须非空、无重复；seed 必须为非负整数。同一 seed/iteration 的权重由函数确定，不允许调用方为两个 setting 分别随机采样。
+6. setting 和 seed 列表必须非空、无重复，并满足共同的整数、范围和逐轮派生规则。同一 seed/iteration 的权重由函数确定，不允许调用方为两个 setting 分别随机采样。
 7. 路径必须通过 `figure5_output_layout(...)` / `Figure5OutputLayout` 获取；多 seed summary 绘图必须用 `--seed` 明确选择一条 seed，stored front 不跨 seed 混合。
 
 ### Figure 5 配置规则
@@ -370,7 +372,7 @@ Figure5ExperimentConfig
 | `paper` | 500 | 1000 | 25 | 20 | 1000 | 3000 | 1 | 参数参考，不验收 |
 
 - 配置先由 Figure 5 的 `preset_config` 解析，再由 `resolve_experiment_config` 应用显式覆盖；Figure 4 和 Figure 5 的 preset 名相同，但数值彼此独立。
-- 数值、device、seed 和 SA 参数遵循与 Figure 4 相同的合法性规则；CLI 首选 `--sa-reads`。
+- 数值、device、seed 和 SA 参数遵循与 Figure 4 相同的严格类型及派生范围规则；CLI 首选 `--sa-reads`。
 - `--settings` 必填；objectives 固定为 `kappa E rho`，Figure 5 CLI 不接受 objective 子集。
 - Figure 5 使用四相直接 one-hot 编码和 system penalty，不接受 CGFM setting。
 - 默认运行 seed 0；显式传入 `--num-seeds N` 时每个 setting 都运行 N 条 trajectory。

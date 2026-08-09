@@ -1,16 +1,23 @@
 import csv
+import math
 import random
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 from alloy_dataset_generator import (
     AL_MATRIX_VOLUME_FRACTION,
     CSV_FIELDNAMES,
     DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES,
+    build_dataset_row,
+    compute_delta_t,
     compute_dataset_statistics,
     compute_density,
     compute_properties,
+    generate_initial_dataset_batch,
     generate_initial_dataset_multi_objective,
+    generate_initial_dataset_multi_objective_batch,
     generate_initial_dataset_single_objective,
     normalized_to_volume_fractions,
     sample_multi_objective_design,
@@ -132,6 +139,68 @@ class AlloyDatasetGeneratorTests(unittest.TestCase):
         self.assertEqual(stats["num_samples"], 20)
         self.assertIn("fraction_ranges", stats)
         self.assertIn("metric_statistics", stats)
+
+    def test_integer_inputs_are_strict_and_numpy_integers_are_normalized(self) -> None:
+        rows, _ = generate_initial_dataset_single_objective(
+            num_samples=np.int64(2),
+            seed=np.int64(3),
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertIs(type(rows[0]["sample_id"]), int)
+        self.assertIs(type(rows[0]["seed"]), int)
+
+        for invalid in (True, 2.0, "2"):
+            with self.subTest(parameter="num_samples", value=invalid):
+                with self.assertRaisesRegex(ValueError, "num_samples"):
+                    generate_initial_dataset_single_objective(num_samples=invalid, seed=0)  # type: ignore[arg-type]
+            with self.subTest(parameter="seed", value=invalid):
+                with self.assertRaises(ValueError):
+                    generate_initial_dataset_single_objective(num_samples=1, seed=invalid)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(ValueError, "sample_id"):
+            build_dataset_row(1.0, 0, [1.0, 0.0, 0.0, 0.0])  # type: ignore[arg-type]
+
+    def test_dataset_batches_reject_empty_duplicate_and_invalid_seeds(self) -> None:
+        for generator in (generate_initial_dataset_batch, generate_initial_dataset_multi_objective_batch):
+            with self.subTest(generator=generator.__name__, case="empty"):
+                with self.assertRaisesRegex(ValueError, "empty"):
+                    generator([], num_samples=1)
+            with self.subTest(generator=generator.__name__, case="duplicates"):
+                with self.assertRaisesRegex(ValueError, "duplicates"):
+                    generator([1, 1], num_samples=1)
+            with self.subTest(generator=generator.__name__, case="type"):
+                with self.assertRaisesRegex(ValueError, "integers"):
+                    generator([1.0], num_samples=1)  # type: ignore[list-item]
+
+    def test_material_inputs_require_valid_four_fraction_compositions(self) -> None:
+        invalid_normalized = (
+            [0.5, 0.5, 0.0],
+            [math.nan, 0.2, 0.3, 0.5],
+            [math.inf, 0.0, 0.0, 0.0],
+            [-0.1, 0.2, 0.3, 0.6],
+            [0.1, 0.2, 0.3, 0.3],
+            [True, 0.0, 0.0, 0.0],
+        )
+        for composition in invalid_normalized:
+            with self.subTest(composition=composition):
+                with self.assertRaises(ValueError):
+                    normalized_to_volume_fractions(composition)
+
+        invalid_volume = (
+            [0.05, 0.05, 0.05],
+            [math.nan, 0.05, 0.05, 0.1],
+            [-0.01, 0.05, 0.06, 0.1],
+            [0.01, 0.02, 0.03, 0.04],
+        )
+        for composition in invalid_volume:
+            with self.subTest(volume=composition):
+                with self.assertRaises(ValueError):
+                    compute_properties(composition)
+
+        for invalid_si in (True, "0.1", math.nan, math.inf, -0.01, 0.21):
+            with self.subTest(si_fraction=invalid_si):
+                with self.assertRaisesRegex(ValueError, "si_fraction_volume"):
+                    compute_delta_t(invalid_si)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

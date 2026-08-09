@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from numbers import Integral
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -16,9 +17,28 @@ import optuna
 FM_FACTORIZATION_RANK = 6
 FM_MAX_STEPS = 2000
 FM_LBFGS_LR = 1.0
+FM_FINAL_FIT_SEED_OFFSET = 20_000
+NUMPY_SEED_MAX = (2**32) - 1
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.1
 TEST_RATIO = 0.1
+
+
+def _require_integer(
+    name: str,
+    value: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")
+    normalized = int(value)
+    if normalized < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and normalized > maximum:
+        raise ValueError(f"{name} must not exceed {maximum}")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -51,11 +71,11 @@ class TorchFMRegressor(nn.Module):
 
     def __init__(self, num_features: int, init_std: float) -> None:
         super().__init__()
-        self.num_features = num_features
+        self.num_features = _require_integer("num_features", num_features, minimum=1)
         self.rank = FM_FACTORIZATION_RANK
         self.w0 = nn.Parameter(torch.zeros(1))
-        self.w = nn.Parameter(torch.zeros(num_features))
-        self.V = nn.Parameter(torch.empty(num_features, self.rank))
+        self.w = nn.Parameter(torch.zeros(self.num_features))
+        self.V = nn.Parameter(torch.empty(self.num_features, self.rank))
         nn.init.normal_(self.V, mean=0.0, std=init_std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,6 +88,7 @@ class TorchFMRegressor(nn.Module):
 
 
 def set_global_seed(seed: int) -> None:
+    seed = _require_integer("seed", seed, maximum=NUMPY_SEED_MAX)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -77,6 +98,7 @@ def set_global_seed(seed: int) -> None:
 def split_train_validation_test(x: np.ndarray, y: np.ndarray, seed: int) -> FMSplitData:
     """按论文复现流程拆分当前 active-learning 数据集。"""
 
+    seed = _require_integer("seed", seed, maximum=NUMPY_SEED_MAX - 1)
     if len(x) != len(y):
         raise ValueError("x and y must have equal length")
     if len(x) < 5:
@@ -188,6 +210,13 @@ def tune_fm_hparams(
 ) -> FMHyperParams:
     """只选择并返回 FM 超参数；最终模型由调用方训练一次。"""
 
+    optuna_trials = _require_integer("optuna_trials", optuna_trials)
+    maximum_trial_offset = max(0, optuna_trials - 1)
+    seed = _require_integer(
+        "seed",
+        seed,
+        maximum=NUMPY_SEED_MAX - maximum_trial_offset,
+    )
     default_hparams = FMHyperParams(
         init_std=0.05,
         l2_reg_w=1e-4,
@@ -226,9 +255,21 @@ def fit_torch_fm(
 ) -> Tuple[TorchFMRegressor, Dict[str, Any]]:
     """训练当前迭代的 FM，并返回可写入 checkpoint/summary 的训练 metadata。"""
 
+    optuna_trials = _require_integer("optuna_trials", optuna_trials)
+    maximum_seed_offset = max(1, FM_FINAL_FIT_SEED_OFFSET, max(0, optuna_trials - 1))
+    seed = _require_integer(
+        "seed",
+        seed,
+        maximum=NUMPY_SEED_MAX - maximum_seed_offset,
+    )
     split_data = split_train_validation_test(x, y, seed)
     best_hparams = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
-    model, final_metrics = _fit_model_once(split_data, best_hparams, device, seed + 20_000)
+    model, final_metrics = _fit_model_once(
+        split_data,
+        best_hparams,
+        device,
+        seed + FM_FINAL_FIT_SEED_OFFSET,
+    )
     metadata: Dict[str, Any] = {
         "tuner": "optuna" if optuna_trials > 0 else "fixed",
         "rank": FM_FACTORIZATION_RANK,

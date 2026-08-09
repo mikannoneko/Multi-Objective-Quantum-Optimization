@@ -26,7 +26,12 @@ from figure5_pipeline import (
     validate_settings,
 )
 from figure5_scalarization import FIGURE5_OBJECTIVES
-from experiment_runtime import collect_runtime_metadata, ensure_compute_device_available, resolve_contiguous_seeds
+from experiment_runtime import (
+    collect_runtime_metadata,
+    ensure_compute_device_available,
+    resolve_contiguous_seeds,
+    validate_seed_list,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -137,7 +142,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         sa_sweeps=args.sa_sweeps,
     )
     ensure_compute_device_available(config.device)
-    seed_list = resolve_seed_list(args.preset, args.num_seeds, args.seed_start)
+    seed_list = validate_seed_list(
+        resolve_seed_list(args.preset, args.num_seeds, args.seed_start),
+        iterations=config.iterations,
+    )
     LOGGER.info(
         "Resolved Figure 5 config=%s seeds=%s settings=%s resume=%s",
         json.dumps(config.to_dict(), sort_keys=True),

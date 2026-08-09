@@ -50,7 +50,7 @@ from figure4_setting_strategies import (
     get_setting_strategy,
     validate_settings,
 )
-from experiment_runtime import validate_seed_list
+from experiment_runtime import SA_SEED_ITERATION_STRIDE, validate_seed_list
 
 
 TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
@@ -520,7 +520,7 @@ def _fit_and_solve_iteration(
         qubo_result.bias,
         reads=config.sa_reads,
         sweeps=config.sa_sweeps,
-        seed=seed + (iteration * 9973),
+        seed=seed + (iteration * SA_SEED_ITERATION_STRIDE),
     )
 
     def is_feasible(candidate_bits: np.ndarray) -> bool:
@@ -790,7 +790,7 @@ def run_figure4_experiment(
     """供 Figure 4 runner 和白盒测试使用的内部实验编排函数。"""
 
     selected_settings = validate_settings(settings)
-    selected_seeds = validate_seed_list(seed_list)
+    selected_seeds = validate_seed_list(seed_list, iterations=config.iterations)
 
     output_layout = figure4_output_layout(output_dir)
     output_layout.root.mkdir(parents=True, exist_ok=True)
