@@ -13,37 +13,40 @@ from pathlib import Path
 from typing import Sequence
 
 from figure5_experiment_config import (
+    FIGURE5_PRESET_NUM_SEEDS,
     SUPPORTED_PRESETS,
     Figure5ExperimentConfig,
-    Figure5RunScale,
     resolve_experiment_config,
 )
-from figure5_outputs import Figure5OutputLayout, configure_file_logging_path, figure5_output_layout, write_json_atomic
+from fm_torch import fm_seed_block_size
+from figure5_outputs import Figure5OutputLayout, MANIFEST_SCHEMA_VERSION, figure5_output_layout
 from figure5_pipeline import (
-    SUPPORTED_SETTINGS,
-    ensure_training_dependencies,
     run_figure5_experiment,
+)
+from figure5_scalarization import (
+    FIGURE5_OBJECTIVES,
+    FIGURE5_SETTINGS,
     validate_settings,
 )
-from figure5_scalarization import FIGURE5_OBJECTIVES
 from experiment_runtime import (
+    FIGURE5_SEED_INDEX,
+    SEED_DERIVATION_SCHEME,
+    TRAINING_REQUIRED_MODULES,
     collect_runtime_metadata,
+    configure_file_logging_path,
     ensure_compute_device_available,
+    ensure_training_dependencies,
     resolve_contiguous_seeds,
-    validate_seed_list,
+    validate_seed_schedule,
+    write_json_atomic,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-PRESET_NUM_SEEDS: dict[Figure5RunScale, int] = {
-    "paper": 1,
-    "quick": 1,
-    "test": 1,
-}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Figure 5 multi-objective FM+QO reproduction pipeline.")
+    parser = argparse.ArgumentParser(description="Run the Figure 5 multi-objective FM+QUBO reproduction pipeline.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for Figure 5 outputs.")
     parser.add_argument(
         "--preset",
@@ -77,20 +80,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--settings",
         nargs="+",
         required=True,
-        choices=SUPPORTED_SETTINGS,
+        choices=FIGURE5_SETTINGS,
         help="Figure 5 comparison settings: w_ddts wo_ddts",
     )
     return parser.parse_args(argv)
-
-
-def resolve_seed_list(
-    preset: Figure5RunScale,
-    num_seeds: int | None,
-    seed_start: int,
-) -> list[int]:
-    """Resolve the default single seed or an explicit contiguous seed range."""
-
-    return resolve_contiguous_seeds(PRESET_NUM_SEEDS[preset], num_seeds, seed_start)
 
 
 def _write_manifest(
@@ -104,6 +97,9 @@ def _write_manifest(
     config_dict = resolved_config.to_dict()
     workspace_root = Path(__file__).resolve().parent
     manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "figure": 5,
+        "seed_derivation": SEED_DERIVATION_SCHEME,
         "command": [sys.executable, *sys.argv],
         "preset": args.preset,
         "runtime": collect_runtime_metadata(workspace_root, "references/paper_2512_11479.pdf"),
@@ -126,10 +122,6 @@ def _write_manifest(
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
-    output_layout = figure5_output_layout(args.output_dir)
-    log_path = configure_file_logging_path(output_layout.runner_log_path)
-    LOGGER.info("Starting Figure 5 runner")
-    ensure_training_dependencies()
     selected_settings = validate_settings(args.settings)
     config = resolve_experiment_config(
         preset=args.preset,
@@ -141,11 +133,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         sa_reads=args.sa_reads,
         sa_sweeps=args.sa_sweeps,
     )
+    ensure_training_dependencies(TRAINING_REQUIRED_MODULES)
     ensure_compute_device_available(config.device)
-    seed_list = validate_seed_list(
-        resolve_seed_list(args.preset, args.num_seeds, args.seed_start),
+    seed_list = validate_seed_schedule(
+        resolve_contiguous_seeds(
+            FIGURE5_PRESET_NUM_SEEDS[args.preset],
+            args.num_seeds,
+            args.seed_start,
+        ),
+        figure_index=FIGURE5_SEED_INDEX,
+        trajectory_count=len(FIGURE5_SETTINGS),
         iterations=config.iterations,
+        bounded_stream_count=1,
+        fm_model_count=len(FIGURE5_OBJECTIVES),
+        fm_seed_block_size=fm_seed_block_size(config.optuna_trials),
     )
+    output_layout = figure5_output_layout(args.output_dir)
+    log_path = configure_file_logging_path(output_layout.runner_log_path)
+    LOGGER.info("Starting Figure 5 runner")
     LOGGER.info(
         "Resolved Figure 5 config=%s seeds=%s settings=%s resume=%s",
         json.dumps(config.to_dict(), sort_keys=True),
@@ -188,4 +193,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["PRESET_NUM_SEEDS", "main", "parse_args", "resolve_seed_list"]
+__all__ = ["main", "parse_args"]

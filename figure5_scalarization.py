@@ -10,9 +10,11 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Mapping, Sequence
+from typing import Any, Dict, Literal, Mapping, Sequence, cast
 
 import numpy as np
+
+from experiment_runtime import require_integer
 
 
 FIGURE5_OBJECTIVES = ("kappa", "E", "rho")
@@ -22,6 +24,7 @@ SCALARIZATION_SCALE_FLOOR = 1e-12
 
 Figure5Setting = Literal["w_ddts", "wo_ddts"]
 ScalarizationMethod = Literal["weighted_sum", "ddts"]
+FIGURE5_SETTINGS: tuple[Figure5Setting, ...] = ("w_ddts", "wo_ddts")
 
 
 @dataclass(frozen=True)
@@ -45,13 +48,27 @@ class ObjectiveTargetsResult:
     metadata: Dict[str, Any]
 
 
+def validate_settings(settings: Sequence[str]) -> tuple[Figure5Setting, ...]:
+    """Validate the public Figure 5 setting contract without reordering it."""
+
+    if not settings:
+        raise ValueError("At least one setting is required")
+    if any(not isinstance(setting, str) for setting in settings):
+        raise ValueError("Figure 5 settings must contain strings")
+    unknown = [setting for setting in settings if setting not in FIGURE5_SETTINGS]
+    if unknown:
+        raise ValueError(f"Unsupported Figure 5 settings: {', '.join(unknown)}")
+    if len(set(settings)) != len(settings):
+        raise ValueError("Figure 5 settings must not contain duplicates")
+    return tuple(cast(Figure5Setting, setting) for setting in settings)
+
+
 def sample_preference_weights(rng: random.Random, num_objectives: int = 3) -> tuple[float, ...]:
     """采样非负且总和为 1 的 preference weights。"""
 
-    if int(num_objectives) <= 0:
-        raise ValueError("num_objectives must be positive")
+    objective_count = require_integer("num_objectives", num_objectives, minimum=1)
 
-    draws = [rng.expovariate(1.0) for _ in range(int(num_objectives))]
+    draws = [rng.expovariate(1.0) for _ in range(objective_count)]
     total = sum(draws)
     if total <= 0.0 or not math.isfinite(total):
         raise ValueError("Unable to sample finite positive preference weights")
@@ -61,8 +78,9 @@ def sample_preference_weights(rng: random.Random, num_objectives: int = 3) -> tu
 def validate_preference_weights(weights: Sequence[float], num_objectives: int = 3) -> np.ndarray:
     """校验并轻微归一化权重，消除浮点求和误差。"""
 
-    if len(weights) != int(num_objectives):
-        raise ValueError(f"weights must contain {num_objectives} values")
+    objective_count = require_integer("num_objectives", num_objectives, minimum=1)
+    if len(weights) != objective_count:
+        raise ValueError(f"weights must contain {objective_count} values")
 
     array = np.asarray(weights, dtype=np.float64)
     if not np.all(np.isfinite(array)):
@@ -206,6 +224,7 @@ def _objective_metadata(values: Sequence[float]) -> Dict[str, float]:
 __all__ = [
     "FIGURE5_OBJECTIVES",
     "FIGURE5_OBJECTIVE_SENSES",
+    "FIGURE5_SETTINGS",
     "Figure5Setting",
     "ObjectiveTargetsResult",
     "ScalarizationMethod",
@@ -214,5 +233,6 @@ __all__ = [
     "compute_individual_objective_targets",
     "compute_weighted_sum_reference_targets",
     "sample_preference_weights",
+    "validate_settings",
     "validate_preference_weights",
 ]

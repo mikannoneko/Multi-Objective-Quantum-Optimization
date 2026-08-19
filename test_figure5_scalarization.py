@@ -136,8 +136,12 @@ class Figure5ScalarizationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_preference_weights(weights)
 
-        with self.assertRaisesRegex(ValueError, "num_objectives"):
-            sample_preference_weights(random.Random(1), num_objectives=0)
+        for invalid_count in (0, True, 1.5, "3"):
+            with self.subTest(num_objectives=invalid_count):
+                with self.assertRaisesRegex(ValueError, "num_objectives"):
+                    sample_preference_weights(  # type: ignore[arg-type]
+                        random.Random(1), num_objectives=invalid_count
+                    )
 
     def test_weighted_sum_reference_api_cannot_dispatch_training(self) -> None:
         self.assertIn("compute_weighted_sum_reference_targets", scalarization.__all__)

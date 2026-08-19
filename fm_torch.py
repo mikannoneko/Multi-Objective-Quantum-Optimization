@@ -1,9 +1,8 @@
-"""Figure 4 使用的 PyTorch Factorization Machine 训练和 FM-to-QUBO 转换。"""
+"""Shared PyTorch Factorization Machine training and FM-to-QUBO conversion."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from numbers import Integral
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -13,32 +12,42 @@ from torch import nn
 
 import optuna
 
+from experiment_runtime import NUMPY_SEED_MAX, require_integer
+
 
 FM_FACTORIZATION_RANK = 6
 FM_MAX_STEPS = 2000
 FM_LBFGS_LR = 1.0
-FM_FINAL_FIT_SEED_OFFSET = 20_000
-NUMPY_SEED_MAX = (2**32) - 1
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.1
 TEST_RATIO = 0.1
 
 
-def _require_integer(
-    name: str,
-    value: int,
-    *,
-    minimum: int = 0,
-    maximum: int | None = None,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer")
-    normalized = int(value)
-    if normalized < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    if maximum is not None and normalized > maximum:
-        raise ValueError(f"{name} must not exceed {maximum}")
-    return normalized
+def fm_seed_block_size(optuna_trials: int) -> int:
+    """Return the fixed-width seed block reserved for one FM fit."""
+
+    return require_integer("optuna_trials", optuna_trials, minimum=0) + 4
+
+
+def fm_seed_plan(seed_root: int, optuna_trials: int) -> dict[str, Any]:
+    """Allocate split, sampler, trial, and final-fit seeds inside one block."""
+
+    trial_count = require_integer("optuna_trials", optuna_trials, minimum=0)
+    block_size = fm_seed_block_size(trial_count)
+    root = require_integer(
+        "seed",
+        seed_root,
+        minimum=0,
+        maximum=NUMPY_SEED_MAX - block_size + 1,
+    )
+    return {
+        "root": root,
+        "block_size": block_size,
+        "split": [root, root + 1],
+        "tuner": root + 2,
+        "trials": list(range(root + 3, root + 3 + trial_count)),
+        "final_fit": root + 3 + trial_count,
+    }
 
 
 @dataclass(frozen=True)
@@ -71,7 +80,7 @@ class TorchFMRegressor(nn.Module):
 
     def __init__(self, num_features: int, init_std: float) -> None:
         super().__init__()
-        self.num_features = _require_integer("num_features", num_features, minimum=1)
+        self.num_features = require_integer("num_features", num_features, minimum=1)
         self.rank = FM_FACTORIZATION_RANK
         self.w0 = nn.Parameter(torch.zeros(1))
         self.w = nn.Parameter(torch.zeros(self.num_features))
@@ -88,7 +97,7 @@ class TorchFMRegressor(nn.Module):
 
 
 def set_global_seed(seed: int) -> None:
-    seed = _require_integer("seed", seed, maximum=NUMPY_SEED_MAX)
+    seed = require_integer("seed", seed, minimum=0, maximum=NUMPY_SEED_MAX)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -98,7 +107,7 @@ def set_global_seed(seed: int) -> None:
 def split_train_validation_test(x: np.ndarray, y: np.ndarray, seed: int) -> FMSplitData:
     """按论文复现流程拆分当前 active-learning 数据集。"""
 
-    seed = _require_integer("seed", seed, maximum=NUMPY_SEED_MAX - 1)
+    seed = require_integer("seed", seed, minimum=0, maximum=NUMPY_SEED_MAX - 1)
     if len(x) != len(y):
         raise ValueError("x and y must have equal length")
     if len(x) < 5:
@@ -156,14 +165,15 @@ def _fit_model_once(
     hparams: FMHyperParams,
     device: str,
     seed: int,
+    *,
+    include_test_loss: bool,
 ) -> Tuple[TorchFMRegressor, Dict[str, float]]:
-    """用一组超参数训练一次 FM，并返回 train/validation/test loss。"""
+    """用一组超参数训练一次 FM，并返回本次调用所需的数据集 loss。"""
 
     set_global_seed(seed)
     model = TorchFMRegressor(num_features=split_data.train_x.shape[1], init_std=hparams.init_std).to(device)
     train_x_tensor, train_y_tensor = _tensor_pair(split_data.train_x, split_data.train_y, device)
     validation_x_tensor, validation_y_tensor = _tensor_pair(split_data.validation_x, split_data.validation_y, device)
-    test_x_tensor, test_y_tensor = _tensor_pair(split_data.test_x, split_data.test_y, device)
 
     optimizer = torch.optim.LBFGS(
         model.parameters(),
@@ -197,8 +207,10 @@ def _fit_model_once(
     metrics = {
         "train_loss": best_train_loss,
         "validation_loss": _evaluate_loss(model, validation_x_tensor, validation_y_tensor),
-        "test_loss": _evaluate_loss(model, test_x_tensor, test_y_tensor),
     }
+    if include_test_loss:
+        test_x_tensor, test_y_tensor = _tensor_pair(split_data.test_x, split_data.test_y, device)
+        metrics["test_loss"] = _evaluate_loss(model, test_x_tensor, test_y_tensor)
     return model, metrics
 
 
@@ -210,13 +222,8 @@ def tune_fm_hparams(
 ) -> FMHyperParams:
     """只选择并返回 FM 超参数；最终模型由调用方训练一次。"""
 
-    optuna_trials = _require_integer("optuna_trials", optuna_trials)
-    maximum_trial_offset = max(0, optuna_trials - 1)
-    seed = _require_integer(
-        "seed",
-        seed,
-        maximum=NUMPY_SEED_MAX - maximum_trial_offset,
-    )
+    optuna_trials = require_integer("optuna_trials", optuna_trials, minimum=0)
+    seed_plan = fm_seed_plan(seed, optuna_trials)
     default_hparams = FMHyperParams(
         init_std=0.05,
         l2_reg_w=1e-4,
@@ -225,7 +232,7 @@ def tune_fm_hparams(
     if optuna_trials <= 0:
         return default_hparams
 
-    sampler = optuna.samplers.TPESampler(seed=seed)
+    sampler = optuna.samplers.TPESampler(seed=seed_plan["tuner"])
     study = optuna.create_study(direction="minimize", sampler=sampler)
 
     def objective(trial: optuna.Trial) -> float:
@@ -234,8 +241,14 @@ def tune_fm_hparams(
             l2_reg_w=trial.suggest_float("l2_reg_w", 1e-8, 1e-1, log=True),
             l2_reg_v=trial.suggest_float("l2_reg_v", 1e-8, 1e-1, log=True),
         )
-        _, metrics = _fit_model_once(split_data, hparams, device, seed + trial.number)
-        return metrics["test_loss"]
+        _, metrics = _fit_model_once(
+            split_data,
+            hparams,
+            device,
+            seed_plan["trials"][trial.number],
+            include_test_loss=False,
+        )
+        return metrics["validation_loss"]
 
     study.optimize(objective, n_trials=optuna_trials, show_progress_bar=False)
     best = study.best_trial.params
@@ -255,24 +268,26 @@ def fit_torch_fm(
 ) -> Tuple[TorchFMRegressor, Dict[str, Any]]:
     """训练当前迭代的 FM，并返回可写入 checkpoint/summary 的训练 metadata。"""
 
-    optuna_trials = _require_integer("optuna_trials", optuna_trials)
-    maximum_seed_offset = max(1, FM_FINAL_FIT_SEED_OFFSET, max(0, optuna_trials - 1))
-    seed = _require_integer(
-        "seed",
-        seed,
-        maximum=NUMPY_SEED_MAX - maximum_seed_offset,
+    optuna_trials = require_integer("optuna_trials", optuna_trials, minimum=0)
+    seed_plan = fm_seed_plan(seed, optuna_trials)
+    split_data = split_train_validation_test(x, y, seed_plan["root"])
+    best_hparams = tune_fm_hparams(
+        split_data,
+        optuna_trials=optuna_trials,
+        device=device,
+        seed=seed_plan["root"],
     )
-    split_data = split_train_validation_test(x, y, seed)
-    best_hparams = tune_fm_hparams(split_data, optuna_trials=optuna_trials, device=device, seed=seed)
     model, final_metrics = _fit_model_once(
         split_data,
         best_hparams,
         device,
-        seed + FM_FINAL_FIT_SEED_OFFSET,
+        seed_plan["final_fit"],
+        include_test_loss=True,
     )
     metadata: Dict[str, Any] = {
         "tuner": "optuna" if optuna_trials > 0 else "fixed",
         "rank": FM_FACTORIZATION_RANK,
+        "seed_plan": seed_plan,
         **asdict(best_hparams),
         **final_metrics,
     }
@@ -287,3 +302,17 @@ def fm_to_qubo(model: TorchFMRegressor) -> Tuple[np.ndarray, float]:
     q = 0.5 * (v @ v.T)
     np.fill_diagonal(q, w)
     return q, 0.0
+
+
+__all__ = [
+    "FMHyperParams",
+    "FMSplitData",
+    "NUMPY_SEED_MAX",
+    "TorchFMRegressor",
+    "fit_torch_fm",
+    "fm_seed_block_size",
+    "fm_seed_plan",
+    "fm_to_qubo",
+    "split_train_validation_test",
+    "tune_fm_hparams",
+]

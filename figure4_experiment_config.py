@@ -1,6 +1,6 @@
 """Figure 4 实验配置和单目标优化方向定义。
 
-该模块只保存与运行规模、训练参数、SA 参数和 objective 方向有关的配置。
+该模块保存 canonical objective/setting、preset seed 数及训练/SA 配置。
 具体的编码策略在 `figure4_setting_strategies.py`，具体运行循环在 `figure4_pipeline.py`。
 """
 
@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field, replace
-from numbers import Integral
 from typing import Any, Literal
 
+from experiment_config import EncodingConfig, FMConfig, SAConfig
+from experiment_runtime import require_integer
 
-RunScale = Literal["paper", "quick", "test"]
-SUPPORTED_PRESETS: tuple[RunScale, ...] = ("paper", "quick", "test")
+
+Figure4RunScale = Literal["paper", "quick", "test"]
+Figure4Setting = Literal["wo_cgfm", "w_cgfm"]
+SUPPORTED_PRESETS: tuple[Figure4RunScale, ...] = ("paper", "quick", "test")
+FIGURE4_SETTINGS: tuple[Figure4Setting, ...] = ("wo_cgfm", "w_cgfm")
+FIGURE4_PRESET_NUM_SEEDS: dict[Figure4RunScale, int] = {
+    "paper": 20,
+    "quick": 3,
+    "test": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -39,77 +48,20 @@ class ObjectiveSpec:
         return min(current_best, candidate)
 
 
-OBJECTIVES: tuple[ObjectiveSpec, ...] = (
+FIGURE4_OBJECTIVES: tuple[ObjectiveSpec, ...] = (
     ObjectiveSpec("kappa", maximize=True),
     ObjectiveSpec("E", maximize=True),
     ObjectiveSpec("rho", maximize=False),
     ObjectiveSpec("delta_alpha", maximize=False),
     ObjectiveSpec("delta_T", maximize=False),
 )
-
-
-def _require_positive(name: str, value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer")
-    normalized = int(value)
-    if normalized <= 0:
-        raise ValueError(f"{name} must be positive")
-    return normalized
-
-
-def _require_non_negative(name: str, value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer")
-    normalized = int(value)
-    if normalized < 0:
-        raise ValueError(f"{name} must be non-negative")
-    return normalized
+FIGURE4_OBJECTIVE_NAMES: tuple[str, ...] = tuple(
+    objective.name for objective in FIGURE4_OBJECTIVES
+)
 
 
 @dataclass(frozen=True)
-class EncodingConfig:
-    """离散编码配置；`num_levels` 决定每个 block 可表示的正分数等级数。"""
-
-    num_levels: int = 50
-
-    def __post_init__(self) -> None:
-        num_levels = _require_positive("num_levels", self.num_levels)
-        if num_levels <= 1:
-            raise ValueError("num_levels must be greater than 1")
-        object.__setattr__(self, "num_levels", num_levels)
-
-
-@dataclass(frozen=True)
-class FMConfig:
-    """FM 训练配置；`optuna_trials=0` 时使用固定超参数，适合快速测试。"""
-
-    optuna_trials: int = 20
-    device: str = "cpu"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "optuna_trials",
-            _require_non_negative("optuna_trials", self.optuna_trials),
-        )
-        if self.device not in {"cpu", "cuda"}:
-            raise ValueError("device must be 'cpu' or 'cuda'")
-
-
-@dataclass(frozen=True)
-class SAConfig:
-    """Simulated annealing 求解配置，对应 D-Wave Ocean `neal` 的 reads 和 sweeps。"""
-
-    reads: int = 1000
-    sweeps: int = 3000
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "reads", _require_positive("sa_reads", self.reads))
-        object.__setattr__(self, "sweeps", _require_positive("sa_sweeps", self.sweeps))
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
+class Figure4ExperimentConfig:
     """Figure 4 一次实验运行的完整配置。"""
 
     num_samples: int = 100
@@ -119,8 +71,12 @@ class ExperimentConfig:
     sa: SAConfig = field(default_factory=SAConfig)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "num_samples", _require_positive("num_samples", self.num_samples))
-        object.__setattr__(self, "iterations", _require_positive("iterations", self.iterations))
+        object.__setattr__(
+            self, "num_samples", require_integer("num_samples", self.num_samples, minimum=1)
+        )
+        object.__setattr__(
+            self, "iterations", require_integer("iterations", self.iterations, minimum=1)
+        )
 
     @property
     def num_levels(self) -> int:
@@ -146,13 +102,13 @@ class ExperimentConfig:
         return asdict(self)
 
 
-def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
+def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4ExperimentConfig:
     """把论文规模、快速规模和单元测试规模收敛到同一个配置 dataclass。"""
 
     if preset == "paper":
-        return ExperimentConfig(fm=FMConfig(device=device))
+        return Figure4ExperimentConfig(fm=FMConfig(device=device))
     if preset == "quick":
-        return ExperimentConfig(
+        return Figure4ExperimentConfig(
             num_samples=100,
             iterations=100,
             encoding=EncodingConfig(num_levels=50),
@@ -160,7 +116,7 @@ def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
             sa=SAConfig(reads=100, sweeps=500),
         )
     if preset == "test":
-        return ExperimentConfig(
+        return Figure4ExperimentConfig(
             num_samples=10,
             iterations=2,
             encoding=EncodingConfig(num_levels=8),
@@ -172,7 +128,7 @@ def preset_config(preset: RunScale, device: str = "cpu") -> ExperimentConfig:
 
 def resolve_experiment_config(
     *,
-    preset: RunScale,
+    preset: Figure4RunScale,
     device: str,
     num_samples: int | None = None,
     iterations: int | None = None,
@@ -180,7 +136,7 @@ def resolve_experiment_config(
     optuna_trials: int | None = None,
     sa_reads: int | None = None,
     sa_sweeps: int | None = None,
-) -> ExperimentConfig:
+) -> Figure4ExperimentConfig:
     """先解析 preset，再应用 CLI override，得到 runner 实际执行的配置。"""
 
     config = preset_config(preset, device=device)
@@ -203,3 +159,18 @@ def resolve_experiment_config(
             ),
         )
     return config
+
+
+__all__ = [
+    "FIGURE4_OBJECTIVE_NAMES",
+    "FIGURE4_OBJECTIVES",
+    "FIGURE4_PRESET_NUM_SEEDS",
+    "FIGURE4_SETTINGS",
+    "Figure4ExperimentConfig",
+    "Figure4RunScale",
+    "Figure4Setting",
+    "ObjectiveSpec",
+    "SUPPORTED_PRESETS",
+    "preset_config",
+    "resolve_experiment_config",
+]

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-import json
-import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+
+from experiment_runtime import (
+    NEAL_SEED_MAX,
+    SEED_DERIVATION_SCHEME,
+    load_json_object,
+    require_integer,
+    same_json_value,
+    write_json_atomic,
+)
 
 if TYPE_CHECKING:
     from figure5_experiment_config import Figure5ExperimentConfig
@@ -16,16 +23,19 @@ else:
     Figure5Setting = str
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 4
+SUMMARY_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 1
 SUMMARY_FILENAME = "figure5_summary.json"
-MANIFEST_FILENAME = "manifest.json"
+MANIFEST_FILENAME = "figure5_manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure5.png"
 LOG_DIR_NAME = "logs"
 RUNNER_LOG_FILENAME = "figure5_runner.log"
 PLOT_LOG_FILENAME = "plot_figure5.log"
 CHECKPOINT_DIR_NAME = "trajectories"
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-_CHECKPOINT_FIELDS = frozenset({"schema_version", "setting", "seed", "config", "state"})
+_CHECKPOINT_FIELDS = frozenset(
+    {"schema_version", "seed_derivation", "setting", "seed", "config", "state"}
+)
 
 
 @dataclass(frozen=True)
@@ -74,7 +84,8 @@ def figure5_output_layout(output_dir: str | Path) -> Figure5OutputLayout:
 
 
 def checkpoint_filename(setting: Figure5Setting, seed: int) -> str:
-    return f"{setting}_seed_{int(seed)}.json"
+    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
+    return f"{setting}_seed_{normalized_seed}.json"
 
 
 def checkpoint_payload(
@@ -86,45 +97,19 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     """Build a checkpoint tied to one setting/seed/config trajectory."""
 
+    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
     return {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "seed_derivation": SEED_DERIVATION_SCHEME,
         "setting": setting,
-        "seed": int(seed),
+        "seed": normalized_seed,
         "config": config.to_dict(),
         "state": asdict(state),
     }
 
 
-def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> Path:
-    """Atomically write JSON so interruption cannot leave a partial checkpoint."""
-
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f"{output_path.name}.tmp")
-    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary_path.replace(output_path)
-    return output_path
-
-
 def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
-    return write_json_atomic(path, payload)
-
-
-def _same_json_value(actual: Any, expected: Any) -> bool:
-    """Compare JSON values without accepting bool/int or other type coercions."""
-
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            _same_json_value(actual[key], expected[key]) for key in expected
-        )
-    if isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            _same_json_value(actual_item, expected_item)
-            for actual_item, expected_item in zip(actual, expected)
-        )
-    return bool(actual == expected)
+    return write_json_atomic(path, payload, indent=None)
 
 
 def _checkpoint_error(checkpoint: Path, detail: str) -> ValueError:
@@ -141,13 +126,8 @@ def load_checkpoint(
     """Load a checkpoint after validating its outer schema and identity."""
 
     checkpoint = Path(path)
-    try:
-        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise _checkpoint_error(checkpoint, f"cannot read valid JSON ({exc})") from exc
-
-    if not isinstance(payload, dict):
-        raise _checkpoint_error(checkpoint, "root must be a JSON object")
+    requested_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
+    payload = load_json_object(checkpoint, document_name="checkpoint")
 
     missing_fields = sorted(_CHECKPOINT_FIELDS - payload.keys())
     if missing_fields:
@@ -162,6 +142,15 @@ def load_checkpoint(
             f"unsupported schema_version {schema_version!r}; expected {CHECKPOINT_SCHEMA_VERSION}",
         )
 
+    seed_derivation = payload["seed_derivation"]
+    if type(seed_derivation) is not str:
+        raise _checkpoint_error(checkpoint, "field 'seed_derivation' must be a string")
+    if seed_derivation != SEED_DERIVATION_SCHEME:
+        raise _checkpoint_error(
+            checkpoint,
+            f"unsupported seed_derivation {seed_derivation!r}; expected {SEED_DERIVATION_SCHEME!r}",
+        )
+
     checkpoint_setting = payload["setting"]
     checkpoint_seed = payload["seed"]
     if type(checkpoint_setting) is not str:
@@ -170,16 +159,16 @@ def load_checkpoint(
         raise _checkpoint_error(checkpoint, "field 'seed' must be an integer")
     if checkpoint_setting != setting:
         raise _checkpoint_error(checkpoint, f"setting metadata does not match {setting!r}")
-    if checkpoint_seed != int(seed):
-        raise _checkpoint_error(checkpoint, f"seed metadata does not match {int(seed)!r}")
+    if checkpoint_seed != requested_seed:
+        raise _checkpoint_error(checkpoint, f"seed metadata does not match {requested_seed!r}")
 
     checkpoint_config = payload["config"]
     if not isinstance(checkpoint_config, dict):
         raise _checkpoint_error(checkpoint, "field 'config' must be a JSON object")
-    if not _same_json_value(checkpoint_config, config.to_dict()):
+    if not same_json_value(checkpoint_config, config.to_dict()):
         raise _checkpoint_error(
             checkpoint,
-            "config does not match the current run; use a separate output directory for different settings",
+            "config does not match the current run; use a separate output directory for a different configuration",
         )
     if not isinstance(payload["state"], dict):
         raise _checkpoint_error(checkpoint, "field 'state' must be a JSON object")
@@ -187,27 +176,7 @@ def load_checkpoint(
 
 
 def load_summary(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def configure_file_logging_path(log_path: str | Path) -> Path:
-    """Configure one Figure 5 file handler without disturbing other handlers."""
-
-    output_path = Path(log_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    for handler in list(root_logger.handlers):
-        if getattr(handler, "_figure5_handler", False):
-            root_logger.removeHandler(handler)
-            handler.close()
-
-    file_handler = logging.FileHandler(output_path, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    file_handler._figure5_handler = True  # type: ignore[attr-defined]
-    root_logger.addHandler(file_handler)
-    return output_path
+    return load_json_object(path, document_name="Figure 5 summary")
 
 
 __all__ = [
@@ -215,13 +184,13 @@ __all__ = [
     "DEFAULT_FIGURE_FILENAME",
     "Figure5OutputLayout",
     "MANIFEST_FILENAME",
+    "MANIFEST_SCHEMA_VERSION",
     "SUMMARY_FILENAME",
+    "SUMMARY_SCHEMA_VERSION",
     "checkpoint_filename",
     "checkpoint_payload",
-    "configure_file_logging_path",
     "figure5_output_layout",
     "load_checkpoint",
     "load_summary",
     "write_checkpoint",
-    "write_json_atomic",
 ]

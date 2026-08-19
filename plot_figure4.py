@@ -13,8 +13,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from figure4_experiment_config import OBJECTIVES
-from figure4_outputs import configure_file_logging_path, figure4_output_layout, load_summary
+from experiment_runtime import SEED_DERIVATION_SCHEME, configure_file_logging_path
+from figure4_experiment_config import FIGURE4_OBJECTIVES
+from figure4_outputs import SUMMARY_SCHEMA_VERSION, figure4_output_layout, load_summary
 
 
 SETTING_LABELS = {
@@ -48,24 +49,41 @@ def plot_values(objective_name: str, values: list[float] | np.ndarray) -> np.nda
 
 def _required_curve(stats: dict[str, Any], key: str) -> np.ndarray:
     if key not in stats:
-        raise KeyError(f"Summary aggregated entry is missing schema v3 field {key!r}")
-    return np.asarray(stats[key], dtype=np.float64)
+        raise ValueError(f"Figure 4 aggregated entry is missing field {key!r}")
+    try:
+        curve = np.asarray(stats[key], dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Figure 4 aggregated field {key!r} must be a numeric curve") from exc
+    if curve.ndim != 1 or curve.size == 0:
+        raise ValueError(f"Figure 4 aggregated field {key!r} must be a non-empty 1-D curve")
+    if not np.all(np.isfinite(curve)):
+        raise ValueError(f"Figure 4 aggregated field {key!r} must contain finite values")
+    return curve
 
 
 def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
-    """合并一个或多个 schema v3 summary 的 aggregated 曲线。"""
+    """合并一个或多个 schema v4 summary 的 aggregated 曲线。"""
 
     merged: dict[str, dict[str, Any]] = {}
     for path in summary_paths:
         summary = load_summary(path)
-        if summary.get("schema_version") != 3:
-            raise ValueError(f"Unsupported Figure 4 summary schema in {path}: expected schema_version 3")
+        if summary.get("schema_version") != SUMMARY_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported Figure 4 summary schema in {path}: "
+                f"expected schema_version {SUMMARY_SCHEMA_VERSION}"
+            )
+        if summary.get("seed_derivation") != SEED_DERIVATION_SCHEME:
+            raise ValueError(
+                f"Unsupported Figure 4 seed_derivation in {path}: expected {SEED_DERIVATION_SCHEME!r}"
+            )
         aggregated = summary.get("aggregated")
         if not isinstance(aggregated, dict) or not aggregated:
             raise ValueError(f"Figure 4 summary has no aggregated results: {path}")
         for key, value in aggregated.items():
             if key in merged:
                 raise ValueError(f"Duplicate aggregated key {key!r} while merging {path}")
+            if not isinstance(value, dict):
+                raise ValueError(f"Figure 4 aggregated entry {key!r} in {path} must be an object")
             merged[key] = dict(value)
     return merged
 
@@ -83,7 +101,7 @@ def main() -> None:
     fig, axes = plt.subplots(2, 3, figsize=(14, 8))
     flat_axes = axes.flatten()
 
-    for idx, objective in enumerate(OBJECTIVES):
+    for idx, objective in enumerate(FIGURE4_OBJECTIVES):
         axis = flat_axes[idx]
         for setting, color in SETTING_COLORS.items():
             key = f"{objective.name}:{setting}"
@@ -95,6 +113,14 @@ def main() -> None:
             best_so_far_std = _required_curve(stats, "best_so_far_std")
             best_so_far_min = _required_curve(stats, "best_so_far_min")
             best_so_far_max = _required_curve(stats, "best_so_far_max")
+            curve_lengths = {
+                len(best_so_far_mean),
+                len(best_so_far_std),
+                len(best_so_far_min),
+                len(best_so_far_max),
+            }
+            if len(curve_lengths) != 1:
+                raise ValueError(f"Figure 4 aggregated curves for {key!r} must have equal lengths")
             x_values = np.arange(1, len(best_so_far_mean) + 1)
 
             label = SETTING_LABELS.get(setting, setting)
@@ -150,3 +176,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = ["main", "parse_args", "plot_values"]

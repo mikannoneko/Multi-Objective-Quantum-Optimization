@@ -8,11 +8,12 @@ composition 如何编码成 FM/QUBO 特征、候选 bit vector 如何解码，�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import numpy as np
 
-from figure4_qubo_math import (
+from figure4_experiment_config import FIGURE4_SETTINGS, Figure4Setting
+from qubo_math import (
     IterationEncoding,
     create_cgfm_iteration_encoding,
     create_iteration_encoding,
@@ -21,11 +22,6 @@ from figure4_qubo_math import (
     encode_cgfm_rows,
     encode_single_objective_rows,
 )
-
-
-Figure4Setting = Literal["wo_cgfm", "w_cgfm"]
-SUPPORTED_SETTINGS: tuple[Figure4Setting, ...] = ("wo_cgfm", "w_cgfm")
-
 
 class SettingStrategy(Protocol):
     """主循环调用的最小策略接口，避免把两条 Figure 4 流程写成两套 pipeline。"""
@@ -94,7 +90,7 @@ SETTING_STRATEGIES: dict[Figure4Setting, SettingStrategy] = {
 
 def get_setting_strategy(setting: str) -> SettingStrategy:
     if setting not in SETTING_STRATEGIES:
-        raise ValueError(f"Unsupported setting {setting!r}. Choices: {', '.join(SUPPORTED_SETTINGS)}")
+        raise ValueError(f"Unsupported setting {setting!r}. Choices: {', '.join(FIGURE4_SETTINGS)}")
     return SETTING_STRATEGIES[setting]  # type: ignore[index]
 
 

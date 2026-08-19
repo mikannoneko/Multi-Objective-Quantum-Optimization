@@ -12,23 +12,28 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from alloy_dataset_generator import build_dataset_row
+from experiment_runtime import SEED_DERIVATION_SCHEME, load_json_object, write_json_atomic
+from figure4_experiment_config import (
+    FIGURE4_OBJECTIVE_NAMES,
+    FIGURE4_PRESET_NUM_SEEDS,
+    FIGURE4_SETTINGS,
+    preset_config as figure4_preset_config,
+)
+from figure4_outputs import SUMMARY_SCHEMA_VERSION as FIGURE4_SCHEMA_VERSION
+from figure5_experiment_config import (
+    FIGURE5_PRESET_NUM_SEEDS,
+    preset_config as figure5_preset_config,
+)
+from figure5_outputs import SUMMARY_SCHEMA_VERSION as FIGURE5_SCHEMA_VERSION
 from figure5_pareto import pareto_front
+from figure5_scalarization import FIGURE5_SETTINGS
 
 
-FIGURE4_SCHEMA_VERSION = 3
-FIGURE5_SCHEMA_VERSION = 3
-FIGURE4_OBJECTIVES = ("kappa", "E", "rho", "delta_alpha", "delta_T")
-FIGURE4_SETTINGS = ("w_cgfm", "wo_cgfm")
-FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
-FIGURE4_QUICK_SCALE = {"num_samples": 100, "iterations": 100, "num_levels": 50, "num_seeds": 3}
-FIGURE5_QUICK_SCALE = {"num_samples": 500, "iterations": 150, "num_levels": 25, "num_seeds": 1}
+REPORT_SCHEMA_VERSION = 2
 
 
 def _load_summary(path: str | Path) -> dict[str, Any]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("summary root must be a JSON object")
-    return payload
+    return load_json_object(path, document_name="reproduction summary")
 
 
 def _check(checks: dict[str, dict[str, Any]], name: str, passed: bool, detail: Any) -> None:
@@ -68,6 +73,16 @@ def _scale_detail(config: Mapping[str, Any], seeds: Sequence[Any]) -> dict[str, 
         "num_levels": encoding.get("num_levels"),
         "num_seeds": len(seeds),
     }
+
+
+_FIGURE4_QUICK_SCALE = _scale_detail(
+    figure4_preset_config("quick").to_dict(),
+    range(FIGURE4_PRESET_NUM_SEEDS["quick"]),
+)
+_FIGURE5_QUICK_SCALE = _scale_detail(
+    figure5_preset_config("quick").to_dict(),
+    range(FIGURE5_PRESET_NUM_SEEDS["quick"]),
+)
 
 
 def _trajectory_accounting(
@@ -112,8 +127,13 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     _check(
         checks,
         "schema",
-        summary.get("schema_version") == FIGURE4_SCHEMA_VERSION,
-        {"expected": FIGURE4_SCHEMA_VERSION, "actual": summary.get("schema_version")},
+        summary.get("schema_version") == FIGURE4_SCHEMA_VERSION
+        and summary.get("seed_derivation") == SEED_DERIVATION_SCHEME,
+        {
+            "expected": FIGURE4_SCHEMA_VERSION,
+            "actual": summary.get("schema_version"),
+            "seed_derivation": summary.get("seed_derivation"),
+        },
     )
     raw_objectives = summary.get("objectives")
     objectives = raw_objectives if isinstance(raw_objectives, list) else []
@@ -122,7 +142,7 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     _check(
         checks,
         "comparison_axes",
-        _matches_exact_string_set(objectives, FIGURE4_OBJECTIVES)
+        _matches_exact_string_set(objectives, FIGURE4_OBJECTIVE_NAMES)
         and _matches_exact_string_set(settings, FIGURE4_SETTINGS),
         {"objectives": objectives, "settings": settings},
     )
@@ -130,14 +150,14 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     config = summary.get("config") if isinstance(summary.get("config"), Mapping) else {}
     seeds = summary.get("seed_list") if isinstance(summary.get("seed_list"), list) else []
     scale_detail = _scale_detail(config, seeds)
-    _check(checks, "quick_scale", scale_detail == FIGURE4_QUICK_SCALE, scale_detail)
+    _check(checks, "quick_scale", scale_detail == _FIGURE4_QUICK_SCALE, scale_detail)
 
     trajectories = summary.get("trajectories") if isinstance(summary.get("trajectories"), list) else []
     expected_iterations = _as_int(config.get("iterations"), 0)
     expected_trajectories = {
         (_as_int(seed), objective, setting)
         for seed in seeds
-        for objective in FIGURE4_OBJECTIVES
+        for objective in FIGURE4_OBJECTIVE_NAMES
         for setting in FIGURE4_SETTINGS
     }
     actual_trajectories = {
@@ -170,7 +190,7 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     aggregate_detail: dict[str, Any] = {}
     final_statistics: dict[str, tuple[float, float] | None] = {}
     aggregate_passed = True
-    for objective in FIGURE4_OBJECTIVES:
+    for objective in FIGURE4_OBJECTIVE_NAMES:
         for setting in FIGURE4_SETTINGS:
             key = f"{objective}:{setting}"
             entry = aggregated.get(key)
@@ -243,6 +263,7 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
             "standardized_difference": standardized_difference,
         }
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "figure": 4,
         "scope": "quick_workflow",
         "passed": all(item["passed"] for item in checks.values()),
@@ -307,6 +328,14 @@ def _spacing_cv(oriented_points: Sequence[Sequence[float]], exact_values: np.nda
     return 0.0 if mean <= 0.0 else float(np.std(nearest) / mean)
 
 
+def _mean_std(values: Sequence[float | None]) -> tuple[float | None, float | None]:
+    finite = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+    if not finite:
+        return None, None
+    array = np.asarray(finite, dtype=np.float64)
+    return float(np.mean(array)), float(np.std(array))
+
+
 def figure5_front_metrics(summary: Mapping[str, Any]) -> dict[str, Any]:
     config = summary.get("config") if isinstance(summary.get("config"), Mapping) else {}
     encoding = config.get("encoding") if isinstance(config.get("encoding"), Mapping) else {}
@@ -314,25 +343,62 @@ def figure5_front_metrics(summary: Mapping[str, Any]) -> dict[str, Any]:
     exact = exact_figure5_front(num_levels)
     exact_values = np.asarray(list(exact.values()), dtype=np.float64)
     solutions = summary.get("solutions") if isinstance(summary.get("solutions"), list) else []
+    raw_seeds = summary.get("seed_list") if isinstance(summary.get("seed_list"), list) else []
+    seeds = [_as_int(seed) for seed in raw_seeds]
+    raw_settings = summary.get("settings") if isinstance(summary.get("settings"), list) else []
+    selected_settings = [setting for setting in FIGURE5_SETTINGS if setting in raw_settings]
 
-    metrics: dict[str, Any] = {"exact_front_size": len(exact), "settings": {}}
-    for setting in FIGURE5_SETTINGS:
-        unique: dict[tuple[float, float, float, float], Mapping[str, Any]] = {}
-        for point in solutions:
-            if isinstance(point, Mapping) and point.get("setting") == setting:
+    by_setting_seed: list[dict[str, Any]] = []
+    for seed in seeds:
+        for setting in selected_settings:
+            unique: dict[tuple[float, float, float, float], Mapping[str, Any]] = {}
+            for point in solutions:
+                if not (
+                    isinstance(point, Mapping)
+                    and point.get("setting") == setting
+                    and _as_int(point.get("seed")) == seed
+                ):
+                    continue
                 composition = point.get("composition")
                 if isinstance(composition, list):
-                    unique[_composition_key(composition)] = point
-        exact_hits = [key for key in unique if key in exact]
-        spacing = _spacing_cv([exact[key] for key in exact_hits], exact_values)
-        metrics["settings"][setting] = {
-            "unique_proposals": len(unique),
-            "exact_front_hits": len(exact_hits),
-            "exact_front_coverage": len(exact_hits) / len(exact) if exact else 0.0,
-            "exact_front_precision": len(exact_hits) / len(unique) if unique else 0.0,
-            "spacing_cv": spacing,
+                    unique.setdefault(_composition_key(composition), point)
+            exact_hits = [key for key in unique if key in exact]
+            by_setting_seed.append(
+                {
+                    "setting": setting,
+                    "seed": seed,
+                    "unique_proposals": len(unique),
+                    "exact_front_hits": len(exact_hits),
+                    "exact_front_coverage": len(exact_hits) / len(exact) if exact else 0.0,
+                    "exact_front_precision": len(exact_hits) / len(unique) if unique else 0.0,
+                    "spacing_cv": _spacing_cv([exact[key] for key in exact_hits], exact_values),
+                }
+            )
+
+    setting_aggregates: dict[str, dict[str, Any]] = {}
+    for setting in selected_settings:
+        records = [record for record in by_setting_seed if record["setting"] == setting]
+        coverage_mean, coverage_std = _mean_std(
+            [record["exact_front_coverage"] for record in records]
+        )
+        precision_mean, precision_std = _mean_std(
+            [record["exact_front_precision"] for record in records]
+        )
+        spacing_mean, spacing_std = _mean_std([record["spacing_cv"] for record in records])
+        setting_aggregates[setting] = {
+            "num_seeds": len(records),
+            "exact_front_coverage_mean": coverage_mean,
+            "exact_front_coverage_std": coverage_std,
+            "exact_front_precision_mean": precision_mean,
+            "exact_front_precision_std": precision_std,
+            "spacing_cv_mean": spacing_mean,
+            "spacing_cv_std": spacing_std,
         }
-    return metrics
+    return {
+        "exact_front_size": len(exact),
+        "by_setting_seed": by_setting_seed,
+        "setting_aggregates": setting_aggregates,
+    }
 
 
 def validate_figure5_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
@@ -342,8 +408,13 @@ def validate_figure5_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     _check(
         checks,
         "schema",
-        summary.get("schema_version") == FIGURE5_SCHEMA_VERSION,
-        {"expected": FIGURE5_SCHEMA_VERSION, "actual": summary.get("schema_version")},
+        summary.get("schema_version") == FIGURE5_SCHEMA_VERSION
+        and summary.get("seed_derivation") == SEED_DERIVATION_SCHEME,
+        {
+            "expected": FIGURE5_SCHEMA_VERSION,
+            "actual": summary.get("schema_version"),
+            "seed_derivation": summary.get("seed_derivation"),
+        },
     )
     raw_settings = summary.get("settings")
     settings = raw_settings if isinstance(raw_settings, list) else []
@@ -357,7 +428,7 @@ def validate_figure5_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
     config = summary.get("config") if isinstance(summary.get("config"), Mapping) else {}
     seeds = summary.get("seed_list") if isinstance(summary.get("seed_list"), list) else []
     scale_detail = _scale_detail(config, seeds)
-    _check(checks, "quick_scale", scale_detail == FIGURE5_QUICK_SCALE, scale_detail)
+    _check(checks, "quick_scale", scale_detail == _FIGURE5_QUICK_SCALE, scale_detail)
 
     expected_iterations = _as_int(config.get("iterations"), 0)
     trajectories = summary.get("trajectories") if isinstance(summary.get("trajectories"), list) else []
@@ -495,22 +566,52 @@ def validate_figure5_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
         _check(checks, "front_metrics", False, str(error))
     if metrics is not None:
         _check(checks, "front_metrics", True, metrics)
-        ddts = metrics["settings"]["w_ddts"]
-        weighted = metrics["settings"]["wo_ddts"]
-        coverage_ratio = ddts["exact_front_coverage"] / max(weighted["exact_front_coverage"], 1e-12)
-        ddts_spacing = ddts["spacing_cv"]
-        weighted_spacing = weighted["spacing_cv"]
-        spacing_ratio = None
-        if ddts_spacing is not None and weighted_spacing not in {None, 0.0}:
-            spacing_ratio = float(ddts_spacing) / float(weighted_spacing)
+        records = {
+            (record["seed"], record["setting"]): record
+            for record in metrics["by_setting_seed"]
+        }
+        by_seed: list[dict[str, Any]] = []
+        for seed in [_as_int(value) for value in seeds]:
+            ddts = records.get((seed, "w_ddts"))
+            weighted = records.get((seed, "wo_ddts"))
+            coverage_ratio: float | None = None
+            spacing_ratio: float | None = None
+            if ddts is not None and weighted is not None:
+                denominator = float(weighted["exact_front_coverage"])
+                if denominator != 0.0:
+                    coverage_ratio = float(ddts["exact_front_coverage"]) / denominator
+                ddts_spacing = ddts["spacing_cv"]
+                weighted_spacing = weighted["spacing_cv"]
+                if ddts_spacing is not None and weighted_spacing not in {None, 0.0}:
+                    spacing_ratio = float(ddts_spacing) / float(weighted_spacing)
+            by_seed.append(
+                {
+                    "seed": seed,
+                    "coverage_ratio_w_ddts_over_wo_ddts": coverage_ratio,
+                    "spacing_cv_ratio_w_ddts_over_wo_ddts": spacing_ratio,
+                }
+            )
+        coverage_mean, coverage_std = _mean_std(
+            [record["coverage_ratio_w_ddts_over_wo_ddts"] for record in by_seed]
+        )
+        spacing_mean, spacing_std = _mean_std(
+            [record["spacing_cv_ratio_w_ddts_over_wo_ddts"] for record in by_seed]
+        )
         comparison = {
-            "coverage_ratio_w_ddts_over_wo_ddts": coverage_ratio,
-            "spacing_cv_ratio_w_ddts_over_wo_ddts": spacing_ratio,
+            "by_seed": by_seed,
+            "aggregate": {
+                "num_seeds": len(by_seed),
+                "coverage_ratio_mean": coverage_mean,
+                "coverage_ratio_std": coverage_std,
+                "spacing_cv_ratio_mean": spacing_mean,
+                "spacing_cv_ratio_std": spacing_std,
+            },
         }
     else:
         comparison = None
 
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "figure": 5,
         "scope": "quick_workflow",
         "passed": all(item["passed"] for item in checks.values()),
@@ -538,8 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     rendered = json.dumps(report, indent=2, allow_nan=False)
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered, encoding="utf-8")
+        write_json_atomic(args.output, report)
     print(rendered)
     return 0 if report["passed"] else 1
 

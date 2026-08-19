@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import importlib
 import logging
 import math
 import random
@@ -23,16 +22,23 @@ from alloy_dataset_generator import (
     generate_initial_dataset_batch,
     sample_single_objective_design,
 )
-from figure4_experiment_config import OBJECTIVES, ExperimentConfig, ObjectiveSpec
-from figure4_fm_torch import fit_torch_fm, fm_to_qubo
+from figure4_experiment_config import (
+    FIGURE4_OBJECTIVE_NAMES,
+    FIGURE4_OBJECTIVES,
+    FIGURE4_SETTINGS,
+    Figure4ExperimentConfig,
+    Figure4Setting,
+    ObjectiveSpec,
+)
+from fm_torch import fit_torch_fm, fm_seed_block_size, fm_seed_plan, fm_to_qubo
 from figure4_outputs import (
+    SUMMARY_SCHEMA_VERSION,
     checkpoint_payload,
     figure4_output_layout,
     load_checkpoint,
     write_checkpoint,
-    write_json_atomic,
 )
-from figure4_qubo_math import (
+from qubo_math import (
     IterationEncoding,
     ONE_HOT_PENALTY_WEIGHT,
     QuboBuildResult,
@@ -45,16 +51,24 @@ from figure4_qubo_math import (
     validate_candidate_composition,
 )
 from figure4_setting_strategies import (
-    Figure4Setting,
     SettingStrategy,
     get_setting_strategy,
     validate_settings,
 )
-from experiment_runtime import SA_SEED_ITERATION_STRIDE, validate_seed_list
+from experiment_runtime import (
+    FIGURE4_REPLACEMENT_NAMESPACE,
+    FIGURE4_SEED_INDEX,
+    SEED_DERIVATION_SCHEME,
+    derive_bounded_seed,
+    derive_fm_seed_root,
+    derive_python_seed,
+    require_integer,
+    same_json_value,
+    validate_seed_schedule,
+    write_json_atomic,
+)
 
 
-TRAINING_REQUIRED_MODULES = ("torch", "optuna", "numpy", "scipy", "sklearn", "neal", "dimod")
-SUMMARY_SCHEMA_VERSION = 3
 TRAINING_BACKEND = "pytorch_fm_lbfgs"
 MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
 CandidateStatus = Literal["accepted", "duplicate_replacement"]
@@ -77,12 +91,35 @@ _QUBO_FLOAT_FIELDS = (
 )
 _DATASET_ROW_FIELDS = frozenset(CSV_FIELDNAMES)
 _DATASET_NUMERIC_FIELDS = tuple(name for name in CSV_FIELDNAMES if name not in {"sample_id", "seed"})
+FIGURE4_TRAJECTORY_COUNT = len(FIGURE4_OBJECTIVES) * len(FIGURE4_SETTINGS)
+FIGURE4_BOUNDED_STREAM_COUNT = 2
+FIGURE4_CGFM_STREAM_INDEX = 0
+FIGURE4_SA_STREAM_INDEX = 1
 
 
-def ensure_training_dependencies() -> None:
-    missing = [name for name in TRAINING_REQUIRED_MODULES if importlib.util.find_spec(name) is None]
-    if missing:
-        raise ImportError(f"Missing required dependencies: {', '.join(missing)}")
+def _trajectory_index(objective: ObjectiveSpec, setting: Figure4Setting) -> int:
+    try:
+        objective_index = FIGURE4_OBJECTIVE_NAMES.index(objective.name)
+        setting_index = FIGURE4_SETTINGS.index(setting)
+    except ValueError as exc:
+        raise ValueError(
+            f"Cannot derive Figure 4 trajectory seed for objective={objective.name!r}, setting={setting!r}"
+        ) from exc
+    return (objective_index * len(FIGURE4_SETTINGS)) + setting_index
+
+
+def _validate_seed_schedule(
+    seed_list: Sequence[int], config: Figure4ExperimentConfig
+) -> list[int]:
+    return validate_seed_schedule(
+        seed_list,
+        figure_index=FIGURE4_SEED_INDEX,
+        trajectory_count=FIGURE4_TRAJECTORY_COUNT,
+        iterations=config.iterations,
+        bounded_stream_count=FIGURE4_BOUNDED_STREAM_COUNT,
+        fm_model_count=1,
+        fm_seed_block_size=fm_seed_block_size(config.optuna_trials),
+    )
 
 
 @dataclass
@@ -157,6 +194,7 @@ class AggregatedTrajectory:
 @dataclass(frozen=True)
 class Figure4Summary:
     schema_version: int
+    seed_derivation: str
     training_backend: str
     config: Dict[str, Any]
     seed_list: List[int]
@@ -188,7 +226,7 @@ def discretize_row_for_figure4(row: Dict[str, Any], num_levels: int) -> Dict[str
     """把连续初始样本固化到当前 one-hot level 网格上，再重算真实物性。"""
 
     discrete_composition = prepare_discrete_composition(normalized_composition_from_row(row), num_levels)
-    return build_dataset_row(int(row["sample_id"]), int(row["seed"]), discrete_composition)
+    return build_dataset_row(row["sample_id"], row["seed"], discrete_composition)
 
 
 def discretize_rows_for_figure4(rows: Sequence[Dict[str, Any]], num_levels: int) -> List[Dict[str, Any]]:
@@ -225,7 +263,7 @@ def _is_json_number(value: Any) -> bool:
 
 
 def _state_from_checkpoint(payload: Dict[str, Any], checkpoint: Path) -> TrajectoryState:
-    """严格反序列化 schema v3 state，不为缺失字段提供默认值。"""
+    """严格反序列化 schema v4 state，不为缺失字段提供默认值。"""
 
     raw_state = payload["state"]
     expected_fields = {item.name for item in dataclass_fields(TrajectoryState)}
@@ -305,7 +343,7 @@ def _validate_trajectory_state(
     objective: ObjectiveSpec,
     setting: Figure4Setting,
     seed: int,
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
     checkpoint: Path,
 ) -> None:
     """验证恢复状态的行、曲线、计数和最后一轮 QUBO 元数据彼此一致。"""
@@ -417,6 +455,27 @@ def _validate_trajectory_state(
             "infeasible_sa_samples_skipped is inconsistent with completed iterations and feasible rank",
         )
 
+    trajectory_index = _trajectory_index(objective, setting)
+    expected_fm_root = derive_fm_seed_root(
+        seed,
+        trajectory_count=FIGURE4_TRAJECTORY_COUNT,
+        trajectory_index=trajectory_index,
+        iterations=config.iterations,
+        iteration=completed - 1,
+        model_count=1,
+        model_index=0,
+        figure_index=FIGURE4_SEED_INDEX,
+        block_size=fm_seed_block_size(config.optuna_trials),
+    )
+    expected_seed_plan = fm_seed_plan(expected_fm_root, config.optuna_trials)
+    if "seed_plan" not in state.fm_metadata:
+        raise _checkpoint_state_error(checkpoint, "fm_metadata is missing field 'seed_plan'")
+    if not same_json_value(state.fm_metadata["seed_plan"], expected_seed_plan):
+        raise _checkpoint_state_error(
+            checkpoint,
+            "fm_metadata.seed_plan does not match the derived latest-iteration FM schedule",
+        )
+
     stats = state.qubo_stats
     if stats is None:
         raise _checkpoint_state_error(checkpoint, "completed state must contain qubo_stats")
@@ -449,12 +508,9 @@ def _validate_trajectory_state(
         raise _checkpoint_state_error(checkpoint, "w_cgfm qubo_stats.system_scale must be zero")
 
 
-def _advance_replacement_rng(rng: random.Random, replacement_draws: int) -> None:
-    for _ in range(max(0, replacement_draws)):
-        sample_single_objective_design(rng)
-
-
-def _initial_state(initial_rows: Sequence[Dict[str, Any]], config: ExperimentConfig) -> TrajectoryState:
+def _initial_state(
+    initial_rows: Sequence[Dict[str, Any]], config: Figure4ExperimentConfig
+) -> TrajectoryState:
     return TrajectoryState(rows=discretize_rows_for_figure4(initial_rows, config.num_levels))
 
 
@@ -488,13 +544,45 @@ def _fit_and_solve_iteration(
     rows: Sequence[Dict[str, Any]],
     objective: ObjectiveSpec,
     strategy: SettingStrategy,
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
     seed: int,
     iteration: int,
 ) -> TrainingIterationResult:
     """完成单轮“当前数据集 -> FM -> QUBO -> SA 候选 bit vector”。"""
 
-    encoding = strategy.create_encoding(config.num_levels, seed + iteration)
+    trajectory_index = _trajectory_index(objective, strategy.name)
+    encoding_seed = derive_bounded_seed(
+        seed,
+        trajectory_count=FIGURE4_TRAJECTORY_COUNT,
+        trajectory_index=trajectory_index,
+        iterations=config.iterations,
+        iteration=iteration,
+        stream_count=FIGURE4_BOUNDED_STREAM_COUNT,
+        stream_index=FIGURE4_CGFM_STREAM_INDEX,
+        figure_index=FIGURE4_SEED_INDEX,
+    )
+    fm_seed_root = derive_fm_seed_root(
+        seed,
+        trajectory_count=FIGURE4_TRAJECTORY_COUNT,
+        trajectory_index=trajectory_index,
+        iterations=config.iterations,
+        iteration=iteration,
+        model_count=1,
+        model_index=0,
+        figure_index=FIGURE4_SEED_INDEX,
+        block_size=fm_seed_block_size(config.optuna_trials),
+    )
+    sa_seed = derive_bounded_seed(
+        seed,
+        trajectory_count=FIGURE4_TRAJECTORY_COUNT,
+        trajectory_index=trajectory_index,
+        iterations=config.iterations,
+        iteration=iteration,
+        stream_count=FIGURE4_BOUNDED_STREAM_COUNT,
+        stream_index=FIGURE4_SA_STREAM_INDEX,
+        figure_index=FIGURE4_SEED_INDEX,
+    )
+    encoding = strategy.create_encoding(config.num_levels, encoding_seed)
     features = strategy.encode_rows(rows, encoding)
     raw_targets = np.array([float(row[objective.name]) for row in rows], dtype=np.float64)
     # 所有 objective 都转换成最小化方向后再 z-score；QUBO/SA 后续也是最小化。
@@ -506,7 +594,7 @@ def _fit_and_solve_iteration(
         scaled_targets,
         optuna_trials=config.optuna_trials,
         device=config.device,
-        seed=seed + iteration,
+        seed=fm_seed_root,
     )
     fm_q, fm_bias = fm_to_qubo(model)
     qubo_result: QuboBuildResult = build_single_objective_qubo(
@@ -520,7 +608,7 @@ def _fit_and_solve_iteration(
         qubo_result.bias,
         reads=config.sa_reads,
         sweeps=config.sa_sweeps,
-        seed=seed + (iteration * SA_SEED_ITERATION_STRIDE),
+        seed=sa_seed,
     )
 
     def is_feasible(candidate_bits: np.ndarray) -> bool:
@@ -593,7 +681,7 @@ def _result_from_state(
     return TrajectoryResult(
         objective=objective.name,
         setting=setting,
-        seed=int(seed),
+        seed=require_integer("seed", seed, minimum=0),
         best_so_far=list(state.best_so_far),
         final_dataset_size=len(state.rows),
         training_backend=TRAINING_BACKEND,
@@ -613,15 +701,17 @@ def run_single_trajectory(
     initial_rows: Sequence[Dict[str, Any]],
     objective: ObjectiveSpec,
     seed: int,
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
     setting: Figure4Setting = "wo_cgfm",
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
 ) -> TrajectoryResult:
     """供 Figure 4 runner 和白盒测试使用的内部单 trajectory 编排函数。"""
 
+    normalized_seed = _validate_seed_schedule([seed], config)[0]
     strategy = get_setting_strategy(setting)
     selected_setting = strategy.name
+    trajectory_index = _trajectory_index(objective, selected_setting)
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
     if resume and checkpoint is not None and checkpoint.exists():
@@ -636,7 +726,7 @@ def run_single_trajectory(
         loaded_checkpoint = load_checkpoint(
             checkpoint,
             objective=objective,
-            seed=seed,
+            seed=normalized_seed,
             config=config,
             setting=selected_setting,
         )
@@ -645,7 +735,7 @@ def run_single_trajectory(
             state,
             objective=objective,
             setting=selected_setting,
-            seed=int(seed),
+            seed=normalized_seed,
             config=config,
             checkpoint=checkpoint,
         )
@@ -657,13 +747,14 @@ def run_single_trajectory(
                 seed,
                 state.completed_iterations,
             )
-            return _result_from_state(objective=objective, setting=selected_setting, seed=seed, state=state)
+            return _result_from_state(
+                objective=objective,
+                setting=selected_setting,
+                seed=normalized_seed,
+                state=state,
+            )
     else:
         state = _initial_state(initial_rows, config)
-
-    replacement_rng = random.Random(seed + 17)
-    # 恢复运行时跳过已消耗的 replacement 抽样，保证断点续跑和一次性运行一致。
-    _advance_replacement_rng(replacement_rng, state.random_replacement_draws)
 
     seen_compositions = {_row_composition_key(row) for row in state.rows}
     best_value = _current_best_value(state, objective)
@@ -678,12 +769,20 @@ def run_single_trajectory(
     )
 
     for iteration in range(state.completed_iterations, config.iterations):
+        replacement_rng = random.Random(
+            derive_python_seed(
+                FIGURE4_REPLACEMENT_NAMESPACE,
+                normalized_seed,
+                trajectory_index=trajectory_index,
+                iteration=iteration,
+            )
+        )
         iteration_result = _fit_and_solve_iteration(
             rows=state.rows,
             objective=objective,
             strategy=strategy,
             config=config,
-            seed=int(seed),
+            seed=normalized_seed,
             iteration=iteration,
         )
         state.fm_metadata = iteration_result.fm_metadata
@@ -699,7 +798,7 @@ def run_single_trajectory(
             encoding=iteration_result.encoding,
             strategy=strategy,
             sample_id=len(state.rows),
-            seed=int(seed),
+            seed=normalized_seed,
             replacement_rng=replacement_rng,
             num_levels=config.num_levels,
             seen_compositions=seen_compositions,
@@ -735,7 +834,7 @@ def run_single_trajectory(
                 checkpoint_payload(
                     objective=objective,
                     setting=selected_setting,
-                    seed=int(seed),
+                    seed=normalized_seed,
                     state=state,
                     config=config,
                 ),
@@ -749,7 +848,12 @@ def run_single_trajectory(
         state.completed_iterations,
         len(state.rows),
     )
-    return _result_from_state(objective=objective, setting=selected_setting, seed=seed, state=state)
+    return _result_from_state(
+        objective=objective,
+        setting=selected_setting,
+        seed=normalized_seed,
+        state=state,
+    )
 
 
 def aggregate_trajectory_results(results: Sequence[TrajectoryResult]) -> Dict[str, AggregatedTrajectory]:
@@ -781,16 +885,16 @@ def aggregate_trajectory_results(results: Sequence[TrajectoryResult]) -> Dict[st
 
 def run_figure4_experiment(
     seed_list: Sequence[int],
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
     output_dir: str | Path,
-    objectives: Sequence[ObjectiveSpec] = OBJECTIVES,
+    objectives: Sequence[ObjectiveSpec] = FIGURE4_OBJECTIVES,
     resume: bool = False,
-    settings: Sequence[Figure4Setting] = ("wo_cgfm",),
+    settings: Sequence[Figure4Setting] = FIGURE4_SETTINGS,
 ) -> Figure4Summary:
     """供 Figure 4 runner 和白盒测试使用的内部实验编排函数。"""
 
     selected_settings = validate_settings(settings)
-    selected_seeds = validate_seed_list(seed_list, iterations=config.iterations)
+    selected_seeds = _validate_seed_schedule(seed_list, config)
 
     output_layout = figure4_output_layout(output_dir)
     output_layout.root.mkdir(parents=True, exist_ok=True)
@@ -823,6 +927,7 @@ def run_figure4_experiment(
 
     summary = Figure4Summary(
         schema_version=SUMMARY_SCHEMA_VERSION,
+        seed_derivation=SEED_DERIVATION_SCHEME,
         training_backend=TRAINING_BACKEND,
         config=config.to_dict(),
         seed_list=selected_seeds,
@@ -843,5 +948,4 @@ __all__ = [
     "aggregate_trajectory_results",
     "discretize_row_for_figure4",
     "discretize_rows_for_figure4",
-    "ensure_training_dependencies",
 ]

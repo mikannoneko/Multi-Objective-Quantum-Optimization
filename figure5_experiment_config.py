@@ -1,15 +1,21 @@
-"""Figure 5 多目标实验规模和训练/求解配置。"""
+"""Figure 5 多目标实验规模、preset seed 数和训练/求解配置。"""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
-from figure4_experiment_config import EncodingConfig, FMConfig, SAConfig, _require_positive
+from experiment_config import EncodingConfig, FMConfig, SAConfig
+from experiment_runtime import require_integer
 
 
 Figure5RunScale = Literal["paper", "quick", "test"]
 SUPPORTED_PRESETS: tuple[Figure5RunScale, ...] = ("paper", "quick", "test")
+FIGURE5_PRESET_NUM_SEEDS: dict[Figure5RunScale, int] = {
+    "paper": 1,
+    "quick": 1,
+    "test": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -27,8 +33,12 @@ class Figure5ExperimentConfig:
     sa: SAConfig = field(default_factory=SAConfig)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "num_samples", _require_positive("num_samples", self.num_samples))
-        object.__setattr__(self, "iterations", _require_positive("iterations", self.iterations))
+        object.__setattr__(
+            self, "num_samples", require_integer("num_samples", self.num_samples, minimum=1)
+        )
+        object.__setattr__(
+            self, "iterations", require_integer("iterations", self.iterations, minimum=1)
+        )
 
     @property
     def num_levels(self) -> int:
@@ -114,6 +124,7 @@ def resolve_experiment_config(
 
 
 __all__ = [
+    "FIGURE5_PRESET_NUM_SEEDS",
     "Figure5ExperimentConfig",
     "Figure5RunScale",
     "SUPPORTED_PRESETS",

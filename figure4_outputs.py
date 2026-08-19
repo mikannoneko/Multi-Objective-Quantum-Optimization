@@ -2,30 +2,39 @@
 
 from __future__ import annotations
 
-import json
-import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING, Protocol
 
+from experiment_runtime import (
+    NEAL_SEED_MAX,
+    SEED_DERIVATION_SCHEME,
+    load_json_object,
+    require_integer,
+    same_json_value,
+    write_json_atomic,
+)
+
 if TYPE_CHECKING:
-    from figure4_experiment_config import ExperimentConfig
-    from figure4_setting_strategies import Figure4Setting
+    from figure4_experiment_config import Figure4ExperimentConfig, Figure4Setting
 else:
-    ExperimentConfig = Any
+    Figure4ExperimentConfig = Any
     Figure4Setting = str
 
 
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 5
+SUMMARY_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 1
 SUMMARY_FILENAME = "figure4_summary.json"
-MANIFEST_FILENAME = "manifest.json"
+MANIFEST_FILENAME = "figure4_manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure4.png"
 LOG_DIR_NAME = "logs"
 RUNNER_LOG_FILENAME = "figure4_runner.log"
 PLOT_LOG_FILENAME = "plot_figure4.log"
 CHECKPOINT_DIR_NAME = "trajectories"
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
-_CHECKPOINT_FIELDS = frozenset({"schema_version", "objective", "setting", "seed", "config", "state"})
+_CHECKPOINT_FIELDS = frozenset(
+    {"schema_version", "seed_derivation", "objective", "setting", "seed", "config", "state"}
+)
 
 
 class ObjectiveLike(Protocol):
@@ -78,7 +87,8 @@ def figure4_output_layout(output_dir: str | Path) -> Figure4OutputLayout:
 
 
 def checkpoint_filename(setting: Figure4Setting, objective_name: str, seed: int) -> str:
-    return f"{setting}_{objective_name}_seed_{int(seed)}.json"
+    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
+    return f"{setting}_{objective_name}_seed_{normalized_seed}.json"
 
 
 def checkpoint_payload(
@@ -87,55 +97,29 @@ def checkpoint_payload(
     setting: Figure4Setting,
     seed: int,
     state: object,
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
 ) -> dict[str, Any]:
-    """构造 schema v3 checkpoint payload。
+    """构造绑定 mixed-radix seed 方案的 checkpoint payload。
 
     checkpoint 绑定 objective、setting、seed 和 config；恢复时这些字段必须一致。
     """
 
+    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
     return {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "seed_derivation": SEED_DERIVATION_SCHEME,
         "objective": objective.name,
         "setting": setting,
-        "seed": int(seed),
+        "seed": normalized_seed,
         "config": config.to_dict(),
         "state": asdict(state),
     }
 
 
-def write_json_atomic(path: str | Path, payload: dict[str, Any]) -> Path:
-    """原子写入 JSON，避免中断时留下半截文件。"""
-
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f"{output_path.name}.tmp")
-    temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temporary_path.replace(output_path)
-    return output_path
-
-
 def write_checkpoint(path: str | Path, payload: dict[str, Any]) -> Path:
-    """原子写入 checkpoint。"""
+    """原子写入紧凑 checkpoint。"""
 
-    return write_json_atomic(path, payload)
-
-
-def _same_json_value(actual: Any, expected: Any) -> bool:
-    """比较 JSON 值，同时保留 bool/int 等类型差异。"""
-
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            _same_json_value(actual[key], expected[key]) for key in expected
-        )
-    if isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            _same_json_value(actual_item, expected_item)
-            for actual_item, expected_item in zip(actual, expected)
-        )
-    return bool(actual == expected)
+    return write_json_atomic(path, payload, indent=None)
 
 
 def _checkpoint_error(checkpoint: Path, detail: str) -> ValueError:
@@ -147,19 +131,14 @@ def load_checkpoint(
     *,
     objective: ObjectiveLike,
     seed: int,
-    config: ExperimentConfig,
+    config: Figure4ExperimentConfig,
     setting: Figure4Setting,
 ) -> dict[str, Any]:
     """读取 checkpoint，并校验外层 schema、类型和 trajectory 身份。"""
 
     checkpoint = Path(path)
-    try:
-        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise _checkpoint_error(checkpoint, f"cannot read valid JSON ({exc})") from exc
-
-    if not isinstance(payload, dict):
-        raise _checkpoint_error(checkpoint, "root must be a JSON object")
+    requested_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
+    payload = load_json_object(checkpoint, document_name="checkpoint")
 
     missing_fields = sorted(_CHECKPOINT_FIELDS - payload.keys())
     if missing_fields:
@@ -174,6 +153,15 @@ def load_checkpoint(
             f"unsupported schema_version {schema_version!r}; expected {CHECKPOINT_SCHEMA_VERSION}",
         )
 
+    seed_derivation = payload["seed_derivation"]
+    if type(seed_derivation) is not str:
+        raise _checkpoint_error(checkpoint, "field 'seed_derivation' must be a string")
+    if seed_derivation != SEED_DERIVATION_SCHEME:
+        raise _checkpoint_error(
+            checkpoint,
+            f"unsupported seed_derivation {seed_derivation!r}; expected {SEED_DERIVATION_SCHEME!r}",
+        )
+
     checkpoint_objective = payload["objective"]
     checkpoint_setting = payload["setting"]
     checkpoint_seed = payload["seed"]
@@ -183,18 +171,20 @@ def load_checkpoint(
         raise _checkpoint_error(checkpoint, "field 'setting' must be a string")
     if type(checkpoint_seed) is not int:
         raise _checkpoint_error(checkpoint, "field 'seed' must be an integer")
-    if checkpoint_objective != objective.name or checkpoint_seed != int(seed):
-        raise _checkpoint_error(checkpoint, "objective/seed metadata does not match the requested trajectory")
+    if checkpoint_objective != objective.name:
+        raise _checkpoint_error(checkpoint, f"objective metadata does not match {objective.name!r}")
+    if checkpoint_seed != requested_seed:
+        raise _checkpoint_error(checkpoint, f"seed metadata does not match {requested_seed!r}")
     if checkpoint_setting != setting:
         raise _checkpoint_error(checkpoint, f"setting metadata does not match {setting!r}")
 
     checkpoint_config = payload["config"]
     if not isinstance(checkpoint_config, dict):
         raise _checkpoint_error(checkpoint, "field 'config' must be a JSON object")
-    if not _same_json_value(checkpoint_config, config.to_dict()):
+    if not same_json_value(checkpoint_config, config.to_dict()):
         raise _checkpoint_error(
             checkpoint,
-            "config does not match the current run; use a separate output directory for different settings",
+            "config does not match the current run; use a separate output directory for a different configuration",
         )
     if not isinstance(payload["state"], dict):
         raise _checkpoint_error(checkpoint, "field 'state' must be a JSON object")
@@ -202,24 +192,21 @@ def load_checkpoint(
 
 
 def load_summary(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return load_json_object(path, document_name="Figure 4 summary")
 
 
-def configure_file_logging_path(log_path: str | Path) -> Path:
-    """为 runner/plot 配置单个文件日志 handler。"""
-
-    output_path = Path(log_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    for handler in list(root_logger.handlers):
-        if getattr(handler, "_figure4_handler", False):
-            root_logger.removeHandler(handler)
-            handler.close()
-
-    file_handler = logging.FileHandler(output_path, encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    file_handler._figure4_handler = True  # type: ignore[attr-defined]
-    root_logger.addHandler(file_handler)
-    return output_path
+__all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
+    "DEFAULT_FIGURE_FILENAME",
+    "Figure4OutputLayout",
+    "MANIFEST_FILENAME",
+    "MANIFEST_SCHEMA_VERSION",
+    "SUMMARY_FILENAME",
+    "SUMMARY_SCHEMA_VERSION",
+    "checkpoint_filename",
+    "checkpoint_payload",
+    "figure4_output_layout",
+    "load_checkpoint",
+    "load_summary",
+    "write_checkpoint",
+]

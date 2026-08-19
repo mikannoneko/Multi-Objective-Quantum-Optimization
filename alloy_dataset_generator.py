@@ -7,11 +7,18 @@ import math
 import random
 import statistics
 from dataclasses import dataclass
-from numbers import Integral, Real
+from numbers import Real
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-from experiment_runtime import validate_seed_list
+from experiment_runtime import (
+    FIGURE4_INITIAL_NAMESPACE,
+    FIGURE5_INITIAL_NAMESPACE,
+    derive_python_seed,
+    require_integer,
+    validate_seed_list,
+    write_json_atomic,
+)
 
 
 AL_MATRIX_VOLUME_FRACTION = 0.8
@@ -75,15 +82,6 @@ DELTA_T_N1 = 85.7
 DELTA_T_M2 = 1388.9
 DELTA_T_N2 = 177.8
 EUTECTIC_SI_VOLUME_FRACTION = 0.128
-
-
-def _validate_integer(name: str, value: int, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer")
-    normalized = int(value)
-    if normalized < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return normalized
 
 
 def _validated_fraction_vector(
@@ -258,13 +256,8 @@ def compute_properties(volume_fractions: Sequence[float]) -> Dict[str, float]:
     }
 
 
-def compute_properties_from_normalized_composition(normalized_fractions: Sequence[float]) -> Dict[str, float]:
-    volume_fractions = normalized_to_volume_fractions(normalized_fractions)
-    return compute_properties(volume_fractions)
-
-
 def build_dataset_row(sample_id: int, seed: int, normalized_fractions: Sequence[float]) -> Dict[str, float | int]:
-    sample_id = _validate_integer("sample_id", sample_id)
+    sample_id = require_integer("sample_id", sample_id, minimum=0)
     seed = _validate_seed(seed)
     normalized_fractions = _validated_fraction_vector(
         normalized_fractions,
@@ -344,9 +337,9 @@ def generate_initial_dataset_single_objective(
     output_path: str | Path | None = None,
 ) -> Tuple[List[Dict[str, float | int]], Dict[str, object]]:
     seed = _validate_seed(seed)
-    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
+    num_samples = require_integer("num_samples", num_samples, minimum=1)
 
-    rng = random.Random(seed)
+    rng = random.Random(derive_python_seed(FIGURE4_INITIAL_NAMESPACE, seed))
     rows = [
         build_dataset_row(index, seed, sample_single_objective_design(rng))
         for index in range(num_samples)
@@ -365,9 +358,9 @@ def generate_initial_dataset_multi_objective(
     output_path: str | Path | None = None,
 ) -> Tuple[List[Dict[str, float | int]], Dict[str, object]]:
     seed = _validate_seed(seed)
-    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
+    num_samples = require_integer("num_samples", num_samples, minimum=1)
 
-    rng = random.Random(seed)
+    rng = random.Random(derive_python_seed(FIGURE5_INITIAL_NAMESPACE, seed))
     rows = [
         build_dataset_row(index, seed, sample_multi_objective_design(rng))
         for index in range(num_samples)
@@ -385,7 +378,7 @@ def generate_initial_dataset_batch(
     num_samples: int = DEFAULT_NUM_SAMPLES,
 ) -> Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]]:
     normalized_seeds = validate_seed_list(seed_list)
-    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
+    num_samples = require_integer("num_samples", num_samples, minimum=1)
     datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
     for seed in normalized_seeds:
         datasets[seed] = generate_initial_dataset_single_objective(num_samples=num_samples, seed=seed)
@@ -397,7 +390,7 @@ def generate_initial_dataset_multi_objective_batch(
     num_samples: int = DEFAULT_MULTI_OBJECTIVE_NUM_SAMPLES,
 ) -> Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]]:
     normalized_seeds = validate_seed_list(seed_list)
-    num_samples = _validate_integer("num_samples", num_samples, minimum=1)
+    num_samples = require_integer("num_samples", num_samples, minimum=1)
     datasets: Dict[int, Tuple[List[Dict[str, float | int]], Dict[str, object]]] = {}
     for seed in normalized_seeds:
         datasets[seed] = generate_initial_dataset_multi_objective(num_samples=num_samples, seed=seed)
@@ -405,7 +398,7 @@ def generate_initial_dataset_multi_objective_batch(
 
 
 def _default_output_path(seed: int) -> Path:
-    return Path(f"initial_dataset_single_objective_seed_{seed}.csv")
+    return Path(f"initial_dataset_single_objective_seed_{_validate_seed(seed)}.csv")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -436,8 +429,7 @@ def main() -> None:
         output_path=output_path,
     )
     if args.stats_json is not None:
-        args.stats_json.parent.mkdir(parents=True, exist_ok=True)
-        args.stats_json.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        write_json_atomic(args.stats_json, stats)
     print(json.dumps({"output_csv": str(output_path), "stats": stats}, indent=2))
 
 

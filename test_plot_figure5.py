@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import plot_figure5 as plot_module
+from experiment_runtime import SEED_DERIVATION_SCHEME
 from figure5_outputs import figure5_output_layout
 from figure5_pareto import pareto_front
 from plot_figure5 import (
@@ -122,7 +123,8 @@ def _summary(
         for setting in settings
     ]
     return {
-        "schema_version": 3,
+        "schema_version": 4,
+        "seed_derivation": SEED_DERIVATION_SCHEME,
         "training_backend": "pytorch_fm_lbfgs",
         "config": {"iterations": iterations},
         "seed_list": seeds,

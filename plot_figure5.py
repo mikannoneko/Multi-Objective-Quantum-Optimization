@@ -15,13 +15,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from figure5_outputs import configure_file_logging_path, figure5_output_layout, load_summary
+from experiment_runtime import SEED_DERIVATION_SCHEME, configure_file_logging_path
+from figure5_outputs import SUMMARY_SCHEMA_VERSION, figure5_output_layout, load_summary
 from figure5_pareto import pareto_front
-from figure5_scalarization import FIGURE5_OBJECTIVES
+from figure5_scalarization import (
+    FIGURE5_OBJECTIVES,
+    FIGURE5_SETTINGS,
+)
 
 
-SUMMARY_SCHEMA_VERSION = 3
-FIGURE5_SETTINGS = ("w_ddts", "wo_ddts")
 FIGURE5_AXIS_OBJECTIVES = ("kappa", "rho", "E")
 SETTING_LABELS = {"w_ddts": "w/ DDTS", "wo_ddts": "w/o DDTS"}
 ALL_SOLUTION_COLOR = "#858b94"
@@ -49,7 +51,7 @@ def _strict_int(value: Any, context: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot the Figure 5 multi-objective reproduction summary.")
-    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v3 JSON file.")
+    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v4 JSON file.")
     parser.add_argument("--output", type=Path, required=True, help="Output PNG path.")
     parser.add_argument(
         "--seed",
@@ -192,6 +194,10 @@ def load_figure5_plot_data(summary_path: str | Path, seed: int | None = None) ->
     if summary.get("schema_version") != SUMMARY_SCHEMA_VERSION:
         raise ValueError(
             f"Unsupported Figure 5 summary schema; expected schema_version {SUMMARY_SCHEMA_VERSION}"
+        )
+    if summary.get("seed_derivation") != SEED_DERIVATION_SCHEME:
+        raise ValueError(
+            f"Unsupported Figure 5 seed_derivation; expected {SEED_DERIVATION_SCHEME!r}"
         )
     if tuple(summary.get("objectives", ())) != FIGURE5_OBJECTIVES:
         raise ValueError(f"Figure 5 objectives must be {FIGURE5_OBJECTIVES}")

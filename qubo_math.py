@@ -1,16 +1,15 @@
-"""Figure 4 的离散编码、CGFM 映射、QUBO 约束和 SA 求解工具。"""
+"""Shared discrete encoding, CGFM mapping, QUBO constraints, and SA tools."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from numbers import Integral
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import dimod
 import numpy as np
 from neal import SimulatedAnnealingSampler
 
-from experiment_runtime import NEAL_SEED_MAX
+from experiment_runtime import NEAL_SEED_MAX, require_integer
 
 
 SYSTEM_PENALTY_WEIGHT = 650.0
@@ -90,11 +89,7 @@ class FeasibleSASolution:
 
 
 def get_positive_level_values(num_levels: int) -> np.ndarray:
-    if isinstance(num_levels, bool) or not isinstance(num_levels, Integral):
-        raise ValueError("num_levels must be an integer")
-    num_levels = int(num_levels)
-    if num_levels <= 1:
-        raise ValueError("num_levels must be greater than 1")
+    num_levels = require_integer("num_levels", num_levels, minimum=2)
     return np.arange(1, num_levels + 1, dtype=np.int64)
 
 
@@ -104,11 +99,7 @@ def _create_fixed_one_hot_encoding(
     value_scale: float,
     phase_permutation: Optional[np.ndarray],
 ) -> IterationEncoding:
-    if isinstance(num_blocks, bool) or not isinstance(num_blocks, Integral):
-        raise ValueError("num_blocks must be an integer")
-    num_blocks = int(num_blocks)
-    if num_blocks <= 0:
-        raise ValueError("num_blocks must be positive")
+    num_blocks = require_integer("num_blocks", num_blocks, minimum=1)
 
     counts = get_positive_level_values(num_levels)
     num_levels = int(num_levels)
@@ -136,11 +127,7 @@ def create_iteration_encoding(num_levels: int, num_blocks: int = 4) -> Iteration
 def create_cgfm_iteration_encoding(num_levels: int, seed: int) -> IterationEncoding:
     """创建 CGFM 编码；seed 只随机化 S7/S8 中的相变量分配。"""
 
-    if isinstance(seed, bool) or not isinstance(seed, Integral):
-        raise ValueError("seed must be an integer")
-    seed = int(seed)
-    if not 0 <= seed <= NEAL_SEED_MAX:
-        raise ValueError(f"seed must be between 0 and {NEAL_SEED_MAX}")
+    seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
     rng = np.random.default_rng(seed)
     phase_permutation = rng.permutation(4)
     return _create_fixed_one_hot_encoding(
@@ -515,21 +502,9 @@ def solve_qubo_with_sa(
     feasible state without replacing an optimization result with random data.
     """
 
-    if isinstance(reads, bool) or not isinstance(reads, Integral):
-        raise ValueError("reads must be an integer")
-    if isinstance(sweeps, bool) or not isinstance(sweeps, Integral):
-        raise ValueError("sweeps must be an integer")
-    if isinstance(seed, bool) or not isinstance(seed, Integral):
-        raise ValueError("seed must be an integer")
-    reads = int(reads)
-    sweeps = int(sweeps)
-    seed = int(seed)
-    if reads <= 0:
-        raise ValueError("reads must be positive")
-    if sweeps <= 0:
-        raise ValueError("sweeps must be positive")
-    if not 0 <= seed <= NEAL_SEED_MAX:
-        raise ValueError(f"seed must be between 0 and {NEAL_SEED_MAX}")
+    reads = require_integer("reads", reads, minimum=1)
+    sweeps = require_integer("sweeps", sweeps, minimum=1)
+    seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
     bqm = _qubo_to_bqm(q, bias)
     sampler = SimulatedAnnealingSampler()
     sample_set = sampler.sample(bqm, num_reads=reads, num_sweeps=sweeps, seed=seed)
@@ -569,3 +544,40 @@ def select_lowest_energy_feasible_sample(
     raise RuntimeError(
         f"No feasible QUBO candidate found among {sampling.num_samples} simulated-annealing reads"
     )
+
+
+__all__ = [
+    "CGFM_ANGLE_MAX",
+    "DEFAULT_TOLERANCE",
+    "FeasibleSASolution",
+    "IterationEncoding",
+    "ONE_HOT_PENALTY_WEIGHT",
+    "QuboBuildResult",
+    "QuboStats",
+    "SASample",
+    "SASamplingResult",
+    "SYSTEM_PENALTY_WEIGHT",
+    "build_one_hot_penalty_matrix",
+    "build_single_objective_qubo",
+    "build_system_penalty_matrix",
+    "cgfm_angles_to_composition",
+    "cgfm_composition_to_angles",
+    "counts_to_composition",
+    "create_cgfm_iteration_encoding",
+    "create_iteration_encoding",
+    "cure_discrete_counts",
+    "decode_candidate_bits_to_cgfm_composition",
+    "decode_candidate_bits_to_composition",
+    "decode_candidate_bits_to_values",
+    "encode_cgfm_rows",
+    "encode_discrete_composition",
+    "encode_discrete_values",
+    "encode_single_objective_rows",
+    "evaluate_qubo_energy",
+    "get_positive_level_values",
+    "normalize_qubo_term",
+    "prepare_discrete_composition",
+    "select_lowest_energy_feasible_sample",
+    "solve_qubo_with_sa",
+    "validate_candidate_composition",
+]

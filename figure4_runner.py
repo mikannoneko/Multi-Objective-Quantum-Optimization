@@ -14,35 +14,38 @@ from pathlib import Path
 from typing import Sequence
 
 from figure4_experiment_config import (
-    OBJECTIVES,
+    FIGURE4_OBJECTIVE_NAMES,
+    FIGURE4_OBJECTIVES,
+    FIGURE4_PRESET_NUM_SEEDS,
+    FIGURE4_SETTINGS,
     SUPPORTED_PRESETS,
-    ExperimentConfig,
+    Figure4ExperimentConfig,
     ObjectiveSpec,
-    RunScale,
     resolve_experiment_config,
 )
+from fm_torch import fm_seed_block_size
 from figure4_outputs import (
     Figure4OutputLayout,
-    configure_file_logging_path,
+    MANIFEST_SCHEMA_VERSION,
     figure4_output_layout,
-    write_json_atomic,
 )
-from figure4_pipeline import ensure_training_dependencies, run_figure4_experiment
-from figure4_setting_strategies import SUPPORTED_SETTINGS, validate_settings
+from figure4_pipeline import run_figure4_experiment
+from figure4_setting_strategies import validate_settings
 from experiment_runtime import (
+    FIGURE4_SEED_INDEX,
+    SEED_DERIVATION_SCHEME,
+    TRAINING_REQUIRED_MODULES,
     collect_runtime_metadata,
+    configure_file_logging_path,
     ensure_compute_device_available,
+    ensure_training_dependencies,
     resolve_contiguous_seeds,
-    validate_seed_list,
+    validate_seed_schedule,
+    write_json_atomic,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-PRESET_NUM_SEEDS: dict[RunScale, int] = {
-    "paper": 20,
-    "quick": 3,
-    "test": 1,
-}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -75,28 +78,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--settings",
         nargs="+",
         required=True,
-        choices=SUPPORTED_SETTINGS,
-        help="Figure 4 settings to run. Choices: wo_cgfm w_cgfm",
+        choices=FIGURE4_SETTINGS,
+        help=f"Figure 4 settings to run. Choices: {' '.join(FIGURE4_SETTINGS)}",
     )
     parser.add_argument(
         "--objectives",
         nargs="*",
         default=None,
-        help="Optional subset of objectives to run. Choices: kappa E rho delta_alpha delta_T",
+        help=f"Optional subset of objectives to run. Choices: {' '.join(FIGURE4_OBJECTIVE_NAMES)}",
     )
     return parser.parse_args(argv)
 
 
 def _selected_objectives(requested_names: list[str] | None) -> tuple[ObjectiveSpec, ...]:
-    """按 canonical `OBJECTIVES` 顺序筛选 CLI 请求的 objective 子集。"""
+    """按 canonical `FIGURE4_OBJECTIVES` 顺序筛选 CLI 请求的 objective 子集。"""
 
     if not requested_names:
-        return OBJECTIVES
+        return FIGURE4_OBJECTIVES
     requested = set(requested_names)
-    selected = tuple(objective for objective in OBJECTIVES if objective.name in requested)
+    selected = tuple(objective for objective in FIGURE4_OBJECTIVES if objective.name in requested)
     if not selected:
         raise ValueError("No valid objectives selected.")
-    unknown = requested - {objective.name for objective in OBJECTIVES}
+    unknown = requested - set(FIGURE4_OBJECTIVE_NAMES)
     if unknown:
         raise ValueError(f"Unknown objectives: {', '.join(sorted(unknown))}")
     return selected
@@ -106,7 +109,7 @@ def _write_manifest(
     *,
     output_layout: Figure4OutputLayout,
     args: argparse.Namespace,
-    resolved_config: ExperimentConfig,
+    resolved_config: Figure4ExperimentConfig,
     seed_list: list[int],
     objective_names: list[str],
     settings: list[str],
@@ -115,6 +118,9 @@ def _write_manifest(
 
     workspace_root = Path(__file__).resolve().parent
     manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "figure": 4,
+        "seed_derivation": SEED_DERIVATION_SCHEME,
         "command": [sys.executable, *sys.argv],
         "preset": args.preset,
         "runtime": collect_runtime_metadata(workspace_root, "references/paper_2512_11479.pdf"),
@@ -139,11 +145,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     """解析命令行并启动 Figure 4 实验。"""
 
     args = parse_args(argv)
-    output_layout = figure4_output_layout(args.output_dir)
-    log_path = configure_file_logging_path(output_layout.runner_log_path)
-    LOGGER.info("Starting Figure 4 runner")
-    LOGGER.info("Command: %s", " ".join(sys.argv))
-    ensure_training_dependencies()
     selected_objectives = _selected_objectives(args.objectives)
     selected_settings = validate_settings(args.settings)
     config = resolve_experiment_config(
@@ -156,11 +157,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         sa_reads=args.sa_reads,
         sa_sweeps=args.sa_sweeps,
     )
+    ensure_training_dependencies(TRAINING_REQUIRED_MODULES)
     ensure_compute_device_available(config.device)
-    seed_list = validate_seed_list(
-        resolve_contiguous_seeds(PRESET_NUM_SEEDS[args.preset], args.num_seeds, args.seed_start),
+    seed_list = validate_seed_schedule(
+        resolve_contiguous_seeds(
+            FIGURE4_PRESET_NUM_SEEDS[args.preset], args.num_seeds, args.seed_start
+        ),
+        figure_index=FIGURE4_SEED_INDEX,
+        trajectory_count=len(FIGURE4_OBJECTIVES) * len(FIGURE4_SETTINGS),
         iterations=config.iterations,
+        bounded_stream_count=2,
+        fm_model_count=1,
+        fm_seed_block_size=fm_seed_block_size(config.optuna_trials),
     )
+    output_layout = figure4_output_layout(args.output_dir)
+    log_path = configure_file_logging_path(output_layout.runner_log_path)
+    LOGGER.info("Starting Figure 4 runner")
+    LOGGER.info("Command: %s", " ".join(sys.argv))
     LOGGER.info("Resolved config: %s", json.dumps(config.to_dict(), sort_keys=True))
     LOGGER.info(
         "Run selection: preset=%s seeds=%s objectives=%s settings=%s resume=%s",
@@ -206,3 +219,6 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = ["main", "parse_args"]
