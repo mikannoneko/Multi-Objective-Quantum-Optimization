@@ -13,7 +13,6 @@ import figure5_runner
 import figure5_scalarization
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_multi_objective
 from experiment_config import EncodingConfig, FMConfig, SAConfig
-from fm_torch import fm_seed_block_size, fm_seed_plan
 from qubo_math import (
     QuboStats,
     SASample,
@@ -35,12 +34,19 @@ from figure5_outputs import (
     load_checkpoint,
     write_checkpoint,
 )
-from figure5_scalarization import FIGURE5_OBJECTIVES, FIGURE5_SETTINGS, validate_settings
+from figure5_scalarization import (
+    FIGURE5_OBJECTIVES,
+    FIGURE5_SETTINGS,
+    preference_weights_for_iteration,
+    validate_settings,
+)
 from experiment_runtime import (
     FIGURE5_REPLACEMENT_NAMESPACE,
     FIGURE5_SEED_INDEX,
     derive_fm_seed_root,
     derive_python_seed,
+    fm_seed_block_size,
+    fm_seed_plan,
     resolve_contiguous_seeds,
 )
 from figure5_pipeline import (
@@ -48,7 +54,6 @@ from figure5_pipeline import (
     IterationRecord,
     SolutionPoint,
     TrainingIterationResult,
-    preference_weights_for_iteration,
     run_figure5_experiment,
     run_single_trajectory,
 )
@@ -421,6 +426,7 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual(summary.pareto_fronts[1].solutions[0]["seed"], 1)
 
     def test_preference_weights_are_shared_and_deterministic(self) -> None:
+        self.assertFalse(hasattr(pipeline, "preference_weights_for_iteration"))
         weights_a = preference_weights_for_iteration(seed=4, iteration=7)
         weights_b = preference_weights_for_iteration(seed=4, iteration=7)
         weights_c = preference_weights_for_iteration(seed=4, iteration=8)

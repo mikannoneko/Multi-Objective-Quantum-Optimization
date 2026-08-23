@@ -18,7 +18,6 @@ from figure5_experiment_config import (
     Figure5ExperimentConfig,
     resolve_experiment_config,
 )
-from fm_torch import fm_seed_block_size
 from figure5_outputs import Figure5OutputLayout, MANIFEST_SCHEMA_VERSION, figure5_output_layout
 from figure5_pipeline import (
     run_figure5_experiment,
@@ -36,6 +35,7 @@ from experiment_runtime import (
     configure_file_logging_path,
     ensure_compute_device_available,
     ensure_training_dependencies,
+    fm_seed_block_size,
     resolve_contiguous_seeds,
     validate_seed_schedule,
     write_json_atomic,

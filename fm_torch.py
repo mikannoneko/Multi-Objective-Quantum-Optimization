@@ -12,42 +12,19 @@ from torch import nn
 
 import optuna
 
-from experiment_runtime import NUMPY_SEED_MAX, require_integer
+from experiment_runtime import (
+    FM_FACTORIZATION_RANK,
+    NUMPY_SEED_MAX,
+    fm_seed_plan as _fm_seed_plan,
+    require_integer,
+)
 
 
-FM_FACTORIZATION_RANK = 6
 FM_MAX_STEPS = 2000
 FM_LBFGS_LR = 1.0
 TRAIN_RATIO = 0.8
 VALIDATION_RATIO = 0.1
 TEST_RATIO = 0.1
-
-
-def fm_seed_block_size(optuna_trials: int) -> int:
-    """Return the fixed-width seed block reserved for one FM fit."""
-
-    return require_integer("optuna_trials", optuna_trials, minimum=0) + 4
-
-
-def fm_seed_plan(seed_root: int, optuna_trials: int) -> dict[str, Any]:
-    """Allocate split, sampler, trial, and final-fit seeds inside one block."""
-
-    trial_count = require_integer("optuna_trials", optuna_trials, minimum=0)
-    block_size = fm_seed_block_size(trial_count)
-    root = require_integer(
-        "seed",
-        seed_root,
-        minimum=0,
-        maximum=NUMPY_SEED_MAX - block_size + 1,
-    )
-    return {
-        "root": root,
-        "block_size": block_size,
-        "split": [root, root + 1],
-        "tuner": root + 2,
-        "trials": list(range(root + 3, root + 3 + trial_count)),
-        "final_fit": root + 3 + trial_count,
-    }
 
 
 @dataclass(frozen=True)
@@ -223,7 +200,7 @@ def tune_fm_hparams(
     """只选择并返回 FM 超参数；最终模型由调用方训练一次。"""
 
     optuna_trials = require_integer("optuna_trials", optuna_trials, minimum=0)
-    seed_plan = fm_seed_plan(seed, optuna_trials)
+    seed_plan = _fm_seed_plan(seed, optuna_trials)
     default_hparams = FMHyperParams(
         init_std=0.05,
         l2_reg_w=1e-4,
@@ -269,7 +246,7 @@ def fit_torch_fm(
     """训练当前迭代的 FM，并返回可写入 checkpoint/summary 的训练 metadata。"""
 
     optuna_trials = require_integer("optuna_trials", optuna_trials, minimum=0)
-    seed_plan = fm_seed_plan(seed, optuna_trials)
+    seed_plan = _fm_seed_plan(seed, optuna_trials)
     split_data = split_train_validation_test(x, y, seed_plan["root"])
     best_hparams = tune_fm_hparams(
         split_data,
@@ -310,8 +287,6 @@ __all__ = [
     "NUMPY_SEED_MAX",
     "TorchFMRegressor",
     "fit_torch_fm",
-    "fm_seed_block_size",
-    "fm_seed_plan",
     "fm_to_qubo",
     "split_train_validation_test",
     "tune_fm_hparams",

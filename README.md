@@ -10,7 +10,7 @@
 - `test`：单元测试和端到端烟测，只确认最短代码路径可运行。
 - `paper`：论文参数的参考配置；可以显式运行，但不属于本项目验收边界，验收器不会接受 paper-scale summary。
 - canonical 小规模输出目录统一命名为 `figure4_quick`、`figure5_quick`。
-- `validate_reproduction.py` 只验收 canonical `quick` 规模、轨迹完整性、输出结构和候选计数一致性。
+- `validate_reproduction.py` 按“严格契约解析 → Figure 自洽重建 → 非阻断 diagnostics → JSON-safe report”四层验收 canonical `quick`；它不重新训练 FM、不重建 QUBO，也不运行 SA。
 - Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
 论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。这是工程替代，因此结果只能称为“小规模流程复现”。
@@ -49,7 +49,7 @@ Figure 4 和 Figure 5 共用 `qubo_math.py` 中的退火求解逻辑：
 
 summary 会记录 `infeasible_sa_samples_skipped`、`max_feasible_candidate_rank`、`duplicate_replacements`、`random_replacements` 和 `random_replacement_draws`。旧版 `invalid_replacement` 路径已移除。
 
-命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device、依赖、seed schedule、严格整数、原子 JSON、文件日志和 manifest 运行环境元数据。所有整数配置接受 Python/NumPy 整数并规范化为 Python `int`，但不把 `bool`、浮点数或字符串静默转换成整数。
+命名统一使用 D-Wave 的 `reads` 术语：配置字段为 `SAConfig.reads`，CLI 首选 `--sa-reads`；`--sa-runs` 只保留为兼容别名。`experiment_runtime.py` 统一负责 device、依赖、seed schedule、FM seed plan、训练后端名、replacement 尝试上限、严格整数、原子 JSON、文件日志和 manifest 运行环境元数据。所有整数配置接受 Python/NumPy 整数并规范化为 Python `int`，但运行后 JSON 验收只接受非 bool 的原生 JSON integer；两者都不把浮点数或字符串静默转换成整数。
 
 项目 base seed 必须位于 `0 <= seed <= 2**31 - 1`。所有依赖有界的逐轮随机流使用 `mixed_radix_v1`：
 
@@ -97,10 +97,10 @@ figure4_setting_strategies.py    wo_cgfm/w_cgfm 编码与解码策略分发
 qubo_math.py                     共用离散编码、CGFM、QUBO 惩罚、SA 与筛选
 fm_torch.py                      共用 PyTorch FM、Optuna、LBFGS、FM-to-QUBO
 figure4_pipeline.py              trajectory、active learning、checkpoint 恢复与聚合
-figure4_outputs.py               checkpoint v4 外层校验与 Figure 4 标准路径
+figure4_outputs.py               checkpoint v5 外层校验与 Figure 4 标准路径
 figure4_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
 plot_figure4.py                  严格读取一个或多个 summary v4 并绘图
-validate_reproduction.py         canonical quick 结构验收与非阻断 diagnostics
+validate_reproduction.py         严格契约、自洽重建、report v3 与非阻断 diagnostics
 test_figure4_pipeline.py         配置、数学、流程、输出、绘图和 README 契约测试
 ```
 
@@ -252,15 +252,15 @@ summary 和 manifest 保留缩进以便审查；所有 JSON 都通过同目录�
 
 ### Figure 4 验收规则
 
-Figure 4 canonical `quick` 只检查：
+Figure 4 canonical `quick` 严格检查：
 
-- 配置为 100 条初始数据、100 次迭代、50 levels、3 seeds。
-- 五个 objectives × 两个 settings × 三个 seeds，共 30 条轨迹全部完成。
-- 聚合曲线字段完整、长度正确且数值有限。
-- accepted/replacement 计数、数据集增长和迭代数一致。
-- validation report 使用 `report_schema_version: 2`。
+- summary、trajectory、FM metadata 和 QUBO stats 使用精确字段集合；整数不得是 bool、浮点数或字符串，所有数值必须有限。
+- 完整配置必须精确等于 `quick` preset（device 允许 `cpu` 或 `cuda`），seed 必须为 `[0, 1, 2]`，objective/setting 的值和顺序必须是 canonical 顺序。
+- 轨迹必须按 `seed → objective → setting` 顺序完整出现；best-so-far 按各 objective 方向单调，计数、SA rank/read 范围、数据集增长、最新 FM seed plan 和 QUBO 编码维度必须自洽。
+- 验收器从 30 条轨迹重新计算每个 `{objective}:{setting}` 的 mean/std/min/max，以 `rtol=atol=1e-12` 精确核对 stored aggregate；Figure 4 summary v4 没有逐轮 proposed/added records，因此验收器不声称重建这些信息。
+- validation report 使用 `report_schema_version: 3`。失败 detail 为 JSON-safe 的 `{path, rule, expected, actual}` error 列表；非法 JSON、非对象根和读取失败也会生成 report v3 并返回退出码 1。
 
-`w_cgfm` 是否表现出论文报告的优势只写入 `diagnostics.cgfm_paper_direction`，不影响验收结果。
+只有 canonical quick 规模不匹配、而其余结构和数值证据有效时，仍会生成开发配置 diagnostics；数据完整性失败时 diagnostics 写入 `skipped_reason`。`w_cgfm` 是否表现出论文报告的优势只写入 `diagnostics.cgfm_paper_direction`，不影响验收结果。
 
 ## 第二部分：Figure 5 复现
 
@@ -287,10 +287,10 @@ figure5_experiment_config.py     Figure 5 配置与 paper/quick/test preset
 figure5_scalarization.py         setting 契约、preference、DDTS 与数学对照
 figure5_pareto.py                mixed-sense 支配关系与 Pareto front
 figure5_pipeline.py              多目标 active learning、checkpoint、solutions 与 summary
-figure5_outputs.py               checkpoint v3 外层校验与 Figure 5 标准路径
+figure5_outputs.py               checkpoint v4 外层校验与 Figure 5 标准路径
 figure5_runner.py                CLI、配置解析、环境检查、manifest、pipeline 调用
 plot_figure5.py                  单/双 setting、seed 选择、3D 总览和迭代窗口
-validate_reproduction.py         canonical quick 结构验收与精确 front diagnostics
+validate_reproduction.py         rows/records/front 重建、report v3 与精确 front diagnostics
 test_figure5_*.py                scalarization、Pareto、pipeline 和输出契约测试
 test_plot_figure5.py             summary 校验、seed 选择和绘图测试
 ```
@@ -316,7 +316,7 @@ Figure 5 不调用 Figure 4 pipeline，也不使用 CGFM strategy；它只复用
 1. runner 解析 preset 和覆盖参数，检查依赖/device，生成 base seed 列表并验证完整 `mixed_radix_v1` schedule，然后写 `figure5_manifest.json`。
 2. `generate_initial_dataset_multi_objective_batch` 为每个 seed 生成共享初始数据；同一 seed 下 `w_ddts` 和 `wo_ddts` 从相同数据出发。
 3. pipeline 对 `seed × setting` 运行独立 trajectory；一条 trajectory 的唯一身份为 `(setting, seed)`。
-4. `preference_weights_for_iteration(seed, iteration)` 用独立 Python namespace 为每轮生成三个非负且和为 1 的确定性权重；同一 seed/iteration 的两个 setting 使用相同权重。
+4. `figure5_scalarization.preference_weights_for_iteration(seed, iteration)` 用独立 Python namespace 为每轮生成三个非负且和为 1 的确定性权重；同一 seed/iteration 的两个 setting 使用相同权重。pipeline 和验收器共同调用这一纯函数，不各自维护权重重建规则。
 5. 两条 scalarization 路径分别构造 FM/QUBO：
    - `w_ddts`：对三个真实目标做 z-score，构造 utopian point，并以最大加权方向距离作为一个 FM 的人工 target：
 
@@ -476,13 +476,14 @@ conda run -n env_torch python validate_reproduction.py figure5 `
 
 ### Figure 5 验收规则
 
-Figure 5 canonical `quick` 只检查：
+Figure 5 canonical `quick` 严格检查：
 
-- 配置为 500 条初始数据、150 次迭代、25 levels、seed 0。
-- `w_ddts` 和 `wo_ddts` 两条 trajectory 均完整，共有 300 条 proposed solution records。
-- composition、真实目标值、iteration identity 和候选计数一致。
-- 两个 `setting × seed` summary Pareto fronts 非空、无重复 composition且与 proposed solutions 一致，并且精确离散 Pareto front 指标可成功计算。
+- summary、trajectory、iteration record、solution、Pareto front、FM metadata 和 QUBO stats 使用精确字段集合；完整配置精确等于 quick preset（device 允许 CPU/CUDA），seed/objective/setting 的值和顺序均为 canonical 契约。
+- 验收器按 seed 重新生成并离散化 500 条初始数据，再用 150 条 iteration records 重建 seen compositions 和实际 added rows；每轮核对确定性 preference weights、scalarization method、SA rank/skipped、sample id、网格 composition，以及由 `build_dataset_row` 重算的 `kappa/E/rho`。
+- `accepted` 必须 proposed 等于 added 且 composition 新颖；`duplicate_replacement` 必须 proposed 已出现、added 新颖且 draws 合法。全部 counters、latest weights、最后一轮 scalarization metadata、FM seed plans 和 QUBO stats 都从 records/rows 重新推导。
+- 顶层 `solutions` 必须精确等于 records 中 proposed solutions 的顺序展平结果，因此 random replacement 不可能混入；每个 `setting × seed` stored front 再从这些 proposals 按混合方向重算并逐项核对。
+- validation report 使用 `report_schema_version: 3`；数据完整性不足时 metrics/diagnostics 不运行并写入 `skipped_reason`，仅 quick 规模不同但结构有效的开发输出仍可生成非阻断 diagnostics。
 
 验收器仍会枚举 25-level 离散设计空间。`metrics.by_setting_seed` 按 `seed_list` 外层、canonical setting 内层的固定顺序，分别报告每个 `setting × seed` 的 unique proposals、exact-front hits、coverage、precision 和 spacing CV；composition 只在当前 pair 内去重，random replacement 不参与。`metrics.setting_aggregates` 再对各 seed 计算 mean/std，绝不先汇池 proposal。
 
-`diagnostics.ddts_comparison.by_seed` 逐 seed 保存 `w_ddts / wo_ddts` 的 coverage 与 spacing 比值，`aggregate` 保存这些比值的 mean/std。分母为零或 spacing 不可定义时写 JSON `null`，不使用 epsilon 伪造比值。validation report 使用 `report_schema_version: 2`；这些 diagnostics 不设置通过阈值。
+`diagnostics.ddts_comparison.by_seed` 逐 seed 保存 `w_ddts / wo_ddts` 的 coverage 与 spacing 比值，`aggregate` 保存这些比值的 mean/std。分母为零或 spacing 不可定义时写 JSON `null`，不使用 epsilon 伪造比值；这些 diagnostics 不设置通过阈值。

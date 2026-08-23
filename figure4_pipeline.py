@@ -30,7 +30,7 @@ from figure4_experiment_config import (
     Figure4Setting,
     ObjectiveSpec,
 )
-from fm_torch import fit_torch_fm, fm_seed_block_size, fm_seed_plan, fm_to_qubo
+from fm_torch import fit_torch_fm, fm_to_qubo
 from figure4_outputs import (
     SUMMARY_SCHEMA_VERSION,
     checkpoint_payload,
@@ -58,10 +58,14 @@ from figure4_setting_strategies import (
 from experiment_runtime import (
     FIGURE4_REPLACEMENT_NAMESPACE,
     FIGURE4_SEED_INDEX,
+    FM_TRAINING_BACKEND,
+    MAX_RANDOM_REPLACEMENT_ATTEMPTS,
     SEED_DERIVATION_SCHEME,
     derive_bounded_seed,
     derive_fm_seed_root,
     derive_python_seed,
+    fm_seed_block_size,
+    fm_seed_plan,
     require_integer,
     same_json_value,
     validate_seed_schedule,
@@ -69,8 +73,7 @@ from experiment_runtime import (
 )
 
 
-TRAINING_BACKEND = "pytorch_fm_lbfgs"
-MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
+TRAINING_BACKEND = FM_TRAINING_BACKEND
 CandidateStatus = Literal["accepted", "duplicate_replacement"]
 LOGGER = logging.getLogger(__name__)
 _STATE_COUNTER_FIELDS = (

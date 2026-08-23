@@ -23,7 +23,7 @@ from alloy_dataset_generator import (
     generate_initial_dataset_multi_objective_batch,
     sample_multi_objective_design,
 )
-from fm_torch import fit_torch_fm, fm_seed_block_size, fm_seed_plan, fm_to_qubo
+from fm_torch import fit_torch_fm, fm_to_qubo
 from qubo_math import (
     IterationEncoding,
     ONE_HOT_PENALTY_WEIGHT,
@@ -54,19 +54,21 @@ from figure5_scalarization import (
     Figure5Setting,
     compute_ddts_targets,
     compute_individual_objective_targets,
-    sample_preference_weights,
+    preference_weights_for_iteration as _preference_weights_for_iteration,
     validate_preference_weights,
     validate_settings,
 )
 from experiment_runtime import (
-    FIGURE5_PREFERENCE_NAMESPACE,
     FIGURE5_REPLACEMENT_NAMESPACE,
     FIGURE5_SEED_INDEX,
-    NEAL_SEED_MAX,
+    FM_TRAINING_BACKEND,
+    MAX_RANDOM_REPLACEMENT_ATTEMPTS,
     SEED_DERIVATION_SCHEME,
     derive_bounded_seed,
     derive_fm_seed_root,
     derive_python_seed,
+    fm_seed_block_size,
+    fm_seed_plan,
     require_integer,
     same_json_value,
     validate_seed_schedule,
@@ -74,8 +76,7 @@ from experiment_runtime import (
 )
 
 
-TRAINING_BACKEND = "pytorch_fm_lbfgs"
-MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
+TRAINING_BACKEND = FM_TRAINING_BACKEND
 CandidateStatus = Literal["accepted", "duplicate_replacement"]
 LOGGER = logging.getLogger(__name__)
 _STATE_COUNTER_FIELDS = (
@@ -267,19 +268,6 @@ def _sample_random_replacement_row(
     continuous_design = sample_multi_objective_design(rng)
     composition = prepare_discrete_composition(continuous_design, num_levels)
     return dict(build_dataset_row(sample_id, seed, composition))
-
-
-def preference_weights_for_iteration(seed: int, iteration: int) -> tuple[float, ...]:
-    """Derive the same deterministic weight vector for both settings."""
-
-    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
-    normalized_iteration = require_integer("iteration", iteration, minimum=0)
-    rng_seed = derive_python_seed(
-        FIGURE5_PREFERENCE_NAMESPACE,
-        normalized_seed,
-        iteration=normalized_iteration,
-    )
-    return sample_preference_weights(random.Random(rng_seed), num_objectives=len(FIGURE5_OBJECTIVES))
 
 
 def _composition_key(composition: Sequence[float]) -> Tuple[float, float, float, float]:
@@ -644,7 +632,7 @@ def _validate_trajectory_state(
             )
         except (TypeError, ValueError) as exc:
             raise _checkpoint_state_error(checkpoint, f"{context}.weights are invalid ({exc})") from exc
-        expected_weights = preference_weights_for_iteration(seed, record_index)
+        expected_weights = _preference_weights_for_iteration(seed, record_index)
         if not np.allclose(record.weights, expected_weights, rtol=0.0, atol=1e-12):
             raise _checkpoint_state_error(
                 checkpoint,
@@ -897,7 +885,7 @@ def _fit_and_solve_iteration(
 
     encoding = create_iteration_encoding(config.num_levels, num_blocks=4)
     features = encode_single_objective_rows(rows, encoding)
-    weights = preference_weights_for_iteration(seed, iteration)
+    weights = _preference_weights_for_iteration(seed, iteration)
     trajectory_index = _trajectory_index(setting)
     block_size = fm_seed_block_size(config.optuna_trials)
 
@@ -1274,5 +1262,4 @@ __all__ = [
     "SolutionPoint",
     "discretize_row_for_figure5",
     "discretize_rows_for_figure5",
-    "preference_weights_for_iteration",
 ]

@@ -23,7 +23,6 @@ from figure4_experiment_config import (
     ObjectiveSpec,
     resolve_experiment_config,
 )
-from fm_torch import fm_seed_block_size
 from figure4_outputs import (
     Figure4OutputLayout,
     MANIFEST_SCHEMA_VERSION,
@@ -39,6 +38,7 @@ from experiment_runtime import (
     configure_file_logging_path,
     ensure_compute_device_available,
     ensure_training_dependencies,
+    fm_seed_block_size,
     resolve_contiguous_seeds,
     validate_seed_schedule,
     write_json_atomic,

@@ -1,68 +1,160 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import unittest
+from pathlib import Path
 
-from experiment_runtime import SEED_DERIVATION_SCHEME
-from figure4_experiment_config import FIGURE4_OBJECTIVE_NAMES, FIGURE4_SETTINGS
+import numpy as np
+
+from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_multi_objective
+from experiment_runtime import (
+    FIGURE4_SEED_INDEX,
+    FIGURE5_SEED_INDEX,
+    FM_FACTORIZATION_RANK,
+    FM_TRAINING_BACKEND,
+    SEED_DERIVATION_SCHEME,
+    derive_fm_seed_root,
+    fm_seed_block_size,
+    fm_seed_plan,
+)
+from figure4_experiment_config import (
+    FIGURE4_OBJECTIVE_NAMES,
+    FIGURE4_OBJECTIVES,
+    FIGURE4_SETTINGS,
+    Figure4ExperimentConfig,
+    preset_config as figure4_preset_config,
+)
+from figure5_experiment_config import Figure5ExperimentConfig, preset_config as figure5_preset_config
 from figure5_pareto import pareto_front
-from figure5_scalarization import FIGURE5_SETTINGS
+from figure5_scalarization import (
+    FIGURE5_OBJECTIVES,
+    FIGURE5_SETTINGS,
+    compute_ddts_targets,
+    compute_individual_objective_targets,
+    preference_weights_for_iteration,
+)
+from qubo_math import (
+    ONE_HOT_PENALTY_WEIGHT,
+    SYSTEM_PENALTY_WEIGHT,
+    prepare_discrete_composition,
+)
 from validate_reproduction import (
     exact_figure5_front,
     figure5_front_metrics,
+    main,
     parse_args,
     validate_figure4_summary,
     validate_figure5_summary,
 )
 
 
-def _figure4_summary() -> dict[str, object]:
-    iterations = 100
-    seeds = [0, 1, 2]
-    final_values = {
-        "kappa": {"w_cgfm": (2.0, 0.2), "wo_cgfm": (1.0, 0.2)},
-        "E": {"w_cgfm": (3.0, 0.2), "wo_cgfm": (2.0, 0.2)},
-        "rho": {"w_cgfm": (1.0, 0.2), "wo_cgfm": (2.0, 0.2)},
-        "delta_alpha": {"w_cgfm": (1.1, 0.2), "wo_cgfm": (1.0, 0.2)},
-        "delta_T": {"w_cgfm": (0.9, 0.2), "wo_cgfm": (1.0, 0.2)},
+WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test" / "validation_report_v3"
+WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _fm_metadata(seed_plan: dict[str, object], trials: int) -> dict[str, object]:
+    return {
+        "tuner": "optuna" if trials else "fixed",
+        "rank": FM_FACTORIZATION_RANK,
+        "seed_plan": seed_plan,
+        "init_std": 0.05,
+        "l2_reg_w": 1e-4,
+        "l2_reg_v": 1e-4,
+        "train_loss": 0.1,
+        "validation_loss": 0.2,
+        "test_loss": 0.3,
     }
-    aggregated = {
-        f"{objective}:{setting}": {
-            "best_so_far_mean": [final_values[objective][setting][0]] * iterations,
-            "best_so_far_std": [final_values[objective][setting][1]] * iterations,
-            "best_so_far_min": [final_values[objective][setting][0] - 0.1] * iterations,
-            "best_so_far_max": [final_values[objective][setting][0] + 0.1] * iterations,
-            "num_trajectories": len(seeds),
-        }
+
+
+def _qubo_stats(*, setting: str, levels: int, figure: int) -> dict[str, object]:
+    include_system = figure == 5 or setting == "wo_cgfm"
+    return {
+        "fm_scale": 2.0,
+        "system_scale": 3.0 if include_system else 0.0,
+        "one_hot_scale": 1.0,
+        "system_penalty_weight": SYSTEM_PENALTY_WEIGHT if include_system else 0.0,
+        "one_hot_penalty_weight": ONE_HOT_PENALTY_WEIGHT,
+        "num_variables": (4 if include_system else 3) * levels,
+        "max_abs": 1.0,
+    }
+
+
+def _figure4_summary(
+    config: Figure4ExperimentConfig | None = None,
+    seeds: list[int] | None = None,
+) -> dict[str, object]:
+    config = figure4_preset_config("quick") if config is None else config
+    seeds = [0, 1, 2] if seeds is None else seeds
+    trajectories: list[dict[str, object]] = []
+    grouped: dict[str, list[list[float]]] = {
+        f"{objective}:{setting}": []
         for objective in FIGURE4_OBJECTIVE_NAMES
         for setting in FIGURE4_SETTINGS
     }
-    trajectories = [
-        {
-            "seed": seed,
+    block_size = fm_seed_block_size(config.optuna_trials)
+    for seed in seeds:
+        for objective_index, objective in enumerate(FIGURE4_OBJECTIVES):
+            for setting_index, setting in enumerate(FIGURE4_SETTINGS):
+                offset = float(seed) * 0.1 + float(setting_index) * 0.5
+                start = 10.0 + float(objective_index) + offset
+                direction = 0.01 if objective.maximize else -0.01
+                curve = [start + (direction * iteration) for iteration in range(config.iterations)]
+                grouped[f"{objective.name}:{setting}"].append(curve)
+                trajectory_index = objective_index * len(FIGURE4_SETTINGS) + setting_index
+                root = derive_fm_seed_root(
+                    seed,
+                    trajectory_count=len(FIGURE4_OBJECTIVES) * len(FIGURE4_SETTINGS),
+                    trajectory_index=trajectory_index,
+                    iterations=config.iterations,
+                    iteration=config.iterations - 1,
+                    model_count=1,
+                    model_index=0,
+                    figure_index=FIGURE4_SEED_INDEX,
+                    block_size=block_size,
+                )
+                trajectories.append(
+                    {
+                        "objective": objective.name,
+                        "setting": setting,
+                        "seed": seed,
+                        "best_so_far": curve,
+                        "final_dataset_size": config.num_samples + config.iterations,
+                        "training_backend": FM_TRAINING_BACKEND,
+                        "fm_metadata": _fm_metadata(
+                            fm_seed_plan(root, config.optuna_trials), config.optuna_trials
+                        ),
+                        "qubo_stats": _qubo_stats(setting=setting, levels=config.num_levels, figure=4),
+                        "duplicate_replacements": 0,
+                        "random_replacements": 0,
+                        "random_replacement_draws": 0,
+                        "accepted_sa_candidates": config.iterations,
+                        "infeasible_sa_samples_skipped": 0,
+                        "max_feasible_candidate_rank": 1,
+                        "completed_iterations": config.iterations,
+                    }
+                )
+    aggregated: dict[str, dict[str, object]] = {}
+    for key, curves in grouped.items():
+        objective, setting = key.split(":", 1)
+        array = np.asarray(curves, dtype=np.float64)
+        aggregated[key] = {
             "objective": objective,
             "setting": setting,
-            "completed_iterations": iterations,
-            "best_so_far": [0.0] * iterations,
-            "final_dataset_size": 200,
-            "accepted_sa_candidates": iterations,
-            "duplicate_replacements": 0,
-            "random_replacements": 0,
-            "random_replacement_draws": 0,
-            "infeasible_sa_samples_skipped": 0,
-            "max_feasible_candidate_rank": 1,
+            "best_so_far_mean": np.mean(array, axis=0).tolist(),
+            "best_so_far_std": np.std(array, axis=0).tolist(),
+            "best_so_far_min": np.min(array, axis=0).tolist(),
+            "best_so_far_max": np.max(array, axis=0).tolist(),
+            "num_trajectories": len(seeds),
         }
-        for seed in seeds
-        for objective in FIGURE4_OBJECTIVE_NAMES
-        for setting in FIGURE4_SETTINGS
-    ]
     return {
         "schema_version": 4,
         "seed_derivation": SEED_DERIVATION_SCHEME,
-        "config": {"num_samples": 100, "iterations": iterations, "encoding": {"num_levels": 50}},
-        "seed_list": seeds,
+        "training_backend": FM_TRAINING_BACKEND,
+        "config": config.to_dict(),
+        "seed_list": list(seeds),
         "objectives": list(FIGURE4_OBJECTIVE_NAMES),
         "settings": list(FIGURE4_SETTINGS),
         "trajectories": trajectories,
@@ -70,160 +162,345 @@ def _figure4_summary() -> dict[str, object]:
     }
 
 
-def _figure5_summary() -> dict[str, object]:
-    iterations = 150
-    exact = exact_figure5_front(25)
-    exact_keys = list(exact)
-    selected_keys = {
-        "w_ddts": exact_keys[:5],
-        "wo_ddts": exact_keys[:20],
+def _initial_rows(config: Figure5ExperimentConfig, seed: int) -> list[dict[str, object]]:
+    raw_rows, _ = generate_initial_dataset_multi_objective(config.num_samples, seed)
+    rows: list[dict[str, object]] = []
+    for raw in raw_rows:
+        composition = prepare_discrete_composition(
+            [raw["f1_norm"], raw["f2_norm"], raw["f3_norm"], raw["f4_norm"]],
+            config.num_levels,
+        )
+        rows.append(dict(build_dataset_row(raw["sample_id"], seed, composition)))
+    return rows
+
+
+def _grid_compositions(levels: int) -> list[tuple[float, float, float, float]]:
+    values: list[tuple[float, float, float, float]] = []
+    for first in range(levels + 1):
+        for second in range(levels - first + 1):
+            for third in range(levels - first - second + 1):
+                fourth = levels - first - second - third
+                values.append((first / levels, second / levels, third / levels, fourth / levels))
+    return values
+
+
+def _solution_point(sample_id: int, seed: int, composition: tuple[float, ...]) -> dict[str, object]:
+    row = build_dataset_row(sample_id, seed, composition)
+    return {
+        "sample_id": sample_id,
+        "composition": list(composition),
+        "kappa": row["kappa"],
+        "E": row["E"],
+        "rho": row["rho"],
     }
+
+
+def _figure5_summary(config: Figure5ExperimentConfig | None = None) -> dict[str, object]:
+    config = figure5_preset_config("quick") if config is None else config
+    seed = 0
+    initial = _initial_rows(config, seed)
+    seen = {
+        tuple(round(float(row[f"f{index}_norm"]), 10) for index in range(1, 5))
+        for row in initial
+    }
+    candidates = [
+        composition
+        for composition in _grid_compositions(config.num_levels)
+        if tuple(round(value, 10) for value in composition) not in seen
+    ][: config.iterations]
+    if len(candidates) != config.iterations:
+        raise AssertionError("test fixture grid does not contain enough novel designs")
+
+    trajectories: list[dict[str, object]] = []
     solutions: list[dict[str, object]] = []
-    for setting in FIGURE5_SETTINGS:
-        keys = selected_keys[setting]
-        for iteration in range(iterations):
-            composition = keys[iteration % len(keys)]
-            kappa, e_value, negative_rho = exact[composition]
+    block_size = fm_seed_block_size(config.optuna_trials)
+    for setting_index, setting in enumerate(FIGURE5_SETTINGS):
+        rows = [dict(row) for row in initial]
+        records: list[dict[str, object]] = []
+        for iteration, composition in enumerate(candidates):
+            sample_id = config.num_samples + iteration
+            point = _solution_point(sample_id, seed, composition)
+            weights = list(preference_weights_for_iteration(seed, iteration))
+            record = {
+                "setting": setting,
+                "seed": seed,
+                "iteration": iteration,
+                "weights": weights,
+                "scalarization_method": "ddts" if setting == "w_ddts" else "weighted_sum",
+                "decision_status": "accepted",
+                "proposed_solution": dict(point),
+                "added_solution": dict(point),
+                "replacement_draws": 0,
+                "sa_energy": float(iteration),
+                "feasible_candidate_rank": 1,
+                "infeasible_sa_samples_skipped": 0,
+            }
+            records.append(record)
+            rows.append(dict(build_dataset_row(sample_id, seed, composition)))
             solutions.append(
                 {
                     "setting": setting,
-                    "seed": 0,
+                    "seed": seed,
                     "iteration": iteration,
-                    "composition": list(composition),
-                    "kappa": kappa,
-                    "E": e_value,
-                    "rho": -negative_rho,
+                    "status": "accepted",
+                    "weights": weights,
+                    **point,
                 }
             )
-    trajectories = [
+        last_weights = records[-1]["weights"]
+        if setting == "w_ddts":
+            scalarization_metadata = dict(compute_ddts_targets(rows[:-1], last_weights).metadata)
+            model_names = [(0, "artificial_target")]
+        else:
+            individual = compute_individual_objective_targets(rows[:-1])
+            scalarization_metadata = {
+                **individual.metadata,
+                "merge_weights": {
+                    objective: float(weight)
+                    for objective, weight in zip(FIGURE5_OBJECTIVES, last_weights)
+                },
+                "merge_stage": "qubo",
+            }
+            model_names = list(enumerate(FIGURE5_OBJECTIVES))
+        latest_fm_metadata: dict[str, object] = {}
+        for model_index, model_name in model_names:
+            root = derive_fm_seed_root(
+                seed,
+                trajectory_count=len(FIGURE5_SETTINGS),
+                trajectory_index=setting_index,
+                iterations=config.iterations,
+                iteration=config.iterations - 1,
+                model_count=len(FIGURE5_OBJECTIVES),
+                model_index=model_index,
+                figure_index=FIGURE5_SEED_INDEX,
+                block_size=block_size,
+            )
+            latest_fm_metadata[model_name] = _fm_metadata(
+                fm_seed_plan(root, config.optuna_trials), config.optuna_trials
+            )
+        trajectories.append(
+            {
+                "setting": setting,
+                "seed": seed,
+                "iteration_records": records,
+                "final_dataset_size": config.num_samples + config.iterations,
+                "training_backend": FM_TRAINING_BACKEND,
+                "latest_weights": list(last_weights),
+                "latest_fm_metadata": latest_fm_metadata,
+                "latest_scalarization_metadata": scalarization_metadata,
+                "qubo_stats": _qubo_stats(setting=setting, levels=config.num_levels, figure=5),
+                "duplicate_replacements": 0,
+                "random_replacements": 0,
+                "random_replacement_draws": 0,
+                "accepted_sa_candidates": config.iterations,
+                "infeasible_sa_samples_skipped": 0,
+                "max_feasible_candidate_rank": 1,
+                "completed_iterations": config.iterations,
+            }
+        )
+    fronts = [
         {
-            "seed": 0,
             "setting": setting,
-            "completed_iterations": iterations,
-            "iteration_records": [{} for _ in range(iterations)],
-            "final_dataset_size": 650,
-            "accepted_sa_candidates": iterations,
-            "duplicate_replacements": 0,
-            "random_replacements": 0,
-            "random_replacement_draws": 0,
-            "infeasible_sa_samples_skipped": 0,
-            "max_feasible_candidate_rank": 1,
+            "seed": seed,
+            "solutions": pareto_front(
+                [point for point in solutions if point["setting"] == setting and point["seed"] == seed]
+            ),
         }
         for setting in FIGURE5_SETTINGS
     ]
     return {
         "schema_version": 4,
         "seed_derivation": SEED_DERIVATION_SCHEME,
+        "training_backend": FM_TRAINING_BACKEND,
+        "config": config.to_dict(),
+        "seed_list": [seed],
+        "objectives": list(FIGURE5_OBJECTIVES),
         "settings": list(FIGURE5_SETTINGS),
-        "config": {"num_samples": 500, "iterations": iterations, "encoding": {"num_levels": 25}},
-        "seed_list": [0],
         "trajectories": trajectories,
         "solutions": solutions,
-        "pareto_fronts": [
-            {
-                "setting": setting,
-                "seed": 0,
-                "solutions": pareto_front([point for point in solutions if point["setting"] == setting]),
-            }
-            for setting in FIGURE5_SETTINGS
-        ],
+        "pareto_fronts": fronts,
     }
 
 
+def _set_first_duplicate_replacement(summary: dict[str, object]) -> None:
+    config = figure5_preset_config("quick")
+    prior = _initial_rows(config, 0)[0]
+    composition = tuple(float(prior[f"f{index}_norm"]) for index in range(1, 5))
+    duplicate = _solution_point(config.num_samples, 0, composition)
+    trajectory = summary["trajectories"][0]  # type: ignore[index]
+    record = trajectory["iteration_records"][0]
+    record["decision_status"] = "duplicate_replacement"
+    record["replacement_draws"] = 1
+    record["proposed_solution"] = duplicate
+    trajectory["accepted_sa_candidates"] -= 1
+    trajectory["duplicate_replacements"] = 1
+    trajectory["random_replacements"] = 1
+    trajectory["random_replacement_draws"] = 1
+    summary["solutions"][0] = {  # type: ignore[index]
+        "setting": "w_ddts",
+        "seed": 0,
+        "iteration": 0,
+        "status": "duplicate_replacement",
+        "weights": record["weights"],
+        **duplicate,
+    }
+    setting_solutions = [
+        point for point in summary["solutions"]  # type: ignore[index]
+        if point["setting"] == "w_ddts" and point["seed"] == 0
+    ]
+    summary["pareto_fronts"][0]["solutions"] = pareto_front(setting_solutions)  # type: ignore[index]
+
+
 class ReproductionValidationTests(unittest.TestCase):
-    def test_figure4_accepts_quick_workflow_and_keeps_trends_diagnostic(self) -> None:
-        summary = _figure4_summary()
-        kappa_with_cgfm = summary["aggregated"]["kappa:w_cgfm"]  # type: ignore[index]
-        kappa_with_cgfm["best_so_far_mean"] = [0.0] * 100
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.figure4 = _figure4_summary()
+        cls.figure5 = _figure5_summary()
 
+    def test_complete_production_fixtures_pass_and_report_is_json_safe(self) -> None:
+        figure4_report = validate_figure4_summary(copy.deepcopy(self.figure4))
+        figure5_report = validate_figure5_summary(copy.deepcopy(self.figure5))
+        self.assertEqual(figure4_report["report_schema_version"], 3)
+        self.assertEqual(figure5_report["report_schema_version"], 3)
+        self.assertTrue(figure4_report["passed"])
+        self.assertTrue(figure5_report["passed"])
+        self.assertIsNone(figure4_report["metrics"])
+        self.assertIsNotNone(figure5_report["metrics"])
+        json.dumps(figure4_report, allow_nan=False)
+        json.dumps(figure5_report, allow_nan=False)
+
+    def test_strict_integer_contract_rejects_bool_float_and_string(self) -> None:
+        for invalid in (True, 100.0, "100"):
+            with self.subTest(invalid=invalid):
+                summary = copy.deepcopy(self.figure4)
+                summary["config"]["iterations"] = invalid
+                report = validate_figure4_summary(summary)
+                self.assertFalse(report["passed"])
+                self.assertFalse(report["checks"]["summary_contract"]["passed"])
+                json.dumps(report, allow_nan=False)
+
+    def test_exact_fields_and_canonical_order_are_enforced(self) -> None:
+        extra = copy.deepcopy(self.figure4)
+        extra["unexpected"] = 1
+        self.assertFalse(validate_figure4_summary(extra)["checks"]["summary_contract"]["passed"])
+
+        reversed_axes = copy.deepcopy(self.figure4)
+        reversed_axes["settings"] = list(reversed(reversed_axes["settings"]))
+        self.assertFalse(validate_figure4_summary(reversed_axes)["checks"]["canonical_axes"]["passed"])
+
+        reversed_trajectories = copy.deepcopy(self.figure4)
+        reversed_trajectories["trajectories"][0:2] = reversed(reversed_trajectories["trajectories"][0:2])
+        self.assertFalse(validate_figure4_summary(reversed_trajectories)["checks"]["trajectories"]["passed"])
+
+    def test_development_scale_keeps_diagnostics_but_fails_quick_contract(self) -> None:
+        summary = _figure4_summary(config=figure4_preset_config("test"), seeds=[0, 1, 2])
         report = validate_figure4_summary(summary)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["checks"]["quick_configuration"]["passed"])
+        self.assertNotIn("skipped_reason", report["diagnostics"])
 
-        self.assertEqual(report["report_schema_version"], 2)
-        self.assertTrue(report["passed"])
-        self.assertTrue(report["checks"]["quick_scale"]["passed"])
-        self.assertEqual(
-            list(report["checks"]["aggregate_curves"]["detail"])[:2],
-            ["kappa:wo_cgfm", "kappa:w_cgfm"],
+    def test_figure4_rejects_nonmonotonic_curves_and_forged_aggregate(self) -> None:
+        nonmonotonic = copy.deepcopy(self.figure4)
+        nonmonotonic["trajectories"][0]["best_so_far"][1] = -999.0
+        self.assertFalse(validate_figure4_summary(nonmonotonic)["checks"]["trajectories"]["passed"])
+
+        forged = copy.deepcopy(self.figure4)
+        forged["aggregated"]["kappa:wo_cgfm"]["best_so_far_mean"][0] += 1.0
+        self.assertFalse(validate_figure4_summary(forged)["checks"]["aggregate_curves"]["passed"])
+
+    def test_figure4_rejects_fm_qubo_counter_and_rank_damage(self) -> None:
+        mutations = (
+            ("fm", lambda summary: summary["trajectories"][0]["fm_metadata"]["seed_plan"].__setitem__("root", 1)),
+            ("qubo", lambda summary: summary["trajectories"][0]["qubo_stats"].__setitem__("num_variables", 1)),
+            ("counter", lambda summary: summary["trajectories"][0].__setitem__("accepted_sa_candidates", 99)),
+            ("rank", lambda summary: summary["trajectories"][0].__setitem__("max_feasible_candidate_rank", 101)),
         )
-        self.assertFalse(
-            report["diagnostics"]["cgfm_paper_direction"]["kappa"]["paper_direction_observed"]
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                summary = copy.deepcopy(self.figure4)
+                mutate(summary)
+                self.assertFalse(validate_figure4_summary(summary)["checks"]["trajectories"]["passed"])
+
+    def test_figure5_rejects_record_semantic_damage(self) -> None:
+        mutations = (
+            ("weight", lambda record: record["weights"].__setitem__(0, record["weights"][0] + 0.1)),
+            ("method", lambda record: record.__setitem__("scalarization_method", "weighted_sum")),
+            ("status", lambda record: record.__setitem__("decision_status", "unknown")),
+            ("sample_id", lambda record: record["proposed_solution"].__setitem__("sample_id", 999)),
+            ("property", lambda record: record["proposed_solution"].__setitem__("kappa", 999.0)),
+            ("grid", lambda record: record["proposed_solution"].__setitem__("composition", [0.1, 0.2, 0.3, 0.4])),
+            ("rank", lambda record: record.__setitem__("feasible_candidate_rank", 2)),
         )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                summary = copy.deepcopy(self.figure5)
+                mutate(summary["trajectories"][0]["iteration_records"][0])
+                report = validate_figure5_summary(summary)
+                self.assertFalse(report["checks"]["trajectories"]["passed"])
+                self.assertIn("skipped_reason", report["diagnostics"])
 
-    def test_figure4_rejects_non_quick_scale(self) -> None:
-        summary = _figure4_summary()
-        summary["config"]["iterations"] = 600  # type: ignore[index]
+    def test_figure5_rejects_state_metadata_and_qubo_damage(self) -> None:
+        mutations = (
+            ("counter", lambda trajectory: trajectory.__setitem__("accepted_sa_candidates", 149)),
+            ("latest_weights", lambda trajectory: trajectory["latest_weights"].__setitem__(0, 0.0)),
+            ("scalar_metadata", lambda trajectory: trajectory["latest_scalarization_metadata"].__setitem__("utopian_space", "raw")),
+            ("fm", lambda trajectory: trajectory["latest_fm_metadata"]["artificial_target"]["seed_plan"].__setitem__("root", 1)),
+            ("qubo", lambda trajectory: trajectory["qubo_stats"].__setitem__("system_scale", 0.0)),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                summary = copy.deepcopy(self.figure5)
+                mutate(summary["trajectories"][0])
+                self.assertFalse(validate_figure5_summary(summary)["checks"]["trajectories"]["passed"])
 
-        report = validate_figure4_summary(summary)
-
-        self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["quick_scale"]["passed"])
-
-    def test_figure4_requires_every_objective_setting_trajectory(self) -> None:
-        summary = _figure4_summary()
-        summary["trajectories"] = summary["trajectories"][:-1]  # type: ignore[index]
-
-        report = validate_figure4_summary(summary)
-
-        self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["complete_trajectories"]["passed"])
-
-    def test_non_finite_figure4_statistics_fail_without_invalid_json(self) -> None:
-        summary = _figure4_summary()
-        kappa_with_cgfm = summary["aggregated"]["kappa:w_cgfm"]  # type: ignore[index]
-        kappa_with_cgfm["best_so_far_mean"] = [float("nan")] * 100
-
-        report = validate_figure4_summary(summary)
-
-        self.assertFalse(report["passed"])
-        json.dumps(report, allow_nan=False)
-
-    def test_figure5_accepts_quick_workflow_without_scientific_thresholds(self) -> None:
-        summary = _figure5_summary()
-        metrics = figure5_front_metrics(summary)
+    def test_duplicate_replacement_keeps_added_design_out_of_proposal_front(self) -> None:
+        summary = copy.deepcopy(self.figure5)
+        _set_first_duplicate_replacement(summary)
         report = validate_figure5_summary(summary)
-
-        self.assertEqual(report["report_schema_version"], 2)
-        self.assertLess(
-            metrics["setting_aggregates"]["w_ddts"]["exact_front_coverage_mean"],
-            metrics["setting_aggregates"]["wo_ddts"]["exact_front_coverage_mean"],
-        )
         self.assertTrue(report["passed"])
-        self.assertLess(
-            report["diagnostics"]["ddts_comparison"]["aggregate"]["coverage_ratio_mean"],
-            1.0,
-        )
-        json.dumps(report, allow_nan=False)
+        proposed = summary["trajectories"][0]["iteration_records"][0]["proposed_solution"]
+        added = summary["trajectories"][0]["iteration_records"][0]["added_solution"]
+        self.assertEqual(summary["solutions"][0]["composition"], proposed["composition"])
+        self.assertNotEqual(summary["solutions"][0]["composition"], added["composition"])
 
-    def test_figure5_metrics_are_isolated_by_seed_and_zero_denominators_are_null(self) -> None:
-        exact = exact_figure5_front(2)
-        first, second = list(exact)[:2]
+    def test_top_solutions_and_stored_front_must_match_reconstruction(self) -> None:
+        stale_solution = copy.deepcopy(self.figure5)
+        stale_solution["solutions"][0]["rho"] += 1.0
+        self.assertFalse(validate_figure5_summary(stale_solution)["checks"]["solutions"]["passed"])
+
+        stale_front = copy.deepcopy(self.figure5)
+        stale_front["pareto_fronts"][0]["solutions"] = []
+        self.assertFalse(validate_figure5_summary(stale_front)["checks"]["pareto_fronts"]["passed"])
+
+    def test_front_metrics_are_seed_isolated_and_strict(self) -> None:
+        config = figure5_preset_config("test").to_dict()
+        config["num_samples"] = 1
+        config["iterations"] = 2
+        config["encoding"]["num_levels"] = 2
 
         def point(setting: str, seed: int, iteration: int, composition: tuple[float, ...]) -> dict[str, object]:
-            kappa, e_value, negative_rho = exact[composition]
+            solution = _solution_point(1 + iteration, seed, composition)
             return {
                 "setting": setting,
                 "seed": seed,
                 "iteration": iteration,
-                "composition": list(composition),
-                "kappa": kappa,
-                "E": e_value,
-                "rho": -negative_rho,
+                "status": "accepted",
+                "weights": list(preference_weights_for_iteration(seed, iteration)),
+                **solution,
             }
 
+        first = (0.0, 0.0, 0.0, 1.0)
+        second = (0.0, 0.0, 0.5, 0.5)
         summary = {
-            "schema_version": 4,
-            "seed_derivation": SEED_DERIVATION_SCHEME,
-            "settings": list(FIGURE5_SETTINGS),
-            "config": {"num_samples": 500, "iterations": 150, "encoding": {"num_levels": 2}},
+            "config": config,
             "seed_list": [0, 1],
-            "trajectories": [],
+            "settings": list(FIGURE5_SETTINGS),
             "solutions": [
                 point("w_ddts", 0, 0, first),
                 point("w_ddts", 0, 1, first),
                 point("w_ddts", 1, 0, second),
                 point("wo_ddts", 1, 0, first),
             ],
-            "pareto_fronts": [],
         }
         metrics = figure5_front_metrics(summary)
         records = metrics["by_setting_seed"]
@@ -233,50 +510,34 @@ class ReproductionValidationTests(unittest.TestCase):
         )
         self.assertEqual(records[0]["unique_proposals"], 1)
         self.assertEqual(records[1]["unique_proposals"], 0)
-        self.assertEqual(records[2]["unique_proposals"], 1)
         self.assertIsNone(metrics["setting_aggregates"]["w_ddts"]["spacing_cv_mean"])
 
-        report = validate_figure5_summary(summary)
-        comparison = report["diagnostics"]["ddts_comparison"]
-        self.assertIsNone(comparison["by_seed"][0]["coverage_ratio_w_ddts_over_wo_ddts"])
-        self.assertIsNone(comparison["aggregate"]["spacing_cv_ratio_mean"])
+        summary["solutions"][0]["kappa"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "finite_json_number"):
+            figure5_front_metrics(summary)
+
+    def test_exact_front_rejects_lossy_integer_inputs(self) -> None:
+        for invalid in (True, 2.0, "2"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    exact_figure5_front(invalid)  # type: ignore[arg-type]
+
+    def test_cli_malformed_json_writes_report_v3_and_returns_one(self) -> None:
+        summary_path = WORKSPACE_TMP_ROOT / "malformed.json"
+        report_path = WORKSPACE_TMP_ROOT / "malformed_report.json"
+        summary_path.write_text("{not-json", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return_code = main(
+                ["figure5", "--summary", str(summary_path), "--output", str(report_path)]
+            )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(return_code, 1)
+        self.assertEqual(report["report_schema_version"], 3)
+        self.assertFalse(report["passed"])
+        self.assertEqual(set(report["checks"]["input"]["detail"]["errors"][0]), {"path", "rule", "expected", "actual"})
         json.dumps(report, allow_nan=False)
 
-    def test_figure5_rejects_missing_comparison_setting(self) -> None:
-        summary = _figure5_summary()
-        summary["settings"] = ["w_ddts"]
-        summary["solutions"] = [
-            point for point in summary["solutions"] if point["setting"] == "w_ddts"  # type: ignore[index]
-        ]
-
-        report = validate_figure5_summary(summary)
-
-        self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["comparison_settings"]["passed"])
-        self.assertFalse(report["checks"]["solution_records"]["passed"])
-        json.dumps(report, allow_nan=False)
-
-    def test_figure5_rejects_non_quick_scale(self) -> None:
-        summary = _figure5_summary()
-        summary["config"]["iterations"] = 1000  # type: ignore[index]
-
-        report = validate_figure5_summary(summary)
-
-        self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["quick_scale"]["passed"])
-
-    def test_figure5_rejects_schema_v3_and_inconsistent_stored_front(self) -> None:
-        old_summary = _figure5_summary()
-        old_summary["schema_version"] = 3
-        old_report = validate_figure5_summary(old_summary)
-        self.assertFalse(old_report["checks"]["schema"]["passed"])
-
-        stale_summary = _figure5_summary()
-        stale_summary["pareto_fronts"][0]["solutions"] = []  # type: ignore[index]
-        stale_report = validate_figure5_summary(stale_summary)
-        self.assertFalse(stale_report["checks"]["summary_pareto_front"]["passed"])
-
-    def test_cli_exposes_no_paper_acceptance_profile(self) -> None:
+    def test_cli_public_surface_and_no_paper_profile(self) -> None:
         args = parse_args(["figure4", "--summary", "summary.json"])
         self.assertFalse(hasattr(args, "profile"))
         with contextlib.redirect_stderr(io.StringIO()):

@@ -39,6 +39,9 @@ FIGURE5_INITIAL_NAMESPACE = 2
 FIGURE4_REPLACEMENT_NAMESPACE = 3
 FIGURE5_REPLACEMENT_NAMESPACE = 4
 FIGURE5_PREFERENCE_NAMESPACE = 5
+FM_TRAINING_BACKEND = "pytorch_fm_lbfgs"
+FM_FACTORIZATION_RANK = 6
+MAX_RANDOM_REPLACEMENT_ATTEMPTS = 10_000
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 
 
@@ -59,6 +62,33 @@ def require_integer(
     if maximum is not None and normalized > maximum:
         raise ValueError(f"{name} must not exceed {maximum}")
     return normalized
+
+
+def fm_seed_block_size(optuna_trials: int) -> int:
+    """Return the fixed-width seed block reserved for one FM fit."""
+
+    return require_integer("optuna_trials", optuna_trials, minimum=0) + 4
+
+
+def fm_seed_plan(seed_root: int, optuna_trials: int) -> dict[str, Any]:
+    """Allocate split, sampler, trial, and final-fit seeds inside one block."""
+
+    trial_count = require_integer("optuna_trials", optuna_trials, minimum=0)
+    block_size = fm_seed_block_size(trial_count)
+    root = require_integer(
+        "seed",
+        seed_root,
+        minimum=0,
+        maximum=NUMPY_SEED_MAX - block_size + 1,
+    )
+    return {
+        "root": root,
+        "block_size": block_size,
+        "split": [root, root + 1],
+        "tuner": root + 2,
+        "trials": list(range(root + 3, root + 3 + trial_count)),
+        "final_fit": root + 3 + trial_count,
+    }
 
 
 def ensure_training_dependencies(required_modules: Sequence[str]) -> None:
@@ -433,6 +463,9 @@ __all__ = [
     "FIGURE5_REPLACEMENT_NAMESPACE",
     "FIGURE5_SEED_INDEX",
     "FM_SEED_MIN",
+    "FM_FACTORIZATION_RANK",
+    "FM_TRAINING_BACKEND",
+    "MAX_RANDOM_REPLACEMENT_ATTEMPTS",
     "NEAL_SEED_MAX",
     "NUMPY_SEED_MAX",
     "SEED_DERIVATION_SCHEME",
@@ -444,6 +477,8 @@ __all__ = [
     "derive_python_seed",
     "ensure_compute_device_available",
     "ensure_training_dependencies",
+    "fm_seed_block_size",
+    "fm_seed_plan",
     "load_json_object",
     "require_integer",
     "resolve_contiguous_seeds",

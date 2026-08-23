@@ -77,6 +77,8 @@ from experiment_runtime import (
     configure_file_logging_path,
     derive_fm_seed_root,
     ensure_training_dependencies,
+    fm_seed_block_size,
+    fm_seed_plan,
 )
 
 WORKSPACE_TMP_ROOT = (
@@ -101,7 +103,7 @@ def _fm_metadata(
     *,
     trajectory_index: int = 0,
 ) -> dict[str, object]:
-    block_size = fm_torch.fm_seed_block_size(config.optuna_trials)
+    block_size = fm_seed_block_size(config.optuna_trials)
     root = derive_fm_seed_root(
         seed,
         trajectory_count=10,
@@ -113,7 +115,7 @@ def _fm_metadata(
         figure_index=FIGURE4_SEED_INDEX,
         block_size=block_size,
     )
-    return {"mock": True, "seed_plan": fm_torch.fm_seed_plan(root, config.optuna_trials)}
+    return {"mock": True, "seed_plan": fm_seed_plan(root, config.optuna_trials)}
 
 
 def _training_result(
@@ -325,6 +327,8 @@ class Figure4PipelineTests(unittest.TestCase):
             solve_qubo_with_sa(q, 0.0, reads=1, sweeps=1, seed=NEAL_SEED_MAX + 1)
 
     def test_fm_seed_and_integer_boundaries_fail_before_training(self) -> None:
+        self.assertFalse(hasattr(fm_torch, "fm_seed_plan"))
+        self.assertFalse(hasattr(fm_torch, "fm_seed_block_size"))
         x = np.zeros((2, 2), dtype=np.float32)
         y = np.zeros(2, dtype=np.float32)
         split = fm_torch.split_train_validation_test(

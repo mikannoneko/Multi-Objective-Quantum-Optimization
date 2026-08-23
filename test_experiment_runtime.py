@@ -23,6 +23,8 @@ from experiment_runtime import (
     derive_bounded_seed,
     derive_fm_seed_root,
     derive_python_seed,
+    fm_seed_block_size,
+    fm_seed_plan,
     require_integer,
     validate_seed_schedule,
     write_json_atomic,
@@ -35,9 +37,6 @@ from figure5_experiment_config import (
     FIGURE5_PRESET_NUM_SEEDS,
     preset_config as figure5_preset_config,
 )
-from fm_torch import fm_seed_block_size, fm_seed_plan
-
-
 WORKSPACE_TMP_ROOT = Path(__file__).resolve().parent / ".tmp_test" / "runtime_mixed_radix_v1"
 
 

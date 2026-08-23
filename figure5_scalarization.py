@@ -14,7 +14,12 @@ from typing import Any, Dict, Literal, Mapping, Sequence, cast
 
 import numpy as np
 
-from experiment_runtime import require_integer
+from experiment_runtime import (
+    FIGURE5_PREFERENCE_NAMESPACE,
+    NEAL_SEED_MAX,
+    derive_python_seed,
+    require_integer,
+)
 
 
 FIGURE5_OBJECTIVES = ("kappa", "E", "rho")
@@ -73,6 +78,22 @@ def sample_preference_weights(rng: random.Random, num_objectives: int = 3) -> tu
     if total <= 0.0 or not math.isfinite(total):
         raise ValueError("Unable to sample finite positive preference weights")
     return tuple(float(draw / total) for draw in draws)
+
+
+def preference_weights_for_iteration(seed: int, iteration: int) -> tuple[float, ...]:
+    """Derive the deterministic Figure 5 preference vector for one iteration."""
+
+    normalized_seed = require_integer("seed", seed, minimum=0, maximum=NEAL_SEED_MAX)
+    normalized_iteration = require_integer("iteration", iteration, minimum=0)
+    rng_seed = derive_python_seed(
+        FIGURE5_PREFERENCE_NAMESPACE,
+        normalized_seed,
+        iteration=normalized_iteration,
+    )
+    return sample_preference_weights(
+        random.Random(rng_seed),
+        num_objectives=len(FIGURE5_OBJECTIVES),
+    )
 
 
 def validate_preference_weights(weights: Sequence[float], num_objectives: int = 3) -> np.ndarray:
@@ -232,6 +253,7 @@ __all__ = [
     "compute_ddts_targets",
     "compute_individual_objective_targets",
     "compute_weighted_sum_reference_targets",
+    "preference_weights_for_iteration",
     "sample_preference_weights",
     "validate_settings",
     "validate_preference_weights",
