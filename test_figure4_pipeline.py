@@ -155,7 +155,7 @@ class Figure4PipelineTests(unittest.TestCase):
         quick = resolve_experiment_config(preset="quick", device="cuda")
         self.assertEqual(quick.num_samples, 100)
         self.assertEqual(quick.iterations, 100)
-        self.assertEqual(quick.num_levels, 50)
+        self.assertEqual(quick.num_levels, 10)
         self.assertEqual(quick.optuna_trials, 3)
         self.assertEqual(quick.sa_reads, 100)
         self.assertEqual(quick.sa_sweeps, 500)
@@ -1071,6 +1071,42 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(duplicate_result.duplicate_replacements, 1)
         self.assertEqual(duplicate_result.accepted_sa_candidates, 0)
         self.assertEqual(duplicate_result.random_replacements, 1)
+
+    def test_empty_feasible_sa_batch_reports_trajectory_and_constraint_counts(self) -> None:
+        rows, _ = generate_initial_dataset_single_objective(num_samples=6, seed=8)
+        config = Figure4ExperimentConfig(
+            num_samples=6,
+            iterations=1,
+            encoding=EncodingConfig(num_levels=5),
+            fm=FMConfig(optuna_trials=0),
+            sa=SAConfig(reads=1, sweeps=7),
+        )
+        q = np.zeros((4 * config.num_levels, 4 * config.num_levels), dtype=np.float64)
+        # 全零状态满足每个 block 至多一个 bit，但四相之和为 0，不是可行 composition。
+        one_hot_only = np.zeros(4 * config.num_levels, dtype=np.float64)
+        with (
+            mock.patch("figure4_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
+            mock.patch("figure4_pipeline.fm_to_qubo", return_value=(q, 0.0)),
+            mock.patch(
+                "figure4_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(one_hot_only),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                (
+                    "setting='wo_cgfm'.*objective='kappa'.*seed=8.*iteration=1/1.*"
+                    "one_hot_valid=1/1.*fully_feasible=0/1.*num_levels=5.*sa_sweeps=7.*"
+                    "unchanged --resume"
+                ),
+            ):
+                run_single_trajectory(
+                    rows,
+                    FIGURE4_OBJECTIVES[0],
+                    seed=8,
+                    config=config,
+                    setting="wo_cgfm",
+                )
 
     def test_random_replacement_is_forced_to_be_novel(self) -> None:
         duplicate = np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64)

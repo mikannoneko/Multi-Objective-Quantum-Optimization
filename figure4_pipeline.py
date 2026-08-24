@@ -618,7 +618,31 @@ def _fit_and_solve_iteration(
         composition = strategy.decode_candidate(candidate_bits, encoding)
         return composition is not None and validate_candidate_composition(composition)
 
-    selected = select_lowest_energy_feasible_sample(sampling, is_feasible)
+    try:
+        selected = select_lowest_energy_feasible_sample(sampling, is_feasible)
+    except RuntimeError as exc:
+        one_hot_valid = 0
+        fully_feasible = 0
+        for sample in sampling.samples:
+            composition = strategy.decode_candidate(sample.state, encoding)
+            if composition is None:
+                continue
+            one_hot_valid += 1
+            if validate_candidate_composition(composition):
+                fully_feasible += 1
+        detail = (
+            "Figure 4 SA found no feasible candidate for "
+            f"setting={strategy.name!r}, objective={objective.name!r}, seed={seed}, "
+            f"iteration={iteration + 1}/{config.iterations}: "
+            f"one_hot_valid={one_hot_valid}/{sampling.num_samples}, "
+            f"fully_feasible={fully_feasible}/{sampling.num_samples}, "
+            f"num_levels={config.num_levels}, sa_sweeps={config.sa_sweeps}. "
+            "This is a deterministic heuristic-sampling failure; unchanged --resume "
+            "repeats the same SA batch. Use a separate output directory with a smaller "
+            "--num-levels or another SA configuration."
+        )
+        LOGGER.error(detail)
+        raise RuntimeError(detail) from exc
     return TrainingIterationResult(
         encoding=encoding,
         candidate_bits=selected.state,

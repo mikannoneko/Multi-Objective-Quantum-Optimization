@@ -13,6 +13,10 @@
 - `validate_reproduction.py` 按“严格契约解析 → Figure 自洽重建 → 非阻断 diagnostics → JSON-safe report”四层验收 canonical `quick`；它不重新训练 FM、不重建 QUBO，也不运行 SA。
 - Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
+Figure 4 的 `paper` preset 保留论文的 50-level 编码：`wo_cgfm` 为 200-bit 密集 QUBO，`w_cgfm` 为 150 bits。论文使用 fastFM+ALS，并以 1000 runs、3000 sweeps 求解；本项目的 PyTorch FM+LBFGS 会形成不同的能量地形，而 soft penalty 只改变能量、并不保证任意有限 SA batch 一定含有可行终态。实际诊断中，某个 50-level `rho/wo_cgfm` 迭代的 1000 个终态有 335 个满足系统总和、仅 2 个满足 one-hot、没有一个同时满足；同轮可行域本身并非空集。增加 reads/sweeps 可以提高搜索量，但不提供可行性保证。
+
+因此 Figure 4 canonical `quick` 有意使用 10 levels：`wo_cgfm` 为 40 bits、`w_cgfm` 为 30 bits；直接编码仍有 `C(13,3)=286` 个可行 composition，足以容纳 100 个初始样本和 100 轮新增样本。这是“小规模流程复现”的边界，不是论文 50-level SA 表现的替代证据。`paper` 或显式 `--num-levels 50` 仍受支持，但整批 reads 无可行候选时会明确失败；程序不会把不可行状态 cure 或随机替换后冒充 QUBO 解。由于 seed schedule 是确定的，保持 config 不变执行 `--resume` 会重现同一失败批次；应使用新的 `--output-dir` 降低 `--num-levels`，或采用另一组 SA 参数。不同配置不能混用同一 checkpoint 目录。
+
 论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。这是工程替代，因此结果只能称为“小规模流程复现”。
 
 当前仓库尚未提交新版本 canonical `quick` 验收通过报告；实时状态见 `results/reproduction_status.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
@@ -174,7 +178,7 @@ Figure4ExperimentConfig
 | preset | initial samples | iterations | levels | Optuna trials | SA reads | SA sweeps | default seeds | 用途 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | `test` | 10 | 2 | 8 | 0 | 32 | 12 | 1 | 烟测 |
-| `quick` | 100 | 100 | 50 | 3 | 100 | 500 | 3 | 项目验收 |
+| `quick` | 100 | 100 | 10 | 3 | 100 | 500 | 3 | 小规模项目验收；不承担论文 50-level SA 难度 |
 | `paper` | 100 | 600 | 50 | 20 | 1000 | 3000 | 20 | 参数参考，不验收 |
 
 - 配置先由 `preset_config` 解析，再由 `resolve_experiment_config` 应用 CLI 显式覆盖；未覆盖字段保留 preset 值。
@@ -185,6 +189,7 @@ Figure4ExperimentConfig
 - 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
 - canonical `quick` 验收要求表中精确配置、3 个默认 seed、全部 setting 和 objective；任何数值或 seed 覆盖都可运行，但不属于 canonical 验收结果。
 - validator 不再维护第二套 objective、setting 或 quick 数值；验收规模由 `preset_config("quick")` 和 `FIGURE4_PRESET_NUM_SEEDS` 派生。
+- 旧的 50-level `quick` checkpoint 仍可通过显式传回原 config 读取，但不再属于 canonical `quick`；若它已经在某一确定性 SA 批次失败，原样恢复不会改变结果。
 
 ### Figure 4 运行方法
 

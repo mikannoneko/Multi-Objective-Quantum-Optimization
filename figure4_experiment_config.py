@@ -111,7 +111,10 @@ def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4Experi
         return Figure4ExperimentConfig(
             num_samples=100,
             iterations=100,
-            encoding=EncodingConfig(num_levels=50),
+            # quick 只验收小规模流程。保留论文的 50-level/200-bit 直接编码会让
+            # soft-constraint SA 在有限 reads 内可能完全找不到可行终态；10 levels
+            # 仍提供 286 个直接编码可行 composition，足以容纳本 preset 的 200 行。
+            encoding=EncodingConfig(num_levels=10),
             fm=FMConfig(optuna_trials=3, device=device),
             sa=SAConfig(reads=100, sweeps=500),
         )
