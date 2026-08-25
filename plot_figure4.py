@@ -62,7 +62,7 @@ def _required_curve(stats: dict[str, Any], key: str) -> np.ndarray:
 
 
 def _merge_aggregated(summary_paths: list[Path]) -> dict[str, dict[str, Any]]:
-    """合并一个或多个 schema v4 summary 的 aggregated 曲线。"""
+    """合并一个或多个当前 schema summary 的 aggregated 曲线。"""
 
     merged: dict[str, dict[str, Any]] = {}
     for path in summary_paths:

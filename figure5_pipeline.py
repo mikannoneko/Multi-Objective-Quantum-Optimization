@@ -26,13 +26,12 @@ from alloy_dataset_generator import (
 from fm_torch import fit_torch_fm, fm_to_qubo
 from qubo_math import (
     IterationEncoding,
-    ONE_HOT_PENALTY_WEIGHT,
     QuboBuildResult,
     QuboStats,
-    SYSTEM_PENALTY_WEIGHT,
     build_single_objective_qubo,
     create_iteration_encoding,
     decode_candidate_bits_to_composition,
+    diagnose_no_feasible_candidate,
     encode_single_objective_rows,
     prepare_discrete_composition,
     select_lowest_energy_feasible_sample,
@@ -88,11 +87,12 @@ _STATE_COUNTER_FIELDS = (
     "max_feasible_candidate_rank",
 )
 _QUBO_FLOAT_FIELDS = (
+    "fm_objective_weight",
+    "system_penalty_weight",
+    "one_hot_penalty_weight",
     "fm_scale",
     "system_scale",
     "one_hot_scale",
-    "system_penalty_weight",
-    "one_hot_penalty_weight",
     "max_abs",
 )
 _DATASET_ROW_FIELDS = frozenset(CSV_FIELDNAMES)
@@ -293,7 +293,12 @@ def _checkpoint_state_error(checkpoint: Path, detail: str) -> ValueError:
 
 
 def _is_json_number(value: Any) -> bool:
-    return type(value) in {int, float}
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _require_exact_fields(
@@ -443,15 +448,25 @@ def _state_from_checkpoint(payload: Mapping[str, Any], checkpoint: Path) -> Figu
         )
         for field_name in _QUBO_FLOAT_FIELDS:
             if not _is_json_number(raw_qubo_stats[field_name]):
-                raise _checkpoint_state_error(checkpoint, f"state.qubo_stats.{field_name} must be a number")
+                raise _checkpoint_state_error(
+                    checkpoint,
+                    f"state.qubo_stats.{field_name} must be a finite number",
+                )
+        if type(raw_qubo_stats["normalization_scheme"]) is not str:
+            raise _checkpoint_state_error(
+                checkpoint,
+                "state.qubo_stats.normalization_scheme must be a string",
+            )
         if type(raw_qubo_stats["num_variables"]) is not int:
             raise _checkpoint_state_error(checkpoint, "state.qubo_stats.num_variables must be an integer")
         qubo_stats = QuboStats(
+            normalization_scheme=raw_qubo_stats["normalization_scheme"],
+            fm_objective_weight=float(raw_qubo_stats["fm_objective_weight"]),
+            system_penalty_weight=float(raw_qubo_stats["system_penalty_weight"]),
+            one_hot_penalty_weight=float(raw_qubo_stats["one_hot_penalty_weight"]),
             fm_scale=float(raw_qubo_stats["fm_scale"]),
             system_scale=float(raw_qubo_stats["system_scale"]),
             one_hot_scale=float(raw_qubo_stats["one_hot_scale"]),
-            system_penalty_weight=float(raw_qubo_stats["system_penalty_weight"]),
-            one_hot_penalty_weight=float(raw_qubo_stats["one_hot_penalty_weight"]),
             num_variables=raw_qubo_stats["num_variables"],
             max_abs=float(raw_qubo_stats["max_abs"]),
         )
@@ -831,30 +846,49 @@ def _validate_trajectory_state(
                 checkpoint,
                 f"qubo_stats.{field_name} must be finite and non-negative",
             )
-    if stats.fm_scale <= 0.0 or stats.system_scale <= 0.0 or stats.one_hot_scale <= 0.0:
-        raise _checkpoint_state_error(checkpoint, "QUBO normalization scales must be positive")
+    if stats.normalization_scheme != config.qubo.normalization_scheme:
+        raise _checkpoint_state_error(checkpoint, "qubo_stats.normalization_scheme is inconsistent")
     expected_num_variables = 4 * config.num_levels
     if stats.num_variables != expected_num_variables:
         raise _checkpoint_state_error(
             checkpoint,
             f"qubo_stats.num_variables={stats.num_variables}; expected {expected_num_variables}",
         )
-    if not math.isclose(
-        stats.system_penalty_weight,
-        SYSTEM_PENALTY_WEIGHT,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise _checkpoint_state_error(checkpoint, "qubo_stats.system_penalty_weight is inconsistent")
-    if not math.isclose(
-        stats.one_hot_penalty_weight,
-        ONE_HOT_PENALTY_WEIGHT,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise _checkpoint_state_error(checkpoint, "qubo_stats.one_hot_penalty_weight is inconsistent")
-    if stats.max_abs <= 0.0:
-        raise _checkpoint_state_error(checkpoint, "qubo_stats.max_abs must be positive")
+    expected_weights = {
+        "fm": config.qubo.fm_objective_weight,
+        "system": config.qubo.system_penalty_weight,
+        "one_hot": config.qubo.one_hot_penalty_weight,
+    }
+    weight_fields = {
+        "fm": "fm_objective_weight",
+        "system": "system_penalty_weight",
+        "one_hot": "one_hot_penalty_weight",
+    }
+    for term_name, expected_weight in expected_weights.items():
+        actual_weight = getattr(stats, weight_fields[term_name])
+        if not math.isclose(actual_weight, expected_weight, rel_tol=0.0, abs_tol=1e-12):
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"qubo_stats.{term_name} weight is inconsistent with config",
+            )
+        scale = getattr(stats, f"{term_name}_scale")
+        valid_scale = scale > 0.0 if expected_weight > 0.0 else math.isclose(
+            scale, 0.0, rel_tol=0.0, abs_tol=1e-12
+        )
+        if not valid_scale:
+            raise _checkpoint_state_error(
+                checkpoint,
+                f"qubo_stats.{term_name}_scale is inconsistent with its applied weight",
+            )
+    expected_nonzero_qubo = any(weight > 0.0 for weight in expected_weights.values())
+    valid_max_abs = stats.max_abs > 0.0 if expected_nonzero_qubo else math.isclose(
+        stats.max_abs, 0.0, rel_tol=0.0, abs_tol=1e-12
+    )
+    if not valid_max_abs:
+        raise _checkpoint_state_error(
+            checkpoint,
+            "qubo_stats.max_abs is inconsistent with the applied QUBO weights",
+        )
 
 
 def _sample_unique_replacement_row(
@@ -945,6 +979,7 @@ def _fit_and_solve_iteration(
         merged_q,
         merged_bias,
         encoding,
+        config.qubo,
         include_system_penalty=True,
     )
     sampling = solve_qubo_with_sa(
@@ -968,7 +1003,36 @@ def _fit_and_solve_iteration(
         composition = decode_candidate_bits_to_composition(state, encoding)
         return composition is not None and validate_candidate_composition(composition)
 
-    selected = select_lowest_energy_feasible_sample(sampling, is_feasible_candidate)
+    try:
+        selected = select_lowest_energy_feasible_sample(sampling, is_feasible_candidate)
+    except RuntimeError as exc:
+        one_hot_valid = 0
+        fully_feasible = 0
+        for sample in sampling.samples:
+            composition = decode_candidate_bits_to_composition(sample.state, encoding)
+            if composition is None:
+                continue
+            one_hot_valid += 1
+            if validate_candidate_composition(composition):
+                fully_feasible += 1
+        diagnostic = diagnose_no_feasible_candidate(
+            qubo_result.q,
+            qubo_result.bias,
+            sampling,
+            encoding,
+            require_unit_sum=True,
+        )
+        detail = (
+            "Figure 5 SA found no feasible candidate for "
+            f"setting={setting!r}, seed={seed}, iteration={iteration + 1}/{config.iterations}: "
+            f"one_hot_valid={one_hot_valid}/{sampling.num_samples}, "
+            f"fully_feasible={fully_feasible}/{sampling.num_samples}, "
+            f"num_levels={config.num_levels}, sa_reads={config.sa_reads}, "
+            f"sa_sweeps={config.sa_sweeps}. {diagnostic.format_message()} "
+            "The seed schedule is deterministic; unchanged --resume repeats the same SA batch."
+        )
+        LOGGER.error(detail)
+        raise RuntimeError(detail) from exc
     return TrainingIterationResult(
         encoding=encoding,
         candidate_bits=selected.state,
@@ -1193,7 +1257,7 @@ def run_figure5_experiment(
     resume: bool = False,
     settings: Sequence[Figure5Setting] = FIGURE5_SETTINGS,
 ) -> Figure5Summary:
-    """Internal runner/test orchestration that writes Figure 5 summary schema v4."""
+    """Internal runner/test orchestration that writes the current Figure 5 summary."""
 
     selected_settings = validate_settings(settings)
     selected_seeds = _validate_seed_schedule(seed_list, config)

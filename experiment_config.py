@@ -2,9 +2,30 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
+from typing import Literal
 
 from experiment_runtime import require_integer
+
+
+QUBO_NORMALIZATION_SCHEME = "max_abs_polynomial_coefficient_v1"
+QuboNormalizationScheme = Literal["max_abs_polynomial_coefficient_v1"]
+
+
+def _require_non_negative_finite_real(field_name: str, value: Real) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{field_name} must be a finite non-negative real number")
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field_name} must be a finite non-negative real number"
+        ) from exc
+    if not math.isfinite(normalized) or normalized < 0.0:
+        raise ValueError(f"{field_name} must be a finite non-negative real number")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -47,4 +68,41 @@ class SAConfig:
         object.__setattr__(self, "sweeps", require_integer("sa_sweeps", self.sweeps, minimum=1))
 
 
-__all__ = ["EncodingConfig", "FMConfig", "SAConfig"]
+@dataclass(frozen=True)
+class QuboConfig:
+    """Weights and normalization semantics for the complete production QUBO."""
+
+    fm_objective_weight: float = 1.0
+    system_penalty_weight: float = 650.0
+    one_hot_penalty_weight: float = 1.0
+    normalization_scheme: QuboNormalizationScheme = QUBO_NORMALIZATION_SCHEME
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "fm_objective_weight",
+            "system_penalty_weight",
+            "one_hot_penalty_weight",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _require_non_negative_finite_real(field_name, getattr(self, field_name)),
+            )
+        if (
+            type(self.normalization_scheme) is not str
+            or self.normalization_scheme != QUBO_NORMALIZATION_SCHEME
+        ):
+            raise ValueError(
+                "normalization_scheme must be "
+                f"{QUBO_NORMALIZATION_SCHEME!r}"
+            )
+
+
+__all__ = [
+    "EncodingConfig",
+    "FMConfig",
+    "QUBO_NORMALIZATION_SCHEME",
+    "QuboConfig",
+    "QuboNormalizationScheme",
+    "SAConfig",
+]

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_multi_objective
+from experiment_config import QUBO_NORMALIZATION_SCHEME
 from experiment_runtime import (
     FIGURE4_SEED_INDEX,
     FIGURE5_SEED_INDEX,
@@ -36,11 +37,7 @@ from figure5_scalarization import (
     compute_individual_objective_targets,
     preference_weights_for_iteration,
 )
-from qubo_math import (
-    ONE_HOT_PENALTY_WEIGHT,
-    SYSTEM_PENALTY_WEIGHT,
-    prepare_discrete_composition,
-)
+from qubo_math import prepare_discrete_composition
 from validate_reproduction import (
     exact_figure5_front,
     figure5_front_metrics,
@@ -69,16 +66,34 @@ def _fm_metadata(seed_plan: dict[str, object], trials: int) -> dict[str, object]
     }
 
 
-def _qubo_stats(*, setting: str, levels: int, figure: int) -> dict[str, object]:
+def _qubo_stats(
+    *,
+    setting: str,
+    config: Figure4ExperimentConfig | Figure5ExperimentConfig,
+    figure: int,
+) -> dict[str, object]:
     include_system = figure == 5 or setting == "wo_cgfm"
+    applied_system_weight = config.qubo.system_penalty_weight if include_system else 0.0
     return {
-        "fm_scale": 2.0,
-        "system_scale": 3.0 if include_system else 0.0,
-        "one_hot_scale": 1.0,
-        "system_penalty_weight": SYSTEM_PENALTY_WEIGHT if include_system else 0.0,
-        "one_hot_penalty_weight": ONE_HOT_PENALTY_WEIGHT,
-        "num_variables": (4 if include_system else 3) * levels,
-        "max_abs": 1.0,
+        "normalization_scheme": config.qubo.normalization_scheme,
+        "fm_objective_weight": config.qubo.fm_objective_weight,
+        "system_penalty_weight": applied_system_weight,
+        "one_hot_penalty_weight": config.qubo.one_hot_penalty_weight,
+        "fm_scale": 2.0 if config.qubo.fm_objective_weight > 0.0 else 0.0,
+        "system_scale": 3.0 if applied_system_weight > 0.0 else 0.0,
+        "one_hot_scale": 1.0 if config.qubo.one_hot_penalty_weight > 0.0 else 0.0,
+        "num_variables": (4 if include_system else 3) * config.num_levels,
+        "max_abs": (
+            1.0
+            if any(
+                (
+                    config.qubo.fm_objective_weight,
+                    applied_system_weight,
+                    config.qubo.one_hot_penalty_weight,
+                )
+            )
+            else 0.0
+        ),
     }
 
 
@@ -126,7 +141,7 @@ def _figure4_summary(
                         "fm_metadata": _fm_metadata(
                             fm_seed_plan(root, config.optuna_trials), config.optuna_trials
                         ),
-                        "qubo_stats": _qubo_stats(setting=setting, levels=config.num_levels, figure=4),
+                        "qubo_stats": _qubo_stats(setting=setting, config=config, figure=4),
                         "duplicate_replacements": 0,
                         "random_replacements": 0,
                         "random_replacement_draws": 0,
@@ -150,7 +165,7 @@ def _figure4_summary(
             "num_trajectories": len(seeds),
         }
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "seed_derivation": SEED_DERIVATION_SCHEME,
         "training_backend": FM_TRAINING_BACKEND,
         "config": config.to_dict(),
@@ -288,7 +303,7 @@ def _figure5_summary(config: Figure5ExperimentConfig | None = None) -> dict[str,
                 "latest_weights": list(last_weights),
                 "latest_fm_metadata": latest_fm_metadata,
                 "latest_scalarization_metadata": scalarization_metadata,
-                "qubo_stats": _qubo_stats(setting=setting, levels=config.num_levels, figure=5),
+                "qubo_stats": _qubo_stats(setting=setting, config=config, figure=5),
                 "duplicate_replacements": 0,
                 "random_replacements": 0,
                 "random_replacement_draws": 0,
@@ -309,7 +324,7 @@ def _figure5_summary(config: Figure5ExperimentConfig | None = None) -> dict[str,
         for setting in FIGURE5_SETTINGS
     ]
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "seed_derivation": SEED_DERIVATION_SCHEME,
         "training_backend": FM_TRAINING_BACKEND,
         "config": config.to_dict(),
@@ -364,6 +379,10 @@ class ReproductionValidationTests(unittest.TestCase):
         self.assertEqual(figure5_report["report_schema_version"], 3)
         self.assertTrue(figure4_report["passed"])
         self.assertTrue(figure5_report["passed"])
+        self.assertEqual(
+            self.figure4["config"]["qubo"]["normalization_scheme"],
+            QUBO_NORMALIZATION_SCHEME,
+        )
         self.assertIsNone(figure4_report["metrics"])
         self.assertIsNotNone(figure5_report["metrics"])
         json.dumps(figure4_report, allow_nan=False)
@@ -380,6 +399,14 @@ class ReproductionValidationTests(unittest.TestCase):
                 json.dumps(report, allow_nan=False)
 
     def test_exact_fields_and_canonical_order_are_enforced(self) -> None:
+        for fixture, validator in (
+            (self.figure4, validate_figure4_summary),
+            (self.figure5, validate_figure5_summary),
+        ):
+            legacy = copy.deepcopy(fixture)
+            legacy["schema_version"] = 4
+            self.assertFalse(validator(legacy)["checks"]["summary_contract"]["passed"])
+
         extra = copy.deepcopy(self.figure4)
         extra["unexpected"] = 1
         self.assertFalse(validate_figure4_summary(extra)["checks"]["summary_contract"]["passed"])
@@ -412,6 +439,18 @@ class ReproductionValidationTests(unittest.TestCase):
         mutations = (
             ("fm", lambda summary: summary["trajectories"][0]["fm_metadata"]["seed_plan"].__setitem__("root", 1)),
             ("qubo", lambda summary: summary["trajectories"][0]["qubo_stats"].__setitem__("num_variables", 1)),
+            (
+                "qubo_weight",
+                lambda summary: summary["trajectories"][0]["qubo_stats"].__setitem__(
+                    "fm_objective_weight", 2.0
+                ),
+            ),
+            (
+                "qubo_scheme",
+                lambda summary: summary["trajectories"][0]["qubo_stats"].__setitem__(
+                    "normalization_scheme", "unknown"
+                ),
+            ),
             ("counter", lambda summary: summary["trajectories"][0].__setitem__("accepted_sa_candidates", 99)),
             ("rank", lambda summary: summary["trajectories"][0].__setitem__("max_feasible_candidate_rank", 101)),
         )
@@ -446,6 +485,12 @@ class ReproductionValidationTests(unittest.TestCase):
             ("scalar_metadata", lambda trajectory: trajectory["latest_scalarization_metadata"].__setitem__("utopian_space", "raw")),
             ("fm", lambda trajectory: trajectory["latest_fm_metadata"]["artificial_target"]["seed_plan"].__setitem__("root", 1)),
             ("qubo", lambda trajectory: trajectory["qubo_stats"].__setitem__("system_scale", 0.0)),
+            (
+                "qubo_weight",
+                lambda trajectory: trajectory["qubo_stats"].__setitem__(
+                    "one_hot_penalty_weight", 2.0
+                ),
+            ),
         )
         for name, mutate in mutations:
             with self.subTest(name=name):

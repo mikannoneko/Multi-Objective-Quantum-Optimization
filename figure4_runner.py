@@ -72,6 +72,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Simulated annealing read count (--sa-runs is a compatibility alias).",
     )
     parser.add_argument("--sa-sweeps", type=int, default=None, help="Simulated annealing sweep count.")
+    parser.add_argument(
+        "--fm-objective-weight",
+        type=float,
+        default=None,
+        help="Weight applied to the normalized FM objective QUBO term.",
+    )
+    parser.add_argument(
+        "--system-penalty-weight",
+        type=float,
+        default=None,
+        help="Weight applied to the normalized system-constraint QUBO term.",
+    )
+    parser.add_argument(
+        "--one-hot-penalty-weight",
+        type=float,
+        default=None,
+        help="Weight applied to the normalized one-hot QUBO term.",
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="PyTorch execution device.")
     parser.add_argument("--resume", action="store_true", help="Resume from per-trajectory checkpoints in output-dir.")
     parser.add_argument(
@@ -156,6 +174,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         optuna_trials=args.optuna_trials,
         sa_reads=args.sa_reads,
         sa_sweeps=args.sa_sweeps,
+        fm_objective_weight=args.fm_objective_weight,
+        system_penalty_weight=args.system_penalty_weight,
+        one_hot_penalty_weight=args.one_hot_penalty_weight,
     )
     ensure_training_dependencies(TRAINING_REQUIRED_MODULES)
     ensure_compute_device_available(config.device)

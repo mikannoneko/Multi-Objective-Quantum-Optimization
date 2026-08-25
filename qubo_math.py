@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from itertools import product
+from numbers import Real
+from typing import Callable, Dict, Iterator, Literal, Optional, Sequence, Tuple
 
 import dimod
 import numpy as np
 from neal import SimulatedAnnealingSampler
 
+from experiment_config import QUBO_NORMALIZATION_SCHEME, QuboConfig
 from experiment_runtime import NEAL_SEED_MAX, require_integer
 
 
-SYSTEM_PENALTY_WEIGHT = 650.0
-ONE_HOT_PENALTY_WEIGHT = 1.0
 DEFAULT_TOLERANCE = 1e-10
 CGFM_ANGLE_MAX = np.pi / 2.0
+MAX_EXACT_DIAGNOSTIC_STATES = 1_000_000
+
+NoFeasibleCandidateClassification = Literal[
+    "qubo_penalty_balance_failure",
+    "heuristic_sampling_failure",
+    "unclassified_no_feasible_candidate",
+]
 
 
 @dataclass(frozen=True)
@@ -43,11 +52,13 @@ class IterationEncoding:
 
 @dataclass(frozen=True)
 class QuboStats:
+    normalization_scheme: str
+    fm_objective_weight: float
+    system_penalty_weight: float
+    one_hot_penalty_weight: float
     fm_scale: float
     system_scale: float
     one_hot_scale: float
-    system_penalty_weight: float
-    one_hot_penalty_weight: float
     num_variables: int
     max_abs: float
 
@@ -86,6 +97,55 @@ class FeasibleSASolution:
     energy: float
     rank: int
     infeasible_samples_skipped: int
+
+
+@dataclass(frozen=True)
+class NoFeasibleCandidateDiagnostic:
+    """Exact feasible-domain evidence for an SA batch containing no feasible state."""
+
+    classification: NoFeasibleCandidateClassification
+    lowest_sampled_infeasible_energy: float
+    exact_best_feasible_energy: float | None
+    exact_feasible_state_count: int
+    max_exact_diagnostic_states: int
+
+    def format_message(self) -> str:
+        exact_energy = (
+            "not_computed"
+            if self.exact_best_feasible_energy is None
+            else f"{self.exact_best_feasible_energy:.12g}"
+        )
+        evidence = (
+            f"lowest_sampled_infeasible_energy={self.lowest_sampled_infeasible_energy:.12g}, "
+            f"exact_best_feasible_energy={exact_energy}, "
+            f"exact_feasible_state_count={self.exact_feasible_state_count}, "
+            f"max_exact_diagnostic_states={self.max_exact_diagnostic_states}"
+        )
+
+        if self.classification == "qubo_penalty_balance_failure":
+            return (
+                "classification=qubo_penalty_balance_failure "
+                "(QUBO penalty-balance failure); "
+                f"{evidence}. At least one sampled infeasible state is lower in energy than "
+                "every feasible encoded state; adjust the QUBO penalty balance rather than "
+                "only increasing SA effort."
+            )
+        if self.classification == "heuristic_sampling_failure":
+            return (
+                "classification=heuristic_sampling_failure "
+                "(heuristic-sampling failure); "
+                f"{evidence}. The exact feasible optimum is lower in energy than every sampled "
+                "infeasible state; adjust SA reads, sweeps, or solver configuration."
+            )
+        if self.exact_best_feasible_energy is None:
+            reason = "exact comparison skipped because the feasible-domain state count exceeds the limit"
+        else:
+            reason = "the two energies are equal within rel_tol=abs_tol=1e-12"
+        return (
+            "classification=unclassified_no_feasible_candidate; "
+            "no feasible SA candidate; cause not classified; "
+            f"{evidence}. {reason}."
+        )
 
 
 def get_positive_level_values(num_levels: int) -> np.ndarray:
@@ -382,9 +442,16 @@ def _maximum_abs_qubo_coefficient(q: np.ndarray) -> float:
     return max(linear_scale, quadratic_scale)
 
 
-def normalize_qubo_term(q: np.ndarray, bias: float) -> Tuple[np.ndarray, float, float]:
+def normalize_qubo_term(
+    q: np.ndarray,
+    bias: float,
+    *,
+    normalization_scheme: str,
+) -> Tuple[np.ndarray, float, float]:
     """按实际线性/二次多项式系数归一化，常数偏置不参与尺度计算。"""
 
+    if normalization_scheme != QUBO_NORMALIZATION_SCHEME:
+        raise ValueError(f"Unsupported QUBO normalization scheme: {normalization_scheme!r}")
     q_array = np.asarray(q, dtype=np.float64)
     scale = _maximum_abs_qubo_coefficient(q_array)
     if scale <= 0.0:
@@ -396,6 +463,7 @@ def build_single_objective_qubo(
     fm_q: np.ndarray,
     fm_bias: float,
     encoding: IterationEncoding,
+    qubo_config: QuboConfig,
     include_system_penalty: bool = True,
 ) -> QuboBuildResult:
     """合成最终交给 SA 的 QUBO。
@@ -404,28 +472,57 @@ def build_single_objective_qubo(
     system penalty 只在直接四相分数编码时加入，用来惩罚四相总和偏离 1。
     """
 
-    one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
+    fm_q_array = np.asarray(fm_q, dtype=np.float64)
+    expected_size = encoding.num_blocks * encoding.num_levels
+    if fm_q_array.shape != (expected_size, expected_size):
+        raise ValueError(
+            f"FM QUBO matrix shape must be {(expected_size, expected_size)} for this encoding"
+        )
+    total_q = np.zeros_like(fm_q_array)
+    total_bias = 0.0
 
-    normalized_fm_q, normalized_fm_bias, fm_scale = normalize_qubo_term(fm_q, fm_bias)
-    normalized_one_hot_q, normalized_one_hot_bias, one_hot_scale = normalize_qubo_term(one_hot_q, one_hot_bias)
+    fm_scale = 0.0
+    if qubo_config.fm_objective_weight > 0.0:
+        normalized_fm_q, normalized_fm_bias, fm_scale = normalize_qubo_term(
+            fm_q_array,
+            fm_bias,
+            normalization_scheme=qubo_config.normalization_scheme,
+        )
+        total_q += qubo_config.fm_objective_weight * normalized_fm_q
+        total_bias += qubo_config.fm_objective_weight * normalized_fm_bias
 
-    total_q = normalized_fm_q + (ONE_HOT_PENALTY_WEIGHT * normalized_one_hot_q)
-    total_bias = normalized_fm_bias + (ONE_HOT_PENALTY_WEIGHT * normalized_one_hot_bias)
+    one_hot_scale = 0.0
+    if qubo_config.one_hot_penalty_weight > 0.0:
+        one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
+        normalized_one_hot_q, normalized_one_hot_bias, one_hot_scale = normalize_qubo_term(
+            one_hot_q,
+            one_hot_bias,
+            normalization_scheme=qubo_config.normalization_scheme,
+        )
+        total_q += qubo_config.one_hot_penalty_weight * normalized_one_hot_q
+        total_bias += qubo_config.one_hot_penalty_weight * normalized_one_hot_bias
+
     system_scale = 0.0
     system_penalty_weight = 0.0
-    if include_system_penalty:
+    if include_system_penalty and qubo_config.system_penalty_weight > 0.0:
         system_q, system_bias = build_system_penalty_matrix(encoding)
-        normalized_system_q, normalized_system_bias, system_scale = normalize_qubo_term(system_q, system_bias)
-        total_q = total_q + (SYSTEM_PENALTY_WEIGHT * normalized_system_q)
-        total_bias = total_bias + (SYSTEM_PENALTY_WEIGHT * normalized_system_bias)
-        system_penalty_weight = SYSTEM_PENALTY_WEIGHT
+        normalized_system_q, normalized_system_bias, system_scale = normalize_qubo_term(
+            system_q,
+            system_bias,
+            normalization_scheme=qubo_config.normalization_scheme,
+        )
+        total_q += qubo_config.system_penalty_weight * normalized_system_q
+        total_bias += qubo_config.system_penalty_weight * normalized_system_bias
+        system_penalty_weight = qubo_config.system_penalty_weight
 
     stats = QuboStats(
+        normalization_scheme=qubo_config.normalization_scheme,
+        fm_objective_weight=qubo_config.fm_objective_weight,
+        system_penalty_weight=float(system_penalty_weight),
+        one_hot_penalty_weight=qubo_config.one_hot_penalty_weight,
         fm_scale=float(fm_scale),
         system_scale=float(system_scale),
         one_hot_scale=float(one_hot_scale),
-        system_penalty_weight=float(system_penalty_weight),
-        one_hot_penalty_weight=float(ONE_HOT_PENALTY_WEIGHT),
         num_variables=int(total_q.shape[0]),
         max_abs=_maximum_abs_qubo_coefficient(total_q),
     )
@@ -546,17 +643,196 @@ def select_lowest_energy_feasible_sample(
     )
 
 
+def _iter_unit_sum_counts(num_blocks: int, remaining: int) -> Iterator[Tuple[int, ...]]:
+    if num_blocks == 1:
+        yield (remaining,)
+        return
+    for count in range(remaining + 1):
+        for suffix in _iter_unit_sum_counts(num_blocks - 1, remaining - count):
+            yield (count, *suffix)
+
+
+def _active_qubo_energy(q: np.ndarray, bias: float, active_indices: Sequence[int]) -> float:
+    energy = float(bias) + sum(float(q[index, index]) for index in active_indices)
+    for left_position, left_index in enumerate(active_indices):
+        for right_index in active_indices[left_position + 1 :]:
+            energy += float(q[left_index, right_index]) + float(q[right_index, left_index])
+    if not math.isfinite(energy):
+        raise ValueError("QUBO energy must remain finite for every diagnostic state")
+    return energy
+
+
+def _state_is_feasible_for_encoding(
+    state: np.ndarray,
+    encoding: IterationEncoding,
+    *,
+    require_unit_sum: bool,
+) -> bool:
+    total_count = 0
+    for block_index in range(encoding.num_blocks):
+        start = block_index * encoding.num_levels
+        block = state[start : start + encoding.num_levels]
+        active = np.flatnonzero(block > 0.5)
+        if len(active) > 1:
+            return False
+        if len(active) == 1:
+            total_count += int(
+                encoding.positive_count_by_bit[block_index][int(active[0])]
+            )
+    return not require_unit_sum or total_count == encoding.num_levels
+
+
+def diagnose_no_feasible_candidate(
+    q: np.ndarray,
+    bias: float,
+    sampling: SASamplingResult,
+    encoding: IterationEncoding,
+    *,
+    require_unit_sum: bool,
+    max_exact_diagnostic_states: int = MAX_EXACT_DIAGNOSTIC_STATES,
+) -> NoFeasibleCandidateDiagnostic:
+    """Classify an all-infeasible SA batch by exact feasible-domain enumeration.
+
+    This function is diagnostic only: it deliberately returns energies and a
+    classification, never the exact feasible state itself.
+    """
+
+    max_states = require_integer(
+        "max_exact_diagnostic_states",
+        max_exact_diagnostic_states,
+        minimum=1,
+    )
+    if type(require_unit_sum) is not bool:
+        raise ValueError("require_unit_sum must be a boolean")
+    if isinstance(bias, bool) or not isinstance(bias, Real) or not math.isfinite(float(bias)):
+        raise ValueError("QUBO bias must be a finite real number")
+
+    raw_q = np.asarray(q)
+    if raw_q.dtype.kind not in "iuf":
+        raise ValueError("QUBO matrix must contain real numeric coefficients")
+    q_array = raw_q.astype(np.float64, copy=False)
+    num_variables = encoding.num_blocks * encoding.num_levels
+    if q_array.shape != (num_variables, num_variables):
+        raise ValueError(
+            f"QUBO matrix shape must be {(num_variables, num_variables)} for this encoding"
+        )
+    if not np.all(np.isfinite(q_array)):
+        raise ValueError("QUBO matrix coefficients must be finite")
+    if require_unit_sum and (
+        encoding.num_blocks != 4 or abs(encoding.value_scale - 1.0) > DEFAULT_TOLERANCE
+    ):
+        raise ValueError("Unit-sum diagnostics require direct four-fraction encoding")
+    if not sampling.samples:
+        raise ValueError("sampling must contain at least one infeasible state")
+
+    sampled_energies: list[float] = []
+    for sample_index, sample in enumerate(sampling.samples):
+        raw_state = np.asarray(sample.state)
+        if raw_state.dtype.kind not in "iuf":
+            raise ValueError(
+                f"sampling.samples[{sample_index}].state must contain numeric binary values"
+            )
+        state = raw_state.astype(np.float64, copy=False)
+        if state.shape != (num_variables,):
+            raise ValueError(
+                f"sampling.samples[{sample_index}].state must have shape {(num_variables,)}"
+            )
+        if not np.all(np.isfinite(state)) or not np.all((state == 0.0) | (state == 1.0)):
+            raise ValueError(
+                f"sampling.samples[{sample_index}].state must contain finite binary values"
+            )
+        if _state_is_feasible_for_encoding(
+            state,
+            encoding,
+            require_unit_sum=require_unit_sum,
+        ):
+            raise ValueError("sampling must contain no feasible encoded state")
+        sampled_energies.append(
+            _active_qubo_energy(
+                q_array,
+                float(bias),
+                [int(index) for index in np.flatnonzero(state)],
+            )
+        )
+    lowest_sampled_energy = min(sampled_energies)
+
+    if require_unit_sum:
+        feasible_state_count = math.comb(
+            encoding.num_levels + encoding.num_blocks - 1,
+            encoding.num_blocks - 1,
+        )
+    else:
+        feasible_state_count = (encoding.num_levels + 1) ** encoding.num_blocks
+    if feasible_state_count > max_states:
+        return NoFeasibleCandidateDiagnostic(
+            classification="unclassified_no_feasible_candidate",
+            lowest_sampled_infeasible_energy=lowest_sampled_energy,
+            exact_best_feasible_energy=None,
+            exact_feasible_state_count=feasible_state_count,
+            max_exact_diagnostic_states=max_states,
+        )
+
+    if require_unit_sum:
+        count_candidates = _iter_unit_sum_counts(
+            encoding.num_blocks,
+            encoding.num_levels,
+        )
+    else:
+        count_candidates = product(
+            range(encoding.num_levels + 1),
+            repeat=encoding.num_blocks,
+        )
+
+    exact_best_energy = float("inf")
+    enumerated_states = 0
+    for counts in count_candidates:
+        enumerated_states += 1
+        active_indices = [
+            (block_index * encoding.num_levels)
+            + int(encoding.bit_index_by_count[block_index][count])
+            for block_index, count in enumerate(counts)
+            if count > 0
+        ]
+        exact_best_energy = min(
+            exact_best_energy,
+            _active_qubo_energy(q_array, float(bias), active_indices),
+        )
+    if enumerated_states != feasible_state_count or not math.isfinite(exact_best_energy):
+        raise RuntimeError("Internal error while enumerating the exact feasible encoding domain")
+
+    if math.isclose(
+        lowest_sampled_energy,
+        exact_best_energy,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        classification: NoFeasibleCandidateClassification = (
+            "unclassified_no_feasible_candidate"
+        )
+    elif lowest_sampled_energy < exact_best_energy:
+        classification = "qubo_penalty_balance_failure"
+    else:
+        classification = "heuristic_sampling_failure"
+    return NoFeasibleCandidateDiagnostic(
+        classification=classification,
+        lowest_sampled_infeasible_energy=lowest_sampled_energy,
+        exact_best_feasible_energy=exact_best_energy,
+        exact_feasible_state_count=feasible_state_count,
+        max_exact_diagnostic_states=max_states,
+    )
+
+
 __all__ = [
     "CGFM_ANGLE_MAX",
     "DEFAULT_TOLERANCE",
     "FeasibleSASolution",
     "IterationEncoding",
-    "ONE_HOT_PENALTY_WEIGHT",
+    "MAX_EXACT_DIAGNOSTIC_STATES",
+    "NoFeasibleCandidateDiagnostic",
     "QuboBuildResult",
     "QuboStats",
     "SASample",
     "SASamplingResult",
-    "SYSTEM_PENALTY_WEIGHT",
     "build_one_hot_penalty_matrix",
     "build_single_objective_qubo",
     "build_system_penalty_matrix",
@@ -569,6 +845,7 @@ __all__ = [
     "decode_candidate_bits_to_cgfm_composition",
     "decode_candidate_bits_to_composition",
     "decode_candidate_bits_to_values",
+    "diagnose_no_feasible_candidate",
     "encode_cgfm_rows",
     "encode_discrete_composition",
     "encode_discrete_values",

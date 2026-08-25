@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -12,7 +13,13 @@ import figure5_pipeline as pipeline
 import figure5_runner
 import figure5_scalarization
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_multi_objective
-from experiment_config import EncodingConfig, FMConfig, SAConfig
+from experiment_config import (
+    EncodingConfig,
+    FMConfig,
+    QUBO_NORMALIZATION_SCHEME,
+    QuboConfig,
+    SAConfig,
+)
 from qubo_math import (
     QuboStats,
     SASample,
@@ -60,7 +67,9 @@ from figure5_pipeline import (
 
 
 WORKSPACE_TMP_ROOT = (
-    Path(__file__).resolve().parent / ".tmp_test" / "figure5_schema_v4_mixed_radix_v1"
+    Path(__file__).resolve().parent
+    / ".tmp_test"
+    / "figure5_schema_v5_qubo_config_v1_mixed_radix_v1"
 )
 WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -75,15 +84,31 @@ def _test_config(iterations: int = 2) -> Figure5ExperimentConfig:
     )
 
 
-def _qubo_stats(num_variables: int = 32) -> QuboStats:
+def _qubo_stats(
+    num_variables: int = 32,
+    qubo_config: QuboConfig | None = None,
+) -> QuboStats:
+    qubo_config = QuboConfig() if qubo_config is None else qubo_config
     return QuboStats(
-        fm_scale=1.0,
-        system_scale=1.0,
-        one_hot_scale=1.0,
-        system_penalty_weight=650.0,
-        one_hot_penalty_weight=1.0,
+        normalization_scheme=qubo_config.normalization_scheme,
+        fm_objective_weight=qubo_config.fm_objective_weight,
+        system_penalty_weight=qubo_config.system_penalty_weight,
+        one_hot_penalty_weight=qubo_config.one_hot_penalty_weight,
+        fm_scale=1.0 if qubo_config.fm_objective_weight > 0.0 else 0.0,
+        system_scale=1.0 if qubo_config.system_penalty_weight > 0.0 else 0.0,
+        one_hot_scale=1.0 if qubo_config.one_hot_penalty_weight > 0.0 else 0.0,
         num_variables=num_variables,
-        max_abs=1.0,
+        max_abs=(
+            1.0
+            if any(
+                (
+                    qubo_config.fm_objective_weight,
+                    qubo_config.system_penalty_weight,
+                    qubo_config.one_hot_penalty_weight,
+                )
+            )
+            else 0.0
+        ),
     )
 
 
@@ -134,7 +159,7 @@ def _training_result(
         scalarization_method="ddts",
         fm_metadata=_fm_metadata(config, seed, iteration, "w_ddts"),
         scalarization_metadata=dict(scalarization.metadata),
-        qubo_stats=_qubo_stats(4 * config.num_levels),
+        qubo_stats=_qubo_stats(4 * config.num_levels, config.qubo),
         sa_energy=0.0,
         feasible_candidate_rank=1,
         infeasible_sa_samples_skipped=0,
@@ -173,6 +198,9 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual((quick.optuna_trials, quick.sa_reads, quick.sa_sweeps), (3, 100, 500))
         self.assertEqual((test.num_samples, test.iterations, test.num_levels), (10, 2, 8))
         self.assertEqual((test.sa_reads, test.sa_sweeps), (32, 12))
+        self.assertEqual(paper.qubo, QuboConfig())
+        self.assertEqual(quick.qubo, QuboConfig())
+        self.assertEqual(test.qubo, QuboConfig())
 
         overridden = resolve_experiment_config(
             preset="test",
@@ -180,8 +208,19 @@ class Figure5PipelineTests(unittest.TestCase):
             iterations=4,
             num_levels=9,
             sa_reads=7,
+            fm_objective_weight=2.0,
+            system_penalty_weight=3.0,
+            one_hot_penalty_weight=4.0,
         )
         self.assertEqual((overridden.iterations, overridden.num_levels, overridden.sa_reads), (4, 9, 7))
+        self.assertEqual(
+            overridden.qubo,
+            QuboConfig(
+                fm_objective_weight=2.0,
+                system_penalty_weight=3.0,
+                one_hot_penalty_weight=4.0,
+            ),
+        )
 
         args = figure5_runner.parse_args(["--output-dir", "figure5_default", "--settings", "w_ddts"])
         self.assertEqual(args.preset, "quick")
@@ -193,6 +232,29 @@ class Figure5PipelineTests(unittest.TestCase):
                 args.seed_start,
             ),
             [0],
+        )
+
+        qubo_args = figure5_runner.parse_args(
+            [
+                "--output-dir",
+                "figure5_qubo_override",
+                "--settings",
+                "w_ddts",
+                "--fm-objective-weight",
+                "2.5",
+                "--system-penalty-weight",
+                "0",
+                "--one-hot-penalty-weight",
+                "3.5",
+            ]
+        )
+        self.assertEqual(
+            (
+                qubo_args.fm_objective_weight,
+                qubo_args.system_penalty_weight,
+                qubo_args.one_hot_penalty_weight,
+            ),
+            (2.5, 0.0, 3.5),
         )
 
         alias_args = figure5_runner.parse_args(
@@ -442,7 +504,14 @@ class Figure5PipelineTests(unittest.TestCase):
                     preference_weights_for_iteration(0, invalid)  # type: ignore[arg-type]
 
     def test_training_uses_one_fm_for_ddts_and_three_for_weighted_sum(self) -> None:
-        config = _test_config(iterations=1)
+        config = replace(
+            _test_config(iterations=1),
+            qubo=QuboConfig(
+                fm_objective_weight=2.0,
+                system_penalty_weight=3.0,
+                one_hot_penalty_weight=4.0,
+            ),
+        )
         rows, _ = generate_initial_dataset_multi_objective(num_samples=config.num_samples, seed=2)
         rows = pipeline.discretize_rows_for_figure5(rows, config.num_levels)
         size = 4 * config.num_levels
@@ -456,6 +525,7 @@ class Figure5PipelineTests(unittest.TestCase):
             mock.patch("figure5_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})) as fit_mock,
             mock.patch("figure5_pipeline.fm_to_qubo", return_value=(np.eye(size), 1.0)),
             mock.patch("figure5_pipeline.solve_qubo_with_sa", side_effect=fake_sa),
+            mock.patch("figure5_pipeline.diagnose_no_feasible_candidate") as diagnostic_mock,
         ):
             ddts = pipeline._fit_and_solve_iteration(
                 rows=rows,
@@ -464,10 +534,13 @@ class Figure5PipelineTests(unittest.TestCase):
                 seed=2,
                 iteration=0,
             )
+        diagnostic_mock.assert_not_called()
         self.assertEqual(fit_mock.call_count, 1)
         ddts_fit_seed = fit_mock.call_args.kwargs["seed"]
         self.assertEqual(ddts.qubo_stats.num_variables, size)
-        self.assertEqual(ddts.qubo_stats.system_penalty_weight, 650.0)
+        self.assertEqual(ddts.qubo_stats.fm_objective_weight, 2.0)
+        self.assertEqual(ddts.qubo_stats.system_penalty_weight, 3.0)
+        self.assertEqual(ddts.qubo_stats.one_hot_penalty_weight, 4.0)
 
         captured: dict[str, object] = {}
 
@@ -475,12 +548,20 @@ class Figure5PipelineTests(unittest.TestCase):
             fm_q: np.ndarray,
             fm_bias: float,
             encoding: object,
+            qubo_config: QuboConfig,
             include_system_penalty: bool,
         ) -> object:
             captured["q"] = fm_q.copy()
             captured["bias"] = fm_bias
+            captured["qubo_config"] = qubo_config
             captured["include_system_penalty"] = include_system_penalty
-            return build_single_objective_qubo(fm_q, fm_bias, encoding, include_system_penalty)
+            return build_single_objective_qubo(
+                fm_q,
+                fm_bias,
+                encoding,
+                qubo_config,
+                include_system_penalty,
+            )
 
         objective_qubos = [
             (np.eye(size) * 1.0, 1.0),
@@ -492,6 +573,7 @@ class Figure5PipelineTests(unittest.TestCase):
             mock.patch("figure5_pipeline.fm_to_qubo", side_effect=objective_qubos),
             mock.patch("figure5_pipeline.build_single_objective_qubo", side_effect=capture_build),
             mock.patch("figure5_pipeline.solve_qubo_with_sa", side_effect=fake_sa),
+            mock.patch("figure5_pipeline.diagnose_no_feasible_candidate") as diagnostic_mock,
         ):
             weighted = pipeline._fit_and_solve_iteration(
                 rows=rows,
@@ -500,6 +582,7 @@ class Figure5PipelineTests(unittest.TestCase):
                 seed=2,
                 iteration=0,
             )
+        diagnostic_mock.assert_not_called()
 
         weights = preference_weights_for_iteration(2, 0)
         expected_scale = sum(weight * (index + 1) for index, weight in enumerate(weights))
@@ -509,8 +592,63 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertNotIn(ddts_fit_seed, weighted_fit_seeds)
         self.assertTrue(np.allclose(captured["q"], np.eye(size) * expected_scale))
         self.assertAlmostEqual(float(captured["bias"]), expected_scale)
+        self.assertEqual(captured["qubo_config"], config.qubo)
         self.assertTrue(captured["include_system_penalty"])
         self.assertEqual(weighted.scalarization_method, "weighted_sum")
+
+    def test_empty_feasible_sa_batch_is_exactly_classified_with_context(self) -> None:
+        config = Figure5ExperimentConfig(
+            num_samples=10,
+            iterations=1,
+            encoding=EncodingConfig(num_levels=8),
+            fm=FMConfig(optuna_trials=0, device="cpu"),
+            sa=SAConfig(reads=1, sweeps=7),
+        )
+        rows, _ = generate_initial_dataset_multi_objective(
+            num_samples=config.num_samples,
+            seed=2,
+        )
+        rows = pipeline.discretize_rows_for_figure5(rows, config.num_levels)
+        size = 4 * config.num_levels
+        all_zero = np.zeros(size, dtype=np.float64)
+
+        with (
+            mock.patch("figure5_pipeline.fit_torch_fm", return_value=(object(), {"mock": True})),
+            mock.patch(
+                "figure5_pipeline.fm_to_qubo",
+                return_value=(np.zeros((size, size), dtype=np.float64), 0.0),
+            ),
+            mock.patch(
+                "figure5_pipeline.solve_qubo_with_sa",
+                return_value=_sampling_result(all_zero),
+            ),
+            mock.patch(
+                "figure5_pipeline.diagnose_no_feasible_candidate",
+                wraps=pipeline.diagnose_no_feasible_candidate,
+            ) as diagnostic_mock,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                pipeline._fit_and_solve_iteration(
+                    rows=rows,
+                    setting="w_ddts",
+                    config=config,
+                    seed=2,
+                    iteration=0,
+                )
+
+        diagnostic_mock.assert_called_once()
+        self.assertTrue(diagnostic_mock.call_args.kwargs["require_unit_sum"])
+        detail = str(raised.exception)
+        self.assertRegex(
+            detail,
+            (
+                "Figure 5.*setting='w_ddts'.*seed=2.*iteration=1/1.*"
+                "one_hot_valid=1/1.*fully_feasible=0/1.*num_levels=8.*sa_reads=1.*"
+                "sa_sweeps=7.*classification=heuristic_sampling_failure.*"
+                "lowest_sampled_infeasible_energy=.*exact_best_feasible_energy=.*"
+                "exact_feasible_state_count=165.*unchanged --resume"
+            ),
+        )
 
     def test_candidate_decision_separates_proposed_and_replacement(self) -> None:
         config = _test_config(iterations=1)
@@ -724,6 +862,27 @@ class Figure5PipelineTests(unittest.TestCase):
                 "QUBO variable count",
                 lambda payload: payload["state"]["qubo_stats"].__setitem__("num_variables", 31),
                 "num_variables",
+            ),
+            (
+                "QUBO normalization scheme",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "normalization_scheme", "unknown"
+                ),
+                "normalization_scheme",
+            ),
+            (
+                "unexpected QUBO field",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "legacy_penalty", 1.0
+                ),
+                "unexpected fields.*legacy_penalty",
+            ),
+            (
+                "QUBO objective weight",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "fm_objective_weight", 2.0
+                ),
+                "fm.*weight",
             ),
             (
                 "QUBO zero maximum coefficient",
@@ -1074,7 +1233,7 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual(len(summary.pareto_fronts[0].solutions), 1)
         self.assertEqual(summary.pareto_fronts[0].solutions[0]["composition"], strong.composition)
         payload = json.loads(figure5_output_layout(output_dir).summary_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 4)
+        self.assertEqual(payload["schema_version"], 5)
         self.assertEqual(payload["settings"], ["w_ddts", "wo_ddts"])
         self.assertNotIn("pareto_front", payload)
 
@@ -1110,7 +1269,7 @@ class Figure5PipelineTests(unittest.TestCase):
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest_path.name, "figure5_manifest.json")
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["figure"], 5)
         self.assertEqual(manifest["seed_derivation"], "mixed_radix_v1")
         self.assertEqual(manifest["resolved_config"], config.to_dict())
@@ -1138,7 +1297,7 @@ class Figure5PipelineTests(unittest.TestCase):
                 "missing top-level fields.*state",
             ),
             ("boolean schema", {**valid_payload, "schema_version": True}, "schema_version"),
-            ("old tuning schema", {**valid_payload, "schema_version": 3}, "schema_version"),
+            ("old QUBO schema", {**valid_payload, "schema_version": 4}, "schema_version"),
             ("numeric setting", {**valid_payload, "setting": 1}, "setting"),
             ("string seed", {**valid_payload, "seed": "4"}, "seed"),
             ("list config", {**valid_payload, "config": []}, "config"),
@@ -1154,6 +1313,20 @@ class Figure5PipelineTests(unittest.TestCase):
             (
                 "wrong config",
                 {**valid_payload, "config": {**valid_payload["config"], "iterations": 2}},
+                "different configuration",
+            ),
+            (
+                "wrong QUBO config",
+                {
+                    **valid_payload,
+                    "config": {
+                        **valid_payload["config"],
+                        "qubo": {
+                            **valid_payload["config"]["qubo"],
+                            "system_penalty_weight": 3.0,
+                        },
+                    },
+                },
                 "different configuration",
             ),
             (

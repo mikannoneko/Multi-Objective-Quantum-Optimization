@@ -1,5 +1,6 @@
 import inspect
 import json
+import math
 import subprocess
 import sys
 import unittest
@@ -13,15 +14,23 @@ import fm_torch
 import figure4_pipeline
 import figure4_runner
 import plot_figure4
+import qubo_math
 from alloy_dataset_generator import build_dataset_row, generate_initial_dataset_single_objective
 from figure4_experiment_config import (
     FIGURE4_OBJECTIVES,
     FIGURE4_PRESET_NUM_SEEDS,
     FIGURE4_SETTINGS,
     Figure4ExperimentConfig,
+    preset_config as figure4_preset_config,
     resolve_experiment_config,
 )
-from experiment_config import EncodingConfig, FMConfig, SAConfig
+from experiment_config import (
+    EncodingConfig,
+    FMConfig,
+    QUBO_NORMALIZATION_SCHEME,
+    QuboConfig,
+    SAConfig,
+)
 from fm_torch import TorchFMRegressor, fm_to_qubo
 from figure4_outputs import (
     CHECKPOINT_DIR_NAME,
@@ -48,6 +57,7 @@ from figure4_pipeline import (
     run_single_trajectory,
 )
 from qubo_math import (
+    MAX_EXACT_DIAGNOSTIC_STATES,
     QuboStats,
     SASample,
     SASamplingResult,
@@ -60,6 +70,7 @@ from qubo_math import (
     create_iteration_encoding,
     decode_candidate_bits_to_cgfm_composition,
     decode_candidate_bits_to_composition,
+    diagnose_no_feasible_candidate,
     encode_cgfm_rows,
     encode_single_objective_rows,
     evaluate_qubo_energy,
@@ -69,6 +80,7 @@ from qubo_math import (
     solve_qubo_with_sa,
     validate_candidate_composition,
 )
+from figure5_experiment_config import preset_config as figure5_preset_config
 from figure4_setting_strategies import get_setting_strategy, validate_settings
 from experiment_runtime import (
     FIGURE4_SEED_INDEX,
@@ -82,7 +94,9 @@ from experiment_runtime import (
 )
 
 WORKSPACE_TMP_ROOT = (
-    Path(__file__).resolve().parent / ".tmp_test" / "figure4_schema_v5_mixed_radix_v1"
+    Path(__file__).resolve().parent
+    / ".tmp_test"
+    / "figure4_schema_v6_qubo_config_v1_mixed_radix_v1"
 )
 WORKSPACE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -132,7 +146,29 @@ def _training_result(
         feasible_candidate_rank=1,
         infeasible_sa_samples_skipped=0,
         fm_metadata=_fm_metadata(config, seed, iteration),
-        qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 4 * config.num_levels, 650.0),
+        qubo_stats=_qubo_stats(config, 4 * config.num_levels),
+    )
+
+
+def _qubo_stats(
+    config: Figure4ExperimentConfig,
+    num_variables: int,
+    *,
+    include_system: bool = True,
+) -> QuboStats:
+    fm_weight = config.qubo.fm_objective_weight
+    system_weight = config.qubo.system_penalty_weight if include_system else 0.0
+    one_hot_weight = config.qubo.one_hot_penalty_weight
+    return QuboStats(
+        normalization_scheme=config.qubo.normalization_scheme,
+        fm_objective_weight=fm_weight,
+        system_penalty_weight=system_weight,
+        one_hot_penalty_weight=one_hot_weight,
+        fm_scale=1.0 if fm_weight > 0.0 else 0.0,
+        system_scale=1.0 if system_weight > 0.0 else 0.0,
+        one_hot_scale=1.0 if one_hot_weight > 0.0 else 0.0,
+        num_variables=num_variables,
+        max_abs=1.0 if any((fm_weight, system_weight, one_hot_weight)) else 0.0,
     )
 
 
@@ -160,6 +196,7 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(quick.sa_reads, 100)
         self.assertEqual(quick.sa_sweeps, 500)
         self.assertEqual(quick.device, "cuda")
+        self.assertEqual(quick.qubo, QuboConfig())
 
         overridden = resolve_experiment_config(preset="test", device="cpu", iterations=3, sa_reads=4)
         self.assertEqual(overridden.iterations, 3)
@@ -183,6 +220,66 @@ class Figure4PipelineTests(unittest.TestCase):
             with self.subTest(invalid_seeds=invalid_seeds):
                 with self.assertRaises(ValueError):
                     validate_seed_list(invalid_seeds)
+
+    def test_qubo_config_contract_and_runner_overrides(self) -> None:
+        config = QuboConfig(
+            fm_objective_weight=np.float64(0.0),
+            system_penalty_weight=np.float32(2.5),
+            one_hot_penalty_weight=np.int64(0),
+        )
+        self.assertEqual(config.normalization_scheme, QUBO_NORMALIZATION_SCHEME)
+        for value in (
+            config.fm_objective_weight,
+            config.system_penalty_weight,
+            config.one_hot_penalty_weight,
+        ):
+            self.assertIs(type(value), float)
+
+        overridden = resolve_experiment_config(
+            preset="test",
+            device="cpu",
+            fm_objective_weight=0.0,
+            system_penalty_weight=3.0,
+            one_hot_penalty_weight=4.0,
+        )
+        self.assertEqual(
+            overridden.qubo,
+            QuboConfig(0.0, 3.0, 4.0),
+        )
+        args = figure4_runner.parse_args(
+            [
+                "--output-dir",
+                "figure4_qubo_override",
+                "--settings",
+                "wo_cgfm",
+                "--fm-objective-weight",
+                "0",
+                "--system-penalty-weight",
+                "3",
+                "--one-hot-penalty-weight",
+                "4",
+            ]
+        )
+        self.assertEqual(
+            (args.fm_objective_weight, args.system_penalty_weight, args.one_hot_penalty_weight),
+            (0.0, 3.0, 4.0),
+        )
+
+        for field_name in (
+            "fm_objective_weight",
+            "system_penalty_weight",
+            "one_hot_penalty_weight",
+        ):
+            for invalid in (True, "1", -1.0, np.nan, np.inf, 10**400):
+                with self.subTest(field=field_name, value=invalid):
+                    with self.assertRaisesRegex(ValueError, field_name):
+                        QuboConfig(**{field_name: invalid})  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "normalization_scheme"):
+            QuboConfig(normalization_scheme="unknown")  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "normalization_scheme"):
+            QuboConfig(
+                normalization_scheme=np.str_(QUBO_NORMALIZATION_SCHEME)
+            )  # type: ignore[arg-type]
 
     def test_config_integer_contract_rejects_coercion_and_normalizes_numpy_values(self) -> None:
         config = Figure4ExperimentConfig(
@@ -326,6 +423,192 @@ class Figure4PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "seed"):
             solve_qubo_with_sa(q, 0.0, reads=1, sweeps=1, seed=NEAL_SEED_MAX + 1)
 
+    def test_exact_no_feasible_diagnostic_classifies_energy_relationships(self) -> None:
+        encoding = create_iteration_encoding(2, num_blocks=4)
+        size = encoding.num_blocks * encoding.num_levels
+        all_zero = np.zeros(size, dtype=np.float64)
+
+        # An asymmetric stored coefficient must still contribute exactly once to x^T Q x.
+        penalty_q = np.zeros((size, size), dtype=np.float64)
+        penalty_q[0, 1] = -2.0
+        multi_hot = all_zero.copy()
+        multi_hot[[0, 1]] = 1.0
+        penalty = diagnose_no_feasible_candidate(
+            penalty_q,
+            0.0,
+            _sampling_result(multi_hot),
+            encoding,
+            require_unit_sum=True,
+        )
+        self.assertEqual(penalty.classification, "qubo_penalty_balance_failure")
+        self.assertEqual(penalty.lowest_sampled_infeasible_energy, -2.0)
+        self.assertEqual(penalty.exact_best_feasible_energy, 0.0)
+        self.assertEqual(penalty.exact_feasible_state_count, math.comb(5, 3))
+        self.assertIn("QUBO penalty-balance failure", penalty.format_message())
+
+        heuristic_q = np.zeros((size, size), dtype=np.float64)
+        heuristic_q[1, 1] = -1.0
+        heuristic = diagnose_no_feasible_candidate(
+            heuristic_q,
+            0.0,
+            _sampling_result(all_zero),
+            encoding,
+            require_unit_sum=True,
+        )
+        self.assertEqual(heuristic.classification, "heuristic_sampling_failure")
+        self.assertEqual(heuristic.lowest_sampled_infeasible_energy, 0.0)
+        self.assertEqual(heuristic.exact_best_feasible_energy, -1.0)
+        self.assertIn("heuristic-sampling failure", heuristic.format_message())
+
+        tied = diagnose_no_feasible_candidate(
+            np.zeros((size, size), dtype=np.float64),
+            0.0,
+            _sampling_result(all_zero),
+            encoding,
+            require_unit_sum=True,
+        )
+        self.assertEqual(tied.classification, "unclassified_no_feasible_candidate")
+        self.assertEqual(tied.exact_best_feasible_energy, 0.0)
+        self.assertIn("no feasible SA candidate; cause not classified", tied.format_message())
+        self.assertNotIn("heuristic-sampling failure", tied.format_message())
+
+    def test_exact_no_feasible_diagnostic_counts_cgfm_and_skips_over_limit(self) -> None:
+        encoding = create_cgfm_iteration_encoding(2, seed=3)
+        size = encoding.num_blocks * encoding.num_levels
+        q = np.zeros((size, size), dtype=np.float64)
+        q[0, 0] = -1.0
+        q[2, 2] = -2.0
+        multi_hot = np.zeros(size, dtype=np.float64)
+        multi_hot[[0, 1]] = 1.0
+
+        diagnostic = diagnose_no_feasible_candidate(
+            q,
+            0.0,
+            _sampling_result(multi_hot),
+            encoding,
+            require_unit_sum=False,
+        )
+        self.assertEqual(diagnostic.classification, "heuristic_sampling_failure")
+        self.assertEqual(diagnostic.exact_feasible_state_count, 27)
+        self.assertEqual(diagnostic.exact_best_feasible_energy, -3.0)
+
+        with mock.patch(
+            "qubo_math._active_qubo_energy",
+            wraps=qubo_math._active_qubo_energy,
+        ) as energy_mock:
+            over_limit = diagnose_no_feasible_candidate(
+                q,
+                0.0,
+                _sampling_result(multi_hot),
+                encoding,
+                require_unit_sum=False,
+                max_exact_diagnostic_states=10,
+            )
+        self.assertEqual(over_limit.classification, "unclassified_no_feasible_candidate")
+        self.assertIsNone(over_limit.exact_best_feasible_energy)
+        self.assertEqual(over_limit.exact_feasible_state_count, 27)
+        # One call recomputes the sampled state; no exact state was enumerated.
+        self.assertEqual(energy_mock.call_count, 1)
+        self.assertIn("exact_best_feasible_energy=not_computed", over_limit.format_message())
+        self.assertIn("exceeds the limit", over_limit.format_message())
+        self.assertNotIn("heuristic-sampling failure", over_limit.format_message())
+
+    def test_exact_no_feasible_diagnostic_rejects_malformed_inputs(self) -> None:
+        encoding = create_iteration_encoding(2, num_blocks=4)
+        size = encoding.num_blocks * encoding.num_levels
+        q = np.zeros((size, size), dtype=np.float64)
+        all_zero = np.zeros(size, dtype=np.float64)
+        sampling = _sampling_result(all_zero)
+
+        with self.assertRaisesRegex(ValueError, "shape"):
+            diagnose_no_feasible_candidate(
+                q[:-1], 0.0, sampling, encoding, require_unit_sum=True
+            )
+        non_finite_q = q.copy()
+        non_finite_q[0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            diagnose_no_feasible_candidate(
+                non_finite_q, 0.0, sampling, encoding, require_unit_sum=True
+            )
+        with self.assertRaisesRegex(ValueError, "bias"):
+            diagnose_no_feasible_candidate(
+                q, np.inf, sampling, encoding, require_unit_sum=True
+            )
+        with self.assertRaisesRegex(ValueError, "shape"):
+            diagnose_no_feasible_candidate(
+                q,
+                0.0,
+                _sampling_result(all_zero[:-1]),
+                encoding,
+                require_unit_sum=True,
+            )
+        string_sampling = SASamplingResult(
+            samples=(SASample(np.asarray(["0"] * size), 123.0),)
+        )
+        with self.assertRaisesRegex(ValueError, "numeric binary"):
+            diagnose_no_feasible_candidate(
+                q, 0.0, string_sampling, encoding, require_unit_sum=True
+            )
+        for invalid_value in (np.nan, 0.5):
+            invalid_state = all_zero.copy()
+            invalid_state[0] = invalid_value
+            with self.subTest(state_value=invalid_value):
+                with self.assertRaisesRegex(ValueError, "finite binary"):
+                    diagnose_no_feasible_candidate(
+                        q,
+                        0.0,
+                        _sampling_result(invalid_state),
+                        encoding,
+                        require_unit_sum=True,
+                    )
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            diagnose_no_feasible_candidate(
+                q,
+                0.0,
+                SASamplingResult(samples=()),
+                encoding,
+                require_unit_sum=True,
+            )
+        with self.assertRaisesRegex(ValueError, "require_unit_sum"):
+            diagnose_no_feasible_candidate(
+                q,
+                0.0,
+                sampling,
+                encoding,
+                require_unit_sum=1,  # type: ignore[arg-type]
+            )
+        feasible = all_zero.copy()
+        feasible[1] = 1.0
+        with self.assertRaisesRegex(ValueError, "no feasible"):
+            diagnose_no_feasible_candidate(
+                q,
+                0.0,
+                _sampling_result(feasible),
+                encoding,
+                require_unit_sum=True,
+            )
+        for invalid_limit in (True, 1.5, "10"):
+            with self.subTest(max_exact_diagnostic_states=invalid_limit):
+                with self.assertRaisesRegex(ValueError, "max_exact_diagnostic_states"):
+                    diagnose_no_feasible_candidate(
+                        q,
+                        0.0,
+                        sampling,
+                        encoding,
+                        require_unit_sum=True,
+                        max_exact_diagnostic_states=invalid_limit,  # type: ignore[arg-type]
+                    )
+
+    def test_all_builtin_encoding_domains_fit_exact_diagnostic_limit(self) -> None:
+        for preset in ("paper", "quick", "test"):
+            with self.subTest(figure=4, preset=preset):
+                levels = figure4_preset_config(preset).num_levels  # type: ignore[arg-type]
+                self.assertLessEqual(math.comb(levels + 3, 3), MAX_EXACT_DIAGNOSTIC_STATES)
+                self.assertLessEqual((levels + 1) ** 3, MAX_EXACT_DIAGNOSTIC_STATES)
+            with self.subTest(figure=5, preset=preset):
+                levels = figure5_preset_config(preset).num_levels  # type: ignore[arg-type]
+                self.assertLessEqual(math.comb(levels + 3, 3), MAX_EXACT_DIAGNOSTIC_STATES)
+
     def test_fm_seed_and_integer_boundaries_fail_before_training(self) -> None:
         self.assertFalse(hasattr(fm_torch, "fm_seed_plan"))
         self.assertFalse(hasattr(fm_torch, "fm_seed_block_size"))
@@ -428,6 +711,22 @@ class Figure4PipelineTests(unittest.TestCase):
                 config=changed_config,
                 setting="wo_cgfm",
             )
+        changed_qubo_config = Figure4ExperimentConfig(
+            num_samples=4,
+            iterations=1,
+            encoding=EncodingConfig(num_levels=5),
+            fm=FMConfig(optuna_trials=0),
+            sa=SAConfig(reads=64, sweeps=12),
+            qubo=QuboConfig(system_penalty_weight=3.0),
+        )
+        with self.assertRaisesRegex(ValueError, "different configuration"):
+            load_checkpoint(
+                path,
+                objective=FIGURE4_OBJECTIVES[0],
+                seed=4,
+                config=changed_qubo_config,
+                setting="wo_cgfm",
+            )
 
     def test_checkpoint_outer_schema_rejects_malformed_payloads(self) -> None:
         config = Figure4ExperimentConfig(
@@ -455,7 +754,7 @@ class Figure4PipelineTests(unittest.TestCase):
                 "missing top-level fields.*state",
             ),
             ("boolean schema", {**valid_payload, "schema_version": True}, "schema_version"),
-            ("old tuning schema", {**valid_payload, "schema_version": 4}, "schema_version"),
+            ("old QUBO schema", {**valid_payload, "schema_version": 5}, "schema_version"),
             (
                 "wrong seed derivation",
                 {**valid_payload, "seed_derivation": "legacy"},
@@ -507,7 +806,7 @@ class Figure4PipelineTests(unittest.TestCase):
                     layout.checkpoint_path("w_cgfm", "delta_T", invalid_seed)  # type: ignore[arg-type]
 
         summary_payload = {
-            "schema_version": 4,
+            "schema_version": 5,
             "seed_derivation": SEED_DERIVATION_SCHEME,
             "aggregated": {},
         }
@@ -539,7 +838,7 @@ class Figure4PipelineTests(unittest.TestCase):
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest_path.name, "figure4_manifest.json")
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["figure"], 4)
         self.assertEqual(manifest["seed_derivation"], "mixed_radix_v1")
 
@@ -634,6 +933,16 @@ class Figure4PipelineTests(unittest.TestCase):
             "compute_weighted_sum_reference_targets",
         ):
             self.assertIn(figure5_object, content)
+        for qubo_contract_keyword in (
+            "QuboConfig",
+            "max_abs_polynomial_coefficient_v1",
+            "--fm-objective-weight",
+            "--system-penalty-weight",
+            "--one-hot-penalty-weight",
+            "不是 JSONL",
+            "python -m json.tool",
+        ):
+            self.assertIn(qubo_contract_keyword, content)
         legacy_document_name = "FIGURE4" + "_WORKFLOW.md"
         self.assertFalse((repo_root / legacy_document_name).exists())
         figure4_section = content.split("## 第二部分：Figure 5 复现", 1)[0]
@@ -795,8 +1104,12 @@ class Figure4PipelineTests(unittest.TestCase):
     def test_qubo_normalization_scale_ignores_constant_bias(self) -> None:
         q = np.array([[2.0, 0.4], [0.4, -1.0]], dtype=np.float64)
 
-        normalized_without_bias, bias_without_bias, scale_without_bias = normalize_qubo_term(q, 0.0)
-        normalized_with_bias, normalized_bias, scale_with_bias = normalize_qubo_term(q, 100.0)
+        normalized_without_bias, bias_without_bias, scale_without_bias = normalize_qubo_term(
+            q, 0.0, normalization_scheme=QUBO_NORMALIZATION_SCHEME
+        )
+        normalized_with_bias, normalized_bias, scale_with_bias = normalize_qubo_term(
+            q, 100.0, normalization_scheme=QUBO_NORMALIZATION_SCHEME
+        )
 
         np.testing.assert_allclose(normalized_without_bias, normalized_with_bias)
         self.assertEqual(scale_without_bias, 2.0)
@@ -808,8 +1121,12 @@ class Figure4PipelineTests(unittest.TestCase):
         symmetric_q = np.array([[0.0, 0.5], [0.5, 0.0]], dtype=np.float64)
         upper_triangular_q = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.float64)
 
-        normalized_symmetric, _, symmetric_scale = normalize_qubo_term(symmetric_q, 0.0)
-        normalized_upper, _, upper_scale = normalize_qubo_term(upper_triangular_q, 0.0)
+        normalized_symmetric, _, symmetric_scale = normalize_qubo_term(
+            symmetric_q, 0.0, normalization_scheme=QUBO_NORMALIZATION_SCHEME
+        )
+        normalized_upper, _, upper_scale = normalize_qubo_term(
+            upper_triangular_q, 0.0, normalization_scheme=QUBO_NORMALIZATION_SCHEME
+        )
 
         self.assertEqual(symmetric_scale, 1.0)
         self.assertEqual(upper_scale, symmetric_scale)
@@ -824,6 +1141,8 @@ class Figure4PipelineTests(unittest.TestCase):
                 evaluate_qubo_energy(bits, normalized_symmetric),
                 evaluate_qubo_energy(bits, normalized_upper),
             )
+        with self.assertRaisesRegex(ValueError, "normalization scheme"):
+            normalize_qubo_term(symmetric_q, 0.0, normalization_scheme="unknown")
 
     def test_zero_value_uses_all_zero_block(self) -> None:
         encoding = create_iteration_encoding(num_levels=10)
@@ -851,13 +1170,69 @@ class Figure4PipelineTests(unittest.TestCase):
 
         direct_q = np.zeros((4 * direct_encoding.num_levels, 4 * direct_encoding.num_levels), dtype=np.float64)
         cgfm_q = np.zeros((3 * cgfm_encoding.num_levels, 3 * cgfm_encoding.num_levels), dtype=np.float64)
-        direct_result = build_single_objective_qubo(direct_q, 0.0, direct_encoding, include_system_penalty=True)
-        cgfm_result = build_single_objective_qubo(cgfm_q, 0.0, cgfm_encoding, include_system_penalty=False)
+        qubo_config = QuboConfig()
+        direct_result = build_single_objective_qubo(
+            direct_q, 0.0, direct_encoding, qubo_config, include_system_penalty=True
+        )
+        cgfm_result = build_single_objective_qubo(
+            cgfm_q, 0.0, cgfm_encoding, qubo_config, include_system_penalty=False
+        )
 
         self.assertEqual(direct_result.stats.num_variables, 40)
         self.assertEqual(direct_result.stats.system_penalty_weight, 650.0)
         self.assertEqual(cgfm_result.stats.num_variables, 30)
         self.assertEqual(cgfm_result.stats.system_penalty_weight, 0.0)
+
+    def test_qubo_config_weights_and_zero_terms_are_reflected_in_stats(self) -> None:
+        encoding = create_iteration_encoding(2)
+        size = encoding.num_blocks * encoding.num_levels
+        fm_q = np.zeros((size, size), dtype=np.float64)
+        fm_q[0, 0] = 2.0
+        result = build_single_objective_qubo(
+            fm_q,
+            4.0,
+            encoding,
+            QuboConfig(3.0, 0.0, 2.0),
+            include_system_penalty=True,
+        )
+        normalized_fm_q, normalized_fm_bias, _ = normalize_qubo_term(
+            fm_q,
+            4.0,
+            normalization_scheme=QUBO_NORMALIZATION_SCHEME,
+        )
+        one_hot_q, one_hot_bias = build_one_hot_penalty_matrix(encoding)
+        normalized_one_hot_q, normalized_one_hot_bias, _ = normalize_qubo_term(
+            one_hot_q,
+            one_hot_bias,
+            normalization_scheme=QUBO_NORMALIZATION_SCHEME,
+        )
+        np.testing.assert_allclose(
+            result.q,
+            (3.0 * normalized_fm_q) + (2.0 * normalized_one_hot_q),
+        )
+        self.assertEqual(
+            result.bias,
+            (3.0 * normalized_fm_bias) + (2.0 * normalized_one_hot_bias),
+        )
+        self.assertEqual(result.stats.normalization_scheme, QUBO_NORMALIZATION_SCHEME)
+        self.assertEqual(result.stats.fm_objective_weight, 3.0)
+        self.assertEqual(result.stats.system_penalty_weight, 0.0)
+        self.assertEqual(result.stats.system_scale, 0.0)
+        self.assertEqual(result.stats.one_hot_penalty_weight, 2.0)
+
+        zero_result = build_single_objective_qubo(
+            fm_q,
+            4.0,
+            encoding,
+            QuboConfig(0.0, 0.0, 0.0),
+            include_system_penalty=True,
+        )
+        np.testing.assert_array_equal(zero_result.q, np.zeros_like(fm_q))
+        self.assertEqual(zero_result.bias, 0.0)
+        self.assertEqual(zero_result.stats.fm_scale, 0.0)
+        self.assertEqual(zero_result.stats.system_scale, 0.0)
+        self.assertEqual(zero_result.stats.one_hot_scale, 0.0)
+        self.assertEqual(zero_result.stats.max_abs, 0.0)
 
     def test_one_hot_level_weights_follow_paper_eq18_and_are_decodable(self) -> None:
         encoding = create_iteration_encoding(10)
@@ -1036,10 +1411,12 @@ class Figure4PipelineTests(unittest.TestCase):
                 "figure4_pipeline.solve_qubo_with_sa",
                 return_value=_sampling_result(np.zeros(4 * config.num_levels), valid_bits),
             ),
+            mock.patch("figure4_pipeline.diagnose_no_feasible_candidate") as diagnostic_mock,
         ):
             selected_result = run_single_trajectory(
                 rows, FIGURE4_OBJECTIVES[0], seed=8, config=config, setting="wo_cgfm"
             )
+        diagnostic_mock.assert_not_called()
         self.assertEqual(selected_result.duplicate_replacements, 0)
         self.assertEqual(selected_result.accepted_sa_candidates, 1)
         self.assertEqual(selected_result.random_replacements, 0)
@@ -1091,15 +1468,12 @@ class Figure4PipelineTests(unittest.TestCase):
                 "figure4_pipeline.solve_qubo_with_sa",
                 return_value=_sampling_result(one_hot_only),
             ),
+            mock.patch(
+                "figure4_pipeline.diagnose_no_feasible_candidate",
+                wraps=figure4_pipeline.diagnose_no_feasible_candidate,
+            ) as diagnostic_mock,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError,
-                (
-                    "setting='wo_cgfm'.*objective='kappa'.*seed=8.*iteration=1/1.*"
-                    "one_hot_valid=1/1.*fully_feasible=0/1.*num_levels=5.*sa_sweeps=7.*"
-                    "unchanged --resume"
-                ),
-            ):
+            with self.assertRaises(RuntimeError) as raised:
                 run_single_trajectory(
                     rows,
                     FIGURE4_OBJECTIVES[0],
@@ -1107,6 +1481,19 @@ class Figure4PipelineTests(unittest.TestCase):
                     config=config,
                     setting="wo_cgfm",
                 )
+        diagnostic_mock.assert_called_once()
+        self.assertTrue(diagnostic_mock.call_args.kwargs["require_unit_sum"])
+        detail = str(raised.exception)
+        self.assertRegex(
+            detail,
+            (
+                "setting='wo_cgfm'.*objective='kappa'.*seed=8.*iteration=1/1.*"
+                "one_hot_valid=1/1.*fully_feasible=0/1.*num_levels=5.*sa_reads=1.*"
+                "sa_sweeps=7.*classification=heuristic_sampling_failure.*"
+                "lowest_sampled_infeasible_energy=.*exact_best_feasible_energy=.*"
+                "exact_feasible_state_count=56.*unchanged --resume"
+            ),
+        )
 
     def test_random_replacement_is_forced_to_be_novel(self) -> None:
         duplicate = np.array([0.2, 0.2, 0.2, 0.4], dtype=np.float64)
@@ -1172,7 +1559,7 @@ class Figure4PipelineTests(unittest.TestCase):
             rows=rows,
             best_so_far=[max(float(row["kappa"]) for row in rows)],
             fm_metadata=_fm_metadata(config, seed, 0),
-            qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 20, 650.0),
+            qubo_stats=_qubo_stats(config, 20),
             accepted_sa_candidates=1,
             max_feasible_candidate_rank=1,
         )
@@ -1234,6 +1621,41 @@ class Figure4PipelineTests(unittest.TestCase):
                 "num_variables",
             ),
             (
+                "QUBO normalization scheme",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "normalization_scheme", "unknown"
+                ),
+                "normalization_scheme",
+            ),
+            (
+                "QUBO normalization scheme type",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "normalization_scheme", 1
+                ),
+                "normalization_scheme.*string",
+            ),
+            (
+                "missing QUBO field",
+                lambda payload: payload["state"]["qubo_stats"].pop(
+                    "one_hot_penalty_weight"
+                ),
+                "missing.*one_hot_penalty_weight",
+            ),
+            (
+                "QUBO objective weight",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "fm_objective_weight", 2.0
+                ),
+                "fm.*weight",
+            ),
+            (
+                "QUBO objective weight type",
+                lambda payload: payload["state"]["qubo_stats"].__setitem__(
+                    "fm_objective_weight", "1.0"
+                ),
+                "fm_objective_weight.*finite number",
+            ),
+            (
                 "missing QUBO stats",
                 lambda payload: payload["state"].__setitem__("qubo_stats", None),
                 "contain qubo_stats",
@@ -1276,7 +1698,7 @@ class Figure4PipelineTests(unittest.TestCase):
             rows=partial_rows,
             best_so_far=[partial_best],
             fm_metadata=_fm_metadata(config, 9, 0),
-            qubo_stats=QuboStats(1.0, 1.0, 1.0, 650.0, 1.0, 20, 650.0),
+            qubo_stats=_qubo_stats(config, 20),
             duplicate_replacements=1,
             random_replacements=1,
             random_replacement_draws=1,
@@ -1384,7 +1806,7 @@ class Figure4PipelineTests(unittest.TestCase):
         summary_path = layout.summary_path
         output_png = layout.figure_path
         self.assertTrue(summary_path.exists())
-        self.assertEqual(summary.schema_version, 4)
+        self.assertEqual(summary.schema_version, 5)
         self.assertEqual(summary.training_backend, "pytorch_fm_lbfgs")
         self.assertEqual(summary.settings, ["wo_cgfm", "w_cgfm"])
         self.assertIn("kappa:wo_cgfm", summary.aggregated)
@@ -1445,14 +1867,14 @@ class Figure4PipelineTests(unittest.TestCase):
         invalid_dir.mkdir(parents=True, exist_ok=True)
         old_schema_summary = invalid_dir / "old_schema.json"
         old_schema_summary.write_text(
-            json.dumps({"schema_version": 1, "aggregated": {"kappa:wo_cgfm": {}}}),
+            json.dumps({"schema_version": 4, "aggregated": {"kappa:wo_cgfm": {}}}),
             encoding="utf-8",
         )
         empty_summary = invalid_dir / "empty_summary.json"
         empty_summary.write_text(
             json.dumps(
                 {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "seed_derivation": SEED_DERIVATION_SCHEME,
                     "aggregated": {},
                 }

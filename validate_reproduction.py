@@ -34,6 +34,7 @@ from experiment_runtime import (
     same_json_value,
     write_json_atomic,
 )
+from experiment_config import QUBO_NORMALIZATION_SCHEME
 from figure4_experiment_config import (
     FIGURE4_OBJECTIVE_NAMES,
     FIGURE4_OBJECTIVES,
@@ -52,15 +53,23 @@ from figure5_scalarization import (
     compute_individual_objective_targets,
     preference_weights_for_iteration,
 )
-from qubo_math import ONE_HOT_PENALTY_WEIGHT, SYSTEM_PENALTY_WEIGHT, prepare_discrete_composition
+from qubo_math import prepare_discrete_composition
 
 
 REPORT_SCHEMA_VERSION = 3
 _NUMBER_TYPES = (int, float)
-_CONFIG_FIELDS = frozenset({"num_samples", "iterations", "encoding", "fm", "sa"})
+_CONFIG_FIELDS = frozenset({"num_samples", "iterations", "encoding", "fm", "sa", "qubo"})
 _ENCODING_FIELDS = frozenset({"num_levels"})
 _FM_CONFIG_FIELDS = frozenset({"optuna_trials", "device"})
 _SA_CONFIG_FIELDS = frozenset({"reads", "sweeps"})
+_QUBO_CONFIG_FIELDS = frozenset(
+    {
+        "fm_objective_weight",
+        "system_penalty_weight",
+        "one_hot_penalty_weight",
+        "normalization_scheme",
+    }
+)
 _FM_METADATA_FIELDS = frozenset(
     {
         "tuner", "rank", "seed_plan", "init_std", "l2_reg_w", "l2_reg_v",
@@ -69,8 +78,9 @@ _FM_METADATA_FIELDS = frozenset(
 )
 _QUBO_STATS_FIELDS = frozenset(
     {
-        "fm_scale", "system_scale", "one_hot_scale", "system_penalty_weight",
-        "one_hot_penalty_weight", "num_variables", "max_abs",
+        "normalization_scheme", "fm_objective_weight", "system_penalty_weight",
+        "one_hot_penalty_weight", "fm_scale", "system_scale", "one_hot_scale",
+        "num_variables", "max_abs",
     }
 )
 _F4_TOP_FIELDS = frozenset(
@@ -273,6 +283,7 @@ def _parse_config(value: Any, path: str, errors: list[dict[str, Any]]) -> dict[s
     encoding = _expect_fields(config.get("encoding"), f"{path}.encoding", _ENCODING_FIELDS, errors)
     fm = _expect_fields(config.get("fm"), f"{path}.fm", _FM_CONFIG_FIELDS, errors)
     sa = _expect_fields(config.get("sa"), f"{path}.sa", _SA_CONFIG_FIELDS, errors)
+    qubo = _expect_fields(config.get("qubo"), f"{path}.qubo", _QUBO_CONFIG_FIELDS, errors)
     num_samples = _strict_integer(config.get("num_samples"), f"{path}.num_samples", errors, minimum=1)
     iterations = _strict_integer(config.get("iterations"), f"{path}.iterations", errors, minimum=1)
     num_levels = (
@@ -295,7 +306,44 @@ def _parse_config(value: Any, path: str, errors: list[dict[str, Any]]) -> dict[s
         _strict_integer(sa.get("sweeps"), f"{path}.sa.sweeps", errors, minimum=1)
         if sa is not None else None
     )
-    if any(item is None for item in (num_samples, iterations, num_levels, optuna_trials, device, reads, sweeps)):
+    qubo_weights = {
+        field_name: _strict_number(
+            qubo.get(field_name),
+            f"{path}.qubo.{field_name}",
+            errors,
+            minimum=0.0,
+        )
+        for field_name in (
+            "fm_objective_weight",
+            "system_penalty_weight",
+            "one_hot_penalty_weight",
+        )
+    } if qubo is not None else {}
+    normalization_scheme = qubo.get("normalization_scheme") if qubo is not None else None
+    if type(normalization_scheme) is not str or normalization_scheme != QUBO_NORMALIZATION_SCHEME:
+        errors.append(
+            _error(
+                f"{path}.qubo.normalization_scheme",
+                "supported_normalization_scheme",
+                QUBO_NORMALIZATION_SCHEME,
+                normalization_scheme,
+            )
+        )
+        normalization_scheme = None
+    if any(
+        item is None
+        for item in (
+            num_samples,
+            iterations,
+            num_levels,
+            optuna_trials,
+            device,
+            reads,
+            sweeps,
+            normalization_scheme,
+            *qubo_weights.values(),
+        )
+    ) or len(qubo_weights) != 3:
         return None
     return {
         "num_samples": num_samples,
@@ -305,6 +353,8 @@ def _parse_config(value: Any, path: str, errors: list[dict[str, Any]]) -> dict[s
         "device": device,
         "reads": reads,
         "sweeps": sweeps,
+        **qubo_weights,
+        "normalization_scheme": normalization_scheme,
         "raw": config,
     }
 
@@ -358,7 +408,7 @@ def _validate_qubo_stats(
     *,
     figure: int,
     setting: str,
-    num_levels: int,
+    config: Mapping[str, Any],
     errors: list[dict[str, Any]],
 ) -> None:
     stats = _expect_fields(value, path, _QUBO_STATS_FIELDS, errors)
@@ -366,44 +416,85 @@ def _validate_qubo_stats(
         return
     parsed: dict[str, float] = {}
     for field in (
-        "fm_scale", "system_scale", "one_hot_scale", "system_penalty_weight",
-        "one_hot_penalty_weight", "max_abs",
+        "fm_objective_weight", "system_penalty_weight", "one_hot_penalty_weight",
+        "fm_scale", "system_scale", "one_hot_scale", "max_abs",
     ):
         number = _strict_number(stats.get(field), f"{path}.{field}", errors, minimum=0.0)
         if number is not None:
             parsed[field] = number
     num_variables = _strict_integer(stats.get("num_variables"), f"{path}.num_variables", errors, minimum=1)
-    expected_variables = (4 if figure == 5 or setting == "wo_cgfm" else 3) * num_levels
+    scheme = stats.get("normalization_scheme")
+    if type(scheme) is not str or scheme != config["normalization_scheme"]:
+        errors.append(
+            _error(
+                f"{path}.normalization_scheme",
+                "configured_normalization_scheme",
+                config["normalization_scheme"],
+                scheme,
+            )
+        )
+    expected_variables = (
+        4 if figure == 5 or setting == "wo_cgfm" else 3
+    ) * config["num_levels"]
     if num_variables is not None and num_variables != expected_variables:
         errors.append(_error(f"{path}.num_variables", "encoding_size", expected_variables, num_variables))
-    for field in ("fm_scale", "one_hot_scale", "max_abs"):
-        if field in parsed and parsed[field] <= 0.0:
-            errors.append(_error(f"{path}.{field}", "positive_normalization_scale", "> 0", parsed[field]))
-    expected_system_weight = SYSTEM_PENALTY_WEIGHT if figure == 5 or setting == "wo_cgfm" else 0.0
-    if "system_penalty_weight" in parsed and not math.isclose(
-        parsed["system_penalty_weight"], expected_system_weight, rel_tol=0.0, abs_tol=1e-12
-    ):
-        errors.append(
-            _error(f"{path}.system_penalty_weight", "setting_penalty", expected_system_weight, parsed["system_penalty_weight"])
-        )
-    if "one_hot_penalty_weight" in parsed and not math.isclose(
-        parsed["one_hot_penalty_weight"], ONE_HOT_PENALTY_WEIGHT, rel_tol=0.0, abs_tol=1e-12
-    ):
-        errors.append(
-            _error(f"{path}.one_hot_penalty_weight", "one_hot_penalty", ONE_HOT_PENALTY_WEIGHT, parsed["one_hot_penalty_weight"])
-        )
-    if "system_scale" in parsed:
-        should_be_positive = figure == 5 or setting == "wo_cgfm"
-        valid_scale = (
-            parsed["system_scale"] > 0.0
-            if should_be_positive
-            else math.isclose(parsed["system_scale"], 0.0, rel_tol=0.0, abs_tol=1e-12)
-        )
-        if not valid_scale:
+    expected_weights = {
+        "fm": config["fm_objective_weight"],
+        "system": (
+            config["system_penalty_weight"]
+            if figure == 5 or setting == "wo_cgfm"
+            else 0.0
+        ),
+        "one_hot": config["one_hot_penalty_weight"],
+    }
+    weight_fields = {
+        "fm": "fm_objective_weight",
+        "system": "system_penalty_weight",
+        "one_hot": "one_hot_penalty_weight",
+    }
+    for term_name, expected_weight in expected_weights.items():
+        weight_field = weight_fields[term_name]
+        if weight_field in parsed and not math.isclose(
+            parsed[weight_field], expected_weight, rel_tol=0.0, abs_tol=1e-12
+        ):
             errors.append(
                 _error(
-                    f"{path}.system_scale", "setting_normalization_scale",
-                    "> 0" if should_be_positive else 0.0, parsed["system_scale"],
+                    f"{path}.{weight_field}",
+                    "configured_applied_weight",
+                    expected_weight,
+                    parsed[weight_field],
+                )
+            )
+        scale_field = f"{term_name}_scale"
+        if scale_field in parsed:
+            valid_scale = (
+                parsed[scale_field] > 0.0
+                if expected_weight > 0.0
+                else math.isclose(parsed[scale_field], 0.0, rel_tol=0.0, abs_tol=1e-12)
+            )
+            if not valid_scale:
+                errors.append(
+                    _error(
+                        f"{path}.{scale_field}",
+                        "applied_weight_normalization_scale",
+                        "> 0" if expected_weight > 0.0 else 0.0,
+                        parsed[scale_field],
+                    )
+                )
+    if "max_abs" in parsed:
+        expected_nonzero_qubo = any(weight > 0.0 for weight in expected_weights.values())
+        valid_max_abs = (
+            parsed["max_abs"] > 0.0
+            if expected_nonzero_qubo
+            else math.isclose(parsed["max_abs"], 0.0, rel_tol=0.0, abs_tol=1e-12)
+        )
+        if not valid_max_abs:
+            errors.append(
+                _error(
+                    f"{path}.max_abs",
+                    "applied_weight_final_qubo_scale",
+                    "> 0" if expected_nonzero_qubo else 0.0,
+                    parsed["max_abs"],
                 )
             )
 
@@ -634,7 +725,7 @@ def validate_figure4_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
             )
             _validate_qubo_stats(
                 trajectory.get("qubo_stats"), f"{path}.qubo_stats", figure=4, setting=setting,
-                num_levels=config["num_levels"], errors=trajectory_errors,
+                config=config, errors=trajectory_errors,
             )
     _store_check(
         checks, "trajectories", trajectory_errors,
@@ -1064,7 +1155,7 @@ def _validate_figure5_trajectory(
         )
     _validate_qubo_stats(
         trajectory.get("qubo_stats"), f"{path}.qubo_stats", figure=5, setting=expected_setting,
-        num_levels=config["num_levels"], errors=errors,
+        config=config, errors=errors,
     )
     return proposed_solutions
 

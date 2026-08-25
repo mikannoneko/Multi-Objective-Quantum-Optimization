@@ -51,7 +51,12 @@ def _strict_int(value: Any, context: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot the Figure 5 multi-objective reproduction summary.")
-    parser.add_argument("--summary", type=Path, required=True, help="Figure 5 summary schema v4 JSON file.")
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        required=True,
+        help=f"Figure 5 summary schema v{SUMMARY_SCHEMA_VERSION} JSON file.",
+    )
     parser.add_argument("--output", type=Path, required=True, help="Output PNG path.")
     parser.add_argument(
         "--seed",

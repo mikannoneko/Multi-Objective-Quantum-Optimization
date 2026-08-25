@@ -123,7 +123,7 @@ def _summary(
         for setting in settings
     ]
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "seed_derivation": SEED_DERIVATION_SCHEME,
         "training_backend": "pytorch_fm_lbfgs",
         "config": {"iterations": iterations},
@@ -208,7 +208,7 @@ class PlotFigure5Tests(unittest.TestCase):
         cases: list[tuple[str, dict[str, object], str]] = []
 
         wrong_schema = _summary()
-        wrong_schema["schema_version"] = 2
+        wrong_schema["schema_version"] = 4
         cases.append(("wrong_schema", wrong_schema, "schema"))
 
         non_finite = _summary()

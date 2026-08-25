@@ -10,7 +10,7 @@ import math
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
-from experiment_config import EncodingConfig, FMConfig, SAConfig
+from experiment_config import EncodingConfig, FMConfig, QuboConfig, SAConfig
 from experiment_runtime import require_integer
 
 
@@ -69,6 +69,7 @@ class Figure4ExperimentConfig:
     encoding: EncodingConfig = field(default_factory=EncodingConfig)
     fm: FMConfig = field(default_factory=FMConfig)
     sa: SAConfig = field(default_factory=SAConfig)
+    qubo: QuboConfig = field(default_factory=QuboConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -139,6 +140,9 @@ def resolve_experiment_config(
     optuna_trials: int | None = None,
     sa_reads: int | None = None,
     sa_sweeps: int | None = None,
+    fm_objective_weight: float | None = None,
+    system_penalty_weight: float | None = None,
+    one_hot_penalty_weight: float | None = None,
 ) -> Figure4ExperimentConfig:
     """先解析 preset，再应用 CLI override，得到 runner 实际执行的配置。"""
 
@@ -159,6 +163,31 @@ def resolve_experiment_config(
             sa=SAConfig(
                 reads=config.sa.reads if sa_reads is None else sa_reads,
                 sweeps=config.sa.sweeps if sa_sweeps is None else sa_sweeps,
+            ),
+        )
+    if any(
+        value is not None
+        for value in (fm_objective_weight, system_penalty_weight, one_hot_penalty_weight)
+    ):
+        config = replace(
+            config,
+            qubo=replace(
+                config.qubo,
+                fm_objective_weight=(
+                    config.qubo.fm_objective_weight
+                    if fm_objective_weight is None
+                    else fm_objective_weight
+                ),
+                system_penalty_weight=(
+                    config.qubo.system_penalty_weight
+                    if system_penalty_weight is None
+                    else system_penalty_weight
+                ),
+                one_hot_penalty_weight=(
+                    config.qubo.one_hot_penalty_weight
+                    if one_hot_penalty_weight is None
+                    else one_hot_penalty_weight
+                ),
             ),
         )
     return config
