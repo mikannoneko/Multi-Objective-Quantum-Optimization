@@ -9,17 +9,19 @@
 - `quick`：Figure 4 和 Figure 5 统一使用的小规模正式验收名称。
 - `test`：单元测试和端到端烟测，只确认最短代码路径可运行。
 - `paper`：论文参数的参考配置；可以显式运行，但不属于本项目验收边界，验收器不会接受 paper-scale summary。
-- canonical 小规模输出目录统一命名为 `figure4_quick`、`figure5_quick`。
+- 新运行建议把 canonical 小规模输出目录命名为 `figure4_quick`、`figure5_quick`；已完成的 canonical 结果分别保留在 `figure4_quick_gamma2`、`figure5_quick_gamma2`，canonical 身份由 summary 中的完整配置而不是目录名判定。
 - `validate_reproduction.py` 按“严格契约解析 → Figure 自洽重建 → 非阻断 diagnostics → JSON-safe report”四层验收 canonical `quick`；它不重新训练 FM、不重建 QUBO，也不运行 SA。
 - Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
 Figure 4 的 `paper` preset 保留论文的 50-level 编码：`wo_cgfm` 为 200-bit 密集 QUBO，`w_cgfm` 为 150 bits。论文使用 fastFM+ALS，并以 1000 runs、3000 sweeps 求解；本项目的 PyTorch FM+LBFGS 会形成不同的能量地形，而 soft penalty 只改变能量、并不保证任意有限 SA batch 一定含有可行终态。实际诊断中，某个 50-level `rho/wo_cgfm` 迭代的 1000 个终态有 335 个满足系统总和、仅 2 个满足 one-hot、没有一个同时满足；同轮可行域本身并非空集。仅凭“整批无可行终态”不能判断是采样不足还是 penalty 配比失衡，增加 reads/sweeps 也只会提高搜索量，并不提供可行性保证。
 
-因此 Figure 4 canonical `quick` 有意使用 10 levels：`wo_cgfm` 为 40 bits、`w_cgfm` 为 30 bits；直接编码仍有 `C(13,3)=286` 个可行 composition，足以容纳 100 个初始样本和 100 轮新增样本。这是“小规模流程复现”的边界，不是论文 50-level SA 表现的替代证据。`paper` 或显式 `--num-levels 50` 仍受支持，但整批 reads 无可行候选时会明确失败；程序不会把不可行状态 cure、精确枚举结果或随机替换冒充 QUBO 解。此时才会运行错误诊断：若最低采样不可行能量严格低于精确可行域最优能量，报告 `QUBO penalty-balance failure`；反之若精确可行最优严格更低，报告 `heuristic-sampling failure`；两者在 `1e-12` 容差内相等或可行状态数超过诊断上限时，只报告 `no feasible SA candidate; cause not classified`。该诊断不修改论文参数、preset 或实验结果。由于 seed schedule 是确定的，保持 config 不变执行 `--resume` 会重现同一失败批次；应根据分类检查 penalty 配比或调整 reads/sweeps/求解器，并为任何配置变化使用新的 `--output-dir`。不同配置不能混用同一 checkpoint 目录。
+因此 Figure 4 canonical `quick` 有意使用 10 levels：`wo_cgfm` 为 40 bits、`w_cgfm` 为 30 bits；直接编码仍有 `C(13,3)=286` 个可行 composition，足以容纳 100 个初始样本和 100 轮新增样本。这是“小规模流程复现”的边界，不是论文 50-level SA 表现的替代证据，而且减少到 10 levels 本身也不能保证有限 SA 必然返回可行终态：项目曾在 30-bit `w_cgfm` 上观测到 100 个终态全部违反 one-hot，精确能量比较将该批次分类为 `QUBO penalty-balance failure`。为适配本项目的 PyTorch FM 能量地形，Figure 4/5 的 `quick`、`test` preset 将 one-hot penalty `gamma` 固定为 `2.0`；`paper` 保留论文值 `1.0`。这是 non-paper 小规模流程的 penalty-balance 修正，不是有限 SA 可行性的形式化保证。
+
+`paper` 或显式 `--num-levels 50` 仍受支持，但整批 reads 无可行候选时会明确失败；程序不会把不可行状态 cure、精确枚举结果或随机替换冒充 QUBO 解。此时才会运行错误诊断：若最低采样不可行能量严格低于精确可行域最优能量，报告 `QUBO penalty-balance failure`；反之若精确可行最优严格更低，报告 `heuristic-sampling failure`；两者在 `1e-12` 容差内相等或可行状态数超过诊断上限时，只报告 `no feasible SA candidate; cause not classified`。该诊断不修改实验结果。由于 seed schedule 是确定的，保持 config 不变执行 `--resume` 会重现同一失败批次；应根据分类检查 penalty 配比或调整 reads/sweeps/求解器，并为任何配置变化使用新的 `--output-dir`。不同配置不能混用同一 checkpoint 目录。
 
 论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。这是工程替代，因此结果只能称为“小规模流程复现”。
 
-当前仓库尚未提交新版本 canonical `quick` 验收通过报告；实时状态见 `results/reproduction_status.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
+Figure 4 和 Figure 5 的 canonical `quick` 输出均已完成并通过严格验收，报告分别位于 `figure4_quick_gamma2/figure4_validation.json`、`figure5_quick_gamma2/figure5_validation.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
 
 ## 环境与测试
 
@@ -40,7 +42,7 @@ conda env update -n env_torch -f environment.yml --prune
 conda run -n env_torch python -m unittest discover -v
 ```
 
-`figure4_manifest.json`、`figure5_manifest.json` 会分别记录命令、解析后的配置、Python 与依赖版本、CUDA 信息、Git commit/dirty 状态，以及本地论文 PDF 的路径、存在状态和 SHA-256；共用 output-dir 时不会互相覆盖。原始实验目录、checkpoint 和 PNG 默认不进入 Git；验收器生成的精简 JSON 报告应保存到 `results/`。
+`figure4_manifest.json`、`figure5_manifest.json` 会分别记录命令、解析后的配置、Python 与依赖版本、CUDA 信息、Git commit/dirty 状态，以及本地论文 PDF 的路径、存在状态和 SHA-256；共用 output-dir 时不会互相覆盖。原始实验目录、checkpoint 和 PNG 默认不进入 Git。验收器默认把 `figure4_validation.json` / `figure5_validation.json` 写在 summary 与 PNG 所在的同一输出目录；`--output` 只用于显式覆盖该路径。
 
 ## 共同的候选选择规则
 
@@ -83,7 +85,7 @@ QuboConfig
   normalization_scheme: max_abs_polynomial_coefficient_v1
 ```
 
-唯一受支持的 normalization scheme 是 `max_abs_polynomial_coefficient_v1`，语义就是上一段所述的“最大绝对二元多项式系数”，常数偏置不参与尺度计算。完整构建公式为：
+共享 dataclass 默认值和 `paper` preset 的 one-hot weight 都是论文值 `1.0`；两个 Figure 的 `quick/test` preset 显式覆盖为 `2.0`，不会改变直接构造 `QuboConfig()` 的语义。唯一受支持的 normalization scheme 是 `max_abs_polynomial_coefficient_v1`，语义就是上一段所述的“最大绝对二元多项式系数”，常数偏置不参与尺度计算。完整构建公式为：
 
 ```text
 Q = w_fm * N(Q_fm)
@@ -108,7 +110,7 @@ Figure 4 和 Figure 5 共用 FM 数据拆分与训练规则：不少于 5 条数
 - 已完成 PyTorch FM、FM-to-QUBO、SA 全 reads 可行解筛选、重复候选替换、best-so-far 更新及多 seed 聚合。
 - 已完成 per-trajectory checkpoint、两层恢复一致性校验、`--resume`、manifest、runner/plot 日志、checkpoint schema v6、summary schema v5 和多 summary 合并绘图；旧 schema 或错误 seed scheme 不自动迁移。
 - `figure4_runner.py` 默认使用 `quick`，`test` 用于烟测，`paper` 只作参数参考。
-- 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 4 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
+- 单元测试和烟测流程已通过；现有 `figure4_quick_gamma2/figure4_summary.json` 已按 one-hot penalty `gamma=2.0` 的 canonical `quick` 契约验收通过，报告与图片同目录保存。
 
 ### Figure 4 代码结构
 
@@ -208,6 +210,7 @@ Figure4ExperimentConfig
 - 配置先由 `preset_config` 解析，再由 `resolve_experiment_config` 应用 CLI 显式覆盖；未覆盖字段保留 preset 值。
 - `num_samples`、`iterations`、SA reads/sweeps 必须为严格正整数；`num_levels` 必须是大于 1 的整数；`optuna_trials` 必须是非负整数；device 只允许 `cpu` 或 `cuda`。
 - CLI 可覆盖 `--num-samples`、`--iterations`、`--num-levels`、`--optuna-trials`、`--sa-reads`、`--sa-sweeps`，以及 `--fm-objective-weight`、`--system-penalty-weight`、`--one-hot-penalty-weight`。normalization scheme 当前只有一种受支持值，因此不开放 CLI。
+- QUBO preset 契约为：`paper` 的 one-hot penalty `gamma=1.0`，`quick/test` 为 `gamma=2.0`；CLI 显式 `--one-hot-penalty-weight` 最后应用并优先于 preset。
 - `--settings` 必填；`--objectives` 省略或传空时运行全部五个目标。
 - `--seed-start` 必须非负，`--num-seeds` 必须为正；默认 seed 为从 0 开始的连续列表，列表末端和最后一轮派生 SA seed 都不得超过 `2**31 - 1`。
 - 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
@@ -251,9 +254,10 @@ conda run -n env_torch python plot_figure4.py `
 
 ```powershell
 conda run -n env_torch python validate_reproduction.py figure4 `
-  --summary figure4_quick\figure4_summary.json `
-  --output results\figure4_quick_validation.json
+  --summary figure4_quick\figure4_summary.json
 ```
+
+未传 `--output` 时，报告写入 `figure4_quick\figure4_validation.json`。
 
 ### Figure 4 输出规则
 
@@ -262,6 +266,7 @@ conda run -n env_torch python validate_reproduction.py figure4 `
   figure4_summary.json
   figure4_manifest.json
   figure4.png
+  figure4_validation.json
   logs/
     figure4_runner.log
     plot_figure4.log
@@ -275,6 +280,7 @@ conda run -n env_torch python validate_reproduction.py figure4 `
 | trajectory checkpoint | schema v6；绑定 `seed_derivation + setting + objective + seed + config`，并持久化新的 `QuboStats`。每轮仍写完整状态，但使用紧凑流式 JSON；旧 schema、错误 scheme 或损坏状态都不迁移。 |
 | `figure4_summary.json` | schema v5；包含 `seed_derivation`、完整 config、seed/objective/setting、所有 `trajectories` 和 `{objective}:{setting}` 聚合曲线。 |
 | `figure4.png` | 由 `plot_figure4.py` 从一个或多个 schema v5 summary 生成；曲线字段必须是一维、等长且有限。 |
+| `figure4_validation.json` | report schema v3；validator 默认写在 summary/图片同目录。通过、验收失败和输入 JSON 损坏都会落盘；可用 `--output` 显式覆盖。 |
 | 日志 | runner 和 plot 分文件记录；不得用日志替代机器可读 summary/validation report。 |
 
 summary 和 manifest 保留缩进以便审查；所有 JSON 都通过同目录唯一临时文件流式写入，`flush + fsync` 后原子替换，并拒绝 NaN/Infinity。`trajectories/*.json` 是“当前单条轨迹的完整 checkpoint 快照”，每轮原子覆盖同一个文件；紧凑单行是为了降低每轮完整重写的 I/O 常数，不是 JSONL，也不表示只保存了一条记录或发生数据缺失。可用 `python -m json.tool trajectories\wo_cgfm_kappa_seed_0.json` 格式化查看。每条轨迹必须满足：`completed_iterations == iterations`、`len(best_so_far) == iterations`、`final_dataset_size == num_samples + iterations`，并且 `accepted_sa_candidates + duplicate_replacements == iterations`。不同配置必须使用不同输出目录；旧 schema checkpoint 不会自动覆盖或迁移。
@@ -300,7 +306,7 @@ Figure 4 canonical `quick` 严格检查：
 - 已完成每轮 proposed solution 与实际 added solution 的分别记录；重复 proposed solution 会保留，random replacement 不进入 Pareto front。
 - 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、checkpoint schema v5、summary schema v5、两层恢复一致性校验、`--resume`、manifest 和 runner/plot 日志；旧 schema 或错误 seed scheme 不自动迁移。
 - 已完成单/双 setting 绘图、3D 总览、迭代窗口及多 seed 显式选择；canonical `quick` 要求两个 setting 完整对比。
-- 单元测试和烟测流程已通过；当前仍待执行并保存新版 Figure 5 canonical `quick` 运行及验收报告，状态以 `results/reproduction_status.json` 为准。
+- 单元测试和烟测流程已通过；现有 `figure5_quick_gamma2/figure5_summary.json` 已按 one-hot penalty `gamma=2.0` 的 canonical `quick` 契约验收通过，报告与图片同目录保存。
 
 ### Figure 5 代码结构
 
@@ -422,6 +428,7 @@ Figure5ExperimentConfig
 
 - 配置先由 Figure 5 的 `preset_config` 解析，再由 `resolve_experiment_config` 应用显式覆盖；Figure 4 和 Figure 5 的 preset 名相同，但数值彼此独立。
 - 数值、device、seed、SA 和 QUBO 权重遵循与 Figure 4 相同的严格类型及派生范围规则；CLI 首选 `--sa-reads`，三个 QUBO 权重使用相同的显式 override 名称，normalization scheme 不开放 CLI。
+- QUBO preset 契约同样是 `paper` 使用 one-hot penalty `gamma=1.0`，`quick/test` 使用 `gamma=2.0`；CLI 显式权重优先。
 - `--settings` 必填；objectives 固定为 `kappa E rho`，Figure 5 CLI 不接受 objective 子集。
 - Figure 5 使用四相直接 one-hot 编码和 system penalty，不接受 CGFM setting。
 - 默认运行 seed 0；显式传入 `--num-seeds N` 时每个 setting 都运行 N 条 trajectory。
@@ -477,9 +484,10 @@ conda run -n env_torch python plot_figure5.py `
 
 ```powershell
 conda run -n env_torch python validate_reproduction.py figure5 `
-  --summary figure5_quick\figure5_summary.json `
-  --output results\figure5_quick_validation.json
+  --summary figure5_quick\figure5_summary.json
 ```
+
+未传 `--output` 时，报告写入 `figure5_quick\figure5_validation.json`。
 
 ### Figure 5 输出规则
 
@@ -488,6 +496,7 @@ conda run -n env_torch python validate_reproduction.py figure5 `
   figure5_summary.json
   figure5_manifest.json
   figure5.png
+  figure5_validation.json
   logs/
     figure5_runner.log
     plot_figure5.log
@@ -501,6 +510,7 @@ conda run -n env_torch python validate_reproduction.py figure5 `
 | trajectory checkpoint | schema v5；绑定 `seed_derivation + setting + seed + config`，并持久化新的 `QuboStats`。每轮仍写完整状态，但使用紧凑流式 JSON；旧 schema、错误 scheme 或损坏状态都不迁移。 |
 | `figure5_summary.json` | schema v5；包含 `seed_derivation`、完整 config、trajectories、全部 proposed `solutions` 和每个 `setting × seed` 的 `pareto_fronts`。 |
 | `figure5.png` | 由 `plot_figure5.py` 从 schema v5 summary 生成；多 seed 时必须显式传 `--seed`，stored front 必须与该 seed 的 proposed solutions 重算结果一致。 |
+| `figure5_validation.json` | report schema v3；validator 默认写在 summary/图片同目录，通过、验收失败和输入损坏均落盘；`--output` 可覆盖。 |
 | 日志 | runner 和 plot 分文件记录；验收结论只来自 validation report。 |
 
 Figure 5 的 `trajectories/*.json` 与 Figure 4 相同，也是每轮覆盖的单行完整 checkpoint 对象，不是 JSONL；同样可以交给 `python -m json.tool` 格式化查看。每条轨迹必须满足：`completed_iterations == iterations`、`len(iteration_records) == iterations`、`final_dataset_size == num_samples + iterations`，并且 `accepted_sa_candidates + duplicate_replacements == iterations`。每条 `IterationRecord` 必须同时保留 setting、seed、iteration、weights、scalarization method、decision status、proposed/added solution 和 SA 诊断字段。

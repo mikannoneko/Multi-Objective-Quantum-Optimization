@@ -29,6 +29,7 @@ MANIFEST_SCHEMA_VERSION = 2
 SUMMARY_FILENAME = "figure5_summary.json"
 MANIFEST_FILENAME = "figure5_manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure5.png"
+VALIDATION_REPORT_FILENAME = "figure5_validation.json"
 LOG_DIR_NAME = "logs"
 RUNNER_LOG_FILENAME = "figure5_runner.log"
 PLOT_LOG_FILENAME = "plot_figure5.log"
@@ -55,6 +56,10 @@ class Figure5OutputLayout:
     @property
     def figure_path(self) -> Path:
         return self.root / DEFAULT_FIGURE_FILENAME
+
+    @property
+    def validation_report_path(self) -> Path:
+        return self.root / VALIDATION_REPORT_FILENAME
 
     @property
     def logs_dir(self) -> Path:
@@ -187,6 +192,7 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "SUMMARY_FILENAME",
     "SUMMARY_SCHEMA_VERSION",
+    "VALIDATION_REPORT_FILENAME",
     "checkpoint_filename",
     "checkpoint_payload",
     "figure5_output_layout",

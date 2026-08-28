@@ -107,7 +107,10 @@ def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4Experi
     """把论文规模、快速规模和单元测试规模收敛到同一个配置 dataclass。"""
 
     if preset == "paper":
-        return Figure4ExperimentConfig(fm=FMConfig(device=device))
+        return Figure4ExperimentConfig(
+            fm=FMConfig(device=device),
+            qubo=QuboConfig(one_hot_penalty_weight=1.0),
+        )
     if preset == "quick":
         return Figure4ExperimentConfig(
             num_samples=100,
@@ -118,6 +121,7 @@ def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4Experi
             encoding=EncodingConfig(num_levels=10),
             fm=FMConfig(optuna_trials=3, device=device),
             sa=SAConfig(reads=100, sweeps=500),
+            qubo=QuboConfig(one_hot_penalty_weight=2.0),
         )
     if preset == "test":
         return Figure4ExperimentConfig(
@@ -126,6 +130,7 @@ def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4Experi
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0, device=device),
             sa=SAConfig(reads=32, sweeps=12),
+            qubo=QuboConfig(one_hot_penalty_weight=2.0),
         )
     raise ValueError(f"Unsupported preset {preset!r}. Choices: {', '.join(SUPPORTED_PRESETS)}")
 

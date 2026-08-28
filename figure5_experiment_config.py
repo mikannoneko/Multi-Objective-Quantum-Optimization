@@ -69,7 +69,10 @@ def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5Experi
     """Resolve the paper reference, project reproduction, or test scale."""
 
     if preset == "paper":
-        return Figure5ExperimentConfig(fm=FMConfig(device=device))
+        return Figure5ExperimentConfig(
+            fm=FMConfig(device=device),
+            qubo=QuboConfig(one_hot_penalty_weight=1.0),
+        )
     if preset == "quick":
         return Figure5ExperimentConfig(
             num_samples=500,
@@ -77,6 +80,7 @@ def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5Experi
             encoding=EncodingConfig(num_levels=25),
             fm=FMConfig(optuna_trials=3, device=device),
             sa=SAConfig(reads=100, sweeps=500),
+            qubo=QuboConfig(one_hot_penalty_weight=2.0),
         )
     if preset == "test":
         return Figure5ExperimentConfig(
@@ -85,6 +89,7 @@ def preset_config(preset: Figure5RunScale, device: str = "cpu") -> Figure5Experi
             encoding=EncodingConfig(num_levels=8),
             fm=FMConfig(optuna_trials=0, device=device),
             sa=SAConfig(reads=32, sweeps=12),
+            qubo=QuboConfig(one_hot_penalty_weight=2.0),
         )
     raise ValueError(f"Unsupported preset {preset!r}. Choices: {', '.join(SUPPORTED_PRESETS)}")
 

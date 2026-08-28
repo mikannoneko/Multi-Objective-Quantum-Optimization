@@ -41,6 +41,7 @@ from figure4_outputs import (
     PLOT_LOG_FILENAME,
     RUNNER_LOG_FILENAME,
     SUMMARY_FILENAME,
+    VALIDATION_REPORT_FILENAME,
     checkpoint_payload,
     figure4_output_layout,
     load_checkpoint,
@@ -188,7 +189,9 @@ class Figure4PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "optuna_trials"):
             FMConfig(optuna_trials=-1)
 
+        paper = figure4_preset_config("paper", device="cpu")
         quick = resolve_experiment_config(preset="quick", device="cuda")
+        test = figure4_preset_config("test", device="cpu")
         self.assertEqual(quick.num_samples, 100)
         self.assertEqual(quick.iterations, 100)
         self.assertEqual(quick.num_levels, 10)
@@ -196,7 +199,9 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(quick.sa_reads, 100)
         self.assertEqual(quick.sa_sweeps, 500)
         self.assertEqual(quick.device, "cuda")
-        self.assertEqual(quick.qubo, QuboConfig())
+        self.assertEqual(paper.qubo, QuboConfig(one_hot_penalty_weight=1.0))
+        self.assertEqual(quick.qubo, QuboConfig(one_hot_penalty_weight=2.0))
+        self.assertEqual(test.qubo, QuboConfig(one_hot_penalty_weight=2.0))
 
         overridden = resolve_experiment_config(preset="test", device="cpu", iterations=3, sa_reads=4)
         self.assertEqual(overridden.iterations, 3)
@@ -794,6 +799,10 @@ class Figure4PipelineTests(unittest.TestCase):
         self.assertEqual(layout.summary_path, output_dir / SUMMARY_FILENAME)
         self.assertEqual(layout.manifest_path, output_dir / MANIFEST_FILENAME)
         self.assertEqual(layout.figure_path, output_dir / DEFAULT_FIGURE_FILENAME)
+        self.assertEqual(
+            layout.validation_report_path,
+            output_dir / VALIDATION_REPORT_FILENAME,
+        )
         self.assertEqual(layout.runner_log_path, output_dir / LOG_DIR_NAME / RUNNER_LOG_FILENAME)
         self.assertEqual(layout.plot_log_path, output_dir / LOG_DIR_NAME / PLOT_LOG_FILENAME)
         self.assertEqual(

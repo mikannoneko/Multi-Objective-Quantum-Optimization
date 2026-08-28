@@ -28,7 +28,9 @@ from figure4_experiment_config import (
     Figure4ExperimentConfig,
     preset_config as figure4_preset_config,
 )
+from figure4_outputs import figure4_output_layout
 from figure5_experiment_config import Figure5ExperimentConfig, preset_config as figure5_preset_config
+from figure5_outputs import figure5_output_layout
 from figure5_pareto import pareto_front
 from figure5_scalarization import (
     FIGURE5_OBJECTIVES,
@@ -488,7 +490,7 @@ class ReproductionValidationTests(unittest.TestCase):
             (
                 "qubo_weight",
                 lambda trajectory: trajectory["qubo_stats"].__setitem__(
-                    "one_hot_penalty_weight", 2.0
+                    "one_hot_penalty_weight", 3.0
                 ),
             ),
         )
@@ -581,6 +583,36 @@ class ReproductionValidationTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertEqual(set(report["checks"]["input"]["detail"]["errors"][0]), {"path", "rule", "expected", "actual"})
         json.dumps(report, allow_nan=False)
+
+    def test_cli_defaults_report_to_each_summary_directory(self) -> None:
+        cases = (
+            ("figure4", self.figure4, figure4_output_layout),
+            ("figure5", self.figure5, figure5_output_layout),
+        )
+        for figure, summary, layout_factory in cases:
+            with self.subTest(figure=figure):
+                output_dir = WORKSPACE_TMP_ROOT / f"{figure}_default_output"
+                summary_path = output_dir / f"{figure}_summary.json"
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
+                summary_path.write_text(json.dumps(summary), encoding="utf-8")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return_code = main([figure, "--summary", str(summary_path)])
+                report_path = layout_factory(output_dir).validation_report_path
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                self.assertEqual(return_code, 0)
+                self.assertTrue(report["passed"])
+
+    def test_cli_validation_failure_uses_default_report_path(self) -> None:
+        output_dir = WORKSPACE_TMP_ROOT / "figure4_failed_validation"
+        summary_path = output_dir / "figure4_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("{}", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return_code = main(["figure4", "--summary", str(summary_path)])
+        report_path = figure4_output_layout(output_dir).validation_report_path
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(return_code, 1)
+        self.assertFalse(report["passed"])
 
     def test_cli_public_surface_and_no_paper_profile(self) -> None:
         args = parse_args(["figure4", "--summary", "summary.json"])

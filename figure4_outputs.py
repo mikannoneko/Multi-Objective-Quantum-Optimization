@@ -28,6 +28,7 @@ MANIFEST_SCHEMA_VERSION = 2
 SUMMARY_FILENAME = "figure4_summary.json"
 MANIFEST_FILENAME = "figure4_manifest.json"
 DEFAULT_FIGURE_FILENAME = "figure4.png"
+VALIDATION_REPORT_FILENAME = "figure4_validation.json"
 LOG_DIR_NAME = "logs"
 RUNNER_LOG_FILENAME = "figure4_runner.log"
 PLOT_LOG_FILENAME = "plot_figure4.log"
@@ -58,6 +59,10 @@ class Figure4OutputLayout:
     @property
     def figure_path(self) -> Path:
         return self.root / DEFAULT_FIGURE_FILENAME
+
+    @property
+    def validation_report_path(self) -> Path:
+        return self.root / VALIDATION_REPORT_FILENAME
 
     @property
     def logs_dir(self) -> Path:
@@ -203,6 +208,7 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "SUMMARY_FILENAME",
     "SUMMARY_SCHEMA_VERSION",
+    "VALIDATION_REPORT_FILENAME",
     "checkpoint_filename",
     "checkpoint_payload",
     "figure4_output_layout",

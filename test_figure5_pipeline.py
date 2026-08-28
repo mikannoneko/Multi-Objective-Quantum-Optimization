@@ -36,6 +36,7 @@ from figure5_experiment_config import (
 )
 from figure5_outputs import (
     CHECKPOINT_SCHEMA_VERSION,
+    VALIDATION_REPORT_FILENAME,
     checkpoint_payload,
     figure5_output_layout,
     load_checkpoint,
@@ -198,9 +199,9 @@ class Figure5PipelineTests(unittest.TestCase):
         self.assertEqual((quick.optuna_trials, quick.sa_reads, quick.sa_sweeps), (3, 100, 500))
         self.assertEqual((test.num_samples, test.iterations, test.num_levels), (10, 2, 8))
         self.assertEqual((test.sa_reads, test.sa_sweeps), (32, 12))
-        self.assertEqual(paper.qubo, QuboConfig())
-        self.assertEqual(quick.qubo, QuboConfig())
-        self.assertEqual(test.qubo, QuboConfig())
+        self.assertEqual(paper.qubo, QuboConfig(one_hot_penalty_weight=1.0))
+        self.assertEqual(quick.qubo, QuboConfig(one_hot_penalty_weight=2.0))
+        self.assertEqual(test.qubo, QuboConfig(one_hot_penalty_weight=2.0))
 
         overridden = resolve_experiment_config(
             preset="test",
@@ -1241,6 +1242,10 @@ class Figure5PipelineTests(unittest.TestCase):
         config = _test_config(iterations=1)
         output_dir = WORKSPACE_TMP_ROOT / "figure5_outputs"
         layout = figure5_output_layout(output_dir)
+        self.assertEqual(
+            layout.validation_report_path,
+            output_dir / VALIDATION_REPORT_FILENAME,
+        )
         state = pipeline.Figure5TrajectoryState(rows=[])
         checkpoint = layout.checkpoint_path("wo_ddts", 4)
         write_checkpoint(

@@ -42,9 +42,15 @@ from figure4_experiment_config import (
     FIGURE4_SETTINGS,
     preset_config as figure4_preset_config,
 )
-from figure4_outputs import SUMMARY_SCHEMA_VERSION as FIGURE4_SCHEMA_VERSION
+from figure4_outputs import (
+    SUMMARY_SCHEMA_VERSION as FIGURE4_SCHEMA_VERSION,
+    figure4_output_layout,
+)
 from figure5_experiment_config import FIGURE5_PRESET_NUM_SEEDS, preset_config as figure5_preset_config
-from figure5_outputs import SUMMARY_SCHEMA_VERSION as FIGURE5_SCHEMA_VERSION
+from figure5_outputs import (
+    SUMMARY_SCHEMA_VERSION as FIGURE5_SCHEMA_VERSION,
+    figure5_output_layout,
+)
 from figure5_pareto import pareto_front
 from figure5_scalarization import (
     FIGURE5_OBJECTIVES,
@@ -1522,8 +1528,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate a Figure 4 or Figure 5 workflow summary.")
     parser.add_argument("figure", choices=("figure4", "figure5"))
     parser.add_argument("--summary", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=None, help="Optional JSON report path.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional report path; defaults to the Figure-specific validation file beside the summary.",
+    )
     return parser.parse_args(argv)
+
+
+def _default_report_path(figure: str, summary_path: Path) -> Path:
+    output_dir = summary_path.parent
+    if figure == "figure4":
+        return figure4_output_layout(output_dir).validation_report_path
+    return figure5_output_layout(output_dir).validation_report_path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1535,8 +1553,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         report = validate_figure4_summary(summary) if args.figure == "figure4" else validate_figure5_summary(summary)
     rendered = json.dumps(report, indent=2, allow_nan=False)
-    if args.output is not None:
-        write_json_atomic(args.output, report)
+    output_path = args.output if args.output is not None else _default_report_path(
+        args.figure, args.summary
+    )
+    write_json_atomic(output_path, report)
     print(rendered)
     return 0 if report["passed"] else 1
 

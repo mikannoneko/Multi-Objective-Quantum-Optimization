@@ -46,6 +46,7 @@ figure5_paper/
 *.pid
 *.tmp
 *.png
+results/
 
 # OS/editor noise
 .DS_Store
