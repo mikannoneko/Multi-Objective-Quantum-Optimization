@@ -113,14 +113,14 @@ def preset_config(preset: Figure4RunScale, device: str = "cpu") -> Figure4Experi
         )
     if preset == "quick":
         return Figure4ExperimentConfig(
-            num_samples=100,
+            num_samples=50,
             iterations=100,
-            # quick 只验收小规模流程。保留论文的 50-level/200-bit 直接编码会让
-            # soft-constraint SA 在有限 reads 内可能完全找不到可行终态；10 levels
-            # 仍提供 286 个直接编码可行 composition，足以容纳本 preset 的 200 行。
-            encoding=EncodingConfig(num_levels=10),
+            # quick 只验收小规模流程。25 levels 对应 wo_cgfm 的 100-bit 和
+            # w_cgfm 的 75-bit QUBO；直接编码有 C(28, 3)=3276 个可行组成。
+            # 该缩小规模和 gamma=2 仍不保证有限 SA batch 必然包含可行终态。
+            encoding=EncodingConfig(num_levels=25),
             fm=FMConfig(optuna_trials=3, device=device),
-            sa=SAConfig(reads=100, sweeps=500),
+            sa=SAConfig(reads=250, sweeps=1000),
             qubo=QuboConfig(one_hot_penalty_weight=2.0),
         )
     if preset == "test":

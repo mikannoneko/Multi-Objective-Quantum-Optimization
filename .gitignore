@@ -17,25 +17,23 @@ env_*/
 # Codex/local workspace metadata
 .codex/
 
-# Local paper file; keep tracked citation metadata only
-references/*
-!references/README.md
+# Local paper file
+references/
 
 # Temporary outputs
 .tmp_test/
 
 # Figure 4 experiment outputs and checkpoints
 figure4_*output*/
-figure4_*full*/
+figure4_*paper*/
 figure4_*quick*/
 figure4_*test*/
-figure4_compare*/
-figure4_cgfm*/
 figure4_quick_l50/
+figure4_*compare*/
 
 # Figure 5 experiment outputs and checkpoints
 figure5_*output*/
-figure5_*full*/
+figure5_*paper*/
 figure5_*quick*/
 figure5_*test*/
 figure5_quick150/
@@ -52,3 +50,6 @@ results/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# report files
+汇报输出/

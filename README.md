@@ -2,6 +2,58 @@
 
 本项目复现论文 *Progress on Data-Driven, Multi-Objective Quantum Optimization*（arXiv:2512.11479）中 Figure 4 和 Figure 5 的算法流程。论文元数据、本地 PDF 文件名及 SHA-256 见 `references/README.md`。
 
+## 项目状态与结果
+
+Figure 4 和 Figure 5 的 canonical `quick` 输出均已完成并通过严格验收，报告分别位于 `figure4_quick_l25_n50_delta_t/figure4_validation.json`、`figure5_quick_gamma2/figure5_validation.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
+
+### paper 规模试运行与 quick 选择
+
+本项目实际试运行过 Figure 4 的 `paper` preset。`figure4_paper/figure4_manifest.json` 记录的环境为 NVIDIA GeForce RTX 4060 Laptop GPU，配置为 20 个 seed、5 个 objective、2 个 setting、每条 trajectory 600 轮、50 levels、20 次 Optuna trial，以及每轮 1000 SA reads / 3000 sweeps。完整任务因此包含 200 条 trajectory 和 120,000 个 active-learning iteration。
+
+该试运行从 2026-09-06 22:17 持续到 2026-09-07 12:46，约 14.5 小时后仍位于第一条 `wo_cgfm/kappa/seed=0` trajectory，只完成 265/600 轮；相对于完整任务仅为 265/120,000，约 0.221%。这 265 轮中 252 次直接接受 SA proposal、13 次因重复 proposal 使用 replacement，日志没有 traceback 或 SA 无可行候选错误。因此此次未完成不能归因于流程异常，而是本地计算吞吐不足。按已观测的约 3.29 分钟/轮作简单线性外推，完整 Figure 4 paper 规模约需 274 天连续运行；随着数据集逐轮增长，这一估算仍可能偏乐观。
+
+Figure 5 没有继续执行完整 `paper` 运行。其 QUBO levels 虽与 `quick` 相同，但迭代数由 150 增至 1000、Optuna trials 由 3 增至 20、SA 由 100 reads / 500 sweeps 增至 1000 reads / 3000 sweeps。按现有两条 setting 的一 FM/三 FM 结构计算，paper 的总 FM 拟合次数约为 quick 的 35 倍，SA read-sweep 总预算约为 400 倍；在当前本地硬件和 PyTorch FM 实现下同样不具备现实可操作性。
+
+因此项目转而定义自有的 canonical `quick` 规模，用于验证“数据生成 → scalarization/单目标处理 → FM → QUBO → SA → active learning → checkpoint/summary → 绘图与验收”的完整流程。Figure 5 quick 共完成 2 条 trajectory、300 轮，实际耗时约 5 小时 50 分。Figure 4 quick 的规模则经过了以下探索过程。
+
+最初的 Figure 4 quick 使用 100 个初始样本、100 轮、10 levels、100 SA reads / 500 sweeps。one-hot penalty `gamma=1.0` 时，曾在 30-bit `w_cgfm/delta_alpha/seed=0` 的第 53 轮出现 100 个 SA 终态全部违反 one-hot；精确能量比较将该批次归类为 `QUBO penalty-balance failure`。将 non-paper quick/test 的 `gamma` 调整为 `2.0` 后，`figure4_quick_gamma2` 完成了全部轨迹，但曲线较早进入平台。
+
+对旧 10-level 编码域的运行后枚举说明，这些平台不能简单归因于 FM 训练失败。直接编码只有 `C(13,3)=286` 个可行组成，其 Δα 全局最小值为 `0.0274428274`，ΔT 全局最小值为 `5.348`；旧运行的橙色曲线已经达到这些网格极值。特别是实际 Si 体积分数的步长为 `0.2/10=0.02`，无法表示共晶点 `0.128`。CGFM 的 10-level 可达域中，ΔT 最小值为 `0.1932137394`，旧蓝色曲线同样达到该值。该枚举只用于运行后解释，没有参与训练、QUBO、SA 或候选选择；更完整的旧规模核查保留在 `PROJECT_REVIEW.md`。
+
+为减少初始样本对小网格的覆盖并提高离散分辨率，当前 Figure 4 canonical quick 改为 50 个初始样本、100 轮、25 levels、3 次 Optuna trial，以及每轮 250 SA reads / 1000 sweeps；3 个 seed、5 个 objective、2 个 setting 和 `gamma=2.0` 保持不变。25 levels 对应 `wo_cgfm` 的 100-bit QUBO、`w_cgfm` 的 75-bit QUBO，直接编码有 `C(28,3)=3276` 个可行组成。现有 `figure4_quick_l25_n50_delta_t` 共完成 30 条 trajectory 和 3000 轮，累计活跃运行约 19 小时 16 分；其中 2626 次直接接受新 proposal、374 次使用 duplicate replacement，没有出现整批 SA 无可行候选，最大被选可行候选 rank 为 4。
+
+Figure 4 绘制的是各 seed 的历史最优值（best-so-far）的均值。新候选没有改善历史最优时，曲线自然保持水平；`min-max` 和 `mean ± std` 表示同一轮三个 seed 之间的差异，`std` 使用总体标准差（`ddof=0`）。三个 seed 取值相同时，两种阴影都会与均值线重合。当前运行最后一轮的聚合结果为：
+
+| objective | `wo_cgfm` mean ± std | `w_cgfm` mean ± std |
+| --- | ---: | ---: |
+| κ | `152.7996 ± 0.4177` | `154.5118 ± 0.0072` |
+| E | `82.8816 ± 0.3368` | `83.6638 ± 0.0053` |
+| ρ | `2.5712 ± 0.0049` | `2.5600 ± 0.0000` |
+| Δα | `0.002892 ± 0.002772` | `0.004204 ± 0.002206` |
+| ΔT | `1.782667 ± 2.521071` | `0.588331 ± 0.448167` |
+
+25-level 直接编码可以精确表示 `0.128 = 0.2 × 16/25`；`wo_cgfm` 的三个 seed 中有两个取得 ΔT `0.0`，另一个停在 `5.348`。ΔT 和 Δα 使用对数坐标绘制，零值以及小于零的 `mean - std` 边界会被绘图器裁剪到 `1e-12`，因此图中延伸至该下限的曲线或阴影是显示规则，不表示真实性质跨越了 12 个数量级。新旧 quick 同时改变了初始样本数、levels 和 SA 预算，曲线变化不能归因于其中单一参数；平台和零宽阴影本身也仍不是训练失败的证据。
+
+Figure 4 与 Figure 5 的 canonical quick 均使用 non-paper one-hot penalty `gamma=2.0` 并通过 validation report。这些结果证明的是本项目的小规模流程实现完整且输出自洽，不代表复现了论文计算规模、运行效率、数值曲线或相对性能结论；`paper` preset 继续保留为参数参考，不作为本地验收任务。
+
+### Figure 4 当前状态
+
+- 已完成 `wo_cgfm`（直接四相编码）和 `w_cgfm`（CGFM 角度编码）两条流程。
+- 已完成 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T` 五个 objective；优化方向由 `ObjectiveSpec` 统一定义。
+- 已完成 PyTorch FM、FM-to-QUBO、SA 全 reads 可行解筛选、重复候选替换、best-so-far 更新及多 seed 聚合。
+- 已完成 per-trajectory checkpoint、两层恢复一致性校验、`--resume`、manifest、runner/plot 日志、checkpoint schema v6、summary schema v5 和多 summary 合并绘图；旧 schema 或错误 seed scheme 不自动迁移。
+- `figure4_runner.py` 默认使用 `quick`，`test` 用于烟测，`paper` 只作参数参考。
+- 单元测试和烟测流程已通过；现有 `figure4_quick_l25_n50_delta_t/figure4_summary.json` 已按当前 canonical `quick` 契约验收通过，报告与图片同目录保存。
+
+### Figure 5 当前状态
+
+- 已完成 `w_ddts` 和 `wo_ddts`（weighted-sum baseline）两条多目标流程。
+- 已完成最大化 `kappa`、最大化 `E`、最小化 `rho` 的统一方向处理、可复现 preference weights、DDTS 人工目标、三 FM QUBO 合并和 Pareto front。
+- 已完成每轮 proposed solution 与实际 added solution 的分别记录；重复 proposed solution 会保留，random replacement 不进入 Pareto front。
+- 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、checkpoint schema v5、summary schema v5、两层恢复一致性校验、`--resume`、manifest 和 runner/plot 日志；旧 schema 或错误 seed scheme 不自动迁移。
+- 已完成单/双 setting 绘图、3D 总览、迭代窗口及多 seed 显式选择；canonical `quick` 要求两个 setting 完整对比。
+- 单元测试和烟测流程已通过；现有 `figure5_quick_gamma2/figure5_summary.json` 已按 one-hot penalty `gamma=2.0` 的 canonical `quick` 契约验收通过，报告与图片同目录保存。
+
 ## 项目边界
 
 本项目只验收小规模流程复现，不验收论文计算规模，也不以复现论文数值或定性优势作为通过条件。
@@ -9,19 +61,17 @@
 - `quick`：Figure 4 和 Figure 5 统一使用的小规模正式验收名称。
 - `test`：单元测试和端到端烟测，只确认最短代码路径可运行。
 - `paper`：论文参数的参考配置；可以显式运行，但不属于本项目验收边界，验收器不会接受 paper-scale summary。
-- 新运行建议把 canonical 小规模输出目录命名为 `figure4_quick`、`figure5_quick`；已完成的 canonical 结果分别保留在 `figure4_quick_gamma2`、`figure5_quick_gamma2`，canonical 身份由 summary 中的完整配置而不是目录名判定。
+- 新运行建议把 canonical 小规模输出目录命名为 `figure4_quick`、`figure5_quick`；已完成的 canonical 结果分别保留在 `figure4_quick_l25_n50_delta_t`、`figure5_quick_gamma2`，canonical 身份由 summary 中的完整配置而不是目录名判定。旧 `figure4_quick_gamma2` 只保留为 10-level 探索记录。
 - `validate_reproduction.py` 按“严格契约解析 → Figure 自洽重建 → 非阻断 diagnostics → JSON-safe report”四层验收 canonical `quick`；它不重新训练 FM、不重建 QUBO，也不运行 SA。
 - Figure 4 的论文趋势，以及 Figure 5 的 DDTS 覆盖率与均匀性，仍会写入验收报告的 `diagnostics`，但不影响 `passed`。
 
 Figure 4 的 `paper` preset 保留论文的 50-level 编码：`wo_cgfm` 为 200-bit 密集 QUBO，`w_cgfm` 为 150 bits。论文使用 fastFM+ALS，并以 1000 runs、3000 sweeps 求解；本项目的 PyTorch FM+LBFGS 会形成不同的能量地形，而 soft penalty 只改变能量、并不保证任意有限 SA batch 一定含有可行终态。实际诊断中，某个 50-level `rho/wo_cgfm` 迭代的 1000 个终态有 335 个满足系统总和、仅 2 个满足 one-hot、没有一个同时满足；同轮可行域本身并非空集。仅凭“整批无可行终态”不能判断是采样不足还是 penalty 配比失衡，增加 reads/sweeps 也只会提高搜索量，并不提供可行性保证。
 
-因此 Figure 4 canonical `quick` 有意使用 10 levels：`wo_cgfm` 为 40 bits、`w_cgfm` 为 30 bits；直接编码仍有 `C(13,3)=286` 个可行 composition，足以容纳 100 个初始样本和 100 轮新增样本。这是“小规模流程复现”的边界，不是论文 50-level SA 表现的替代证据，而且减少到 10 levels 本身也不能保证有限 SA 必然返回可行终态：项目曾在 30-bit `w_cgfm` 上观测到 100 个终态全部违反 one-hot，精确能量比较将该批次分类为 `QUBO penalty-balance failure`。为适配本项目的 PyTorch FM 能量地形，Figure 4/5 的 `quick`、`test` preset 将 one-hot penalty `gamma` 固定为 `2.0`；`paper` 保留论文值 `1.0`。这是 non-paper 小规模流程的 penalty-balance 修正，不是有限 SA 可行性的形式化保证。
+Figure 4 canonical `quick` 使用 25 levels：`wo_cgfm` 为 100 bits、`w_cgfm` 为 75 bits，直接编码有 `C(28,3)=3276` 个可行 composition，初始数据集为 50 行、完成后为 150 行。旧 10-level quick 曾在 30-bit `w_cgfm` 上观测到 100 个终态全部违反 one-hot，精确能量比较将该批次分类为 `QUBO penalty-balance failure`。为适配本项目的 PyTorch FM 能量地形，Figure 4/5 的 `quick`、`test` preset 将 one-hot penalty `gamma` 固定为 `2.0`；`paper` 保留论文值 `1.0`。这是 non-paper 小规模流程的 penalty-balance 修正。25 levels、250 reads / 1000 sweeps 和 `gamma=2.0` 都不构成有限 SA 可行性的形式化保证。
 
 `paper` 或显式 `--num-levels 50` 仍受支持，但整批 reads 无可行候选时会明确失败；程序不会把不可行状态 cure、精确枚举结果或随机替换冒充 QUBO 解。此时才会运行错误诊断：若最低采样不可行能量严格低于精确可行域最优能量，报告 `QUBO penalty-balance failure`；反之若精确可行最优严格更低，报告 `heuristic-sampling failure`；两者在 `1e-12` 容差内相等或可行状态数超过诊断上限时，只报告 `no feasible SA candidate; cause not classified`。该诊断不修改实验结果。由于 seed schedule 是确定的，保持 config 不变执行 `--resume` 会重现同一失败批次；应根据分类检查 penalty 配比或调整 reads/sweeps/求解器，并为任何配置变化使用新的 `--output-dir`。不同配置不能混用同一 checkpoint 目录。
 
-论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。这是工程替代，因此结果只能称为“小规模流程复现”。
-
-Figure 4 和 Figure 5 的 canonical `quick` 输出均已完成并通过严格验收，报告分别位于 `figure4_quick_gamma2/figure4_validation.json`、`figure5_quick_gamma2/figure5_validation.json`。旧输出审查报告只说明修复前的问题，不作为当前验收证据。
+论文补充材料使用 `fastFM + ALS`。本项目使用 PyTorch 二阶 FM + LBFGS，并保留 rank 6、最多 2000 次训练步、target z-score、Optuna 和 FM-to-QUBO 流程。
 
 ## 环境与测试
 
@@ -102,15 +152,6 @@ Figure 4 和 Figure 5 共用 FM 数据拆分与训练规则：不少于 5 条数
 `compute_delta_t` 当前按论文 Eq. 15 的舍入系数实现分段线性拟合，并只把精确共晶点 `fSi = 0.128` 设为 `delta_T = 0`。由于两侧舍入后的直线没有严格通过该零点，极窄邻域内可能得到非物理负值；canonical `quick` 的离散网格不会落入该区间，但连续输入或自定义 levels 仍可能触发。后续修正应保留论文系数并将计算结果截断到非负范围，同时增加共晶点两侧的定向测试。
 
 ## 第一部分：Figure 4 复现
-
-### Figure 4 当前状态
-
-- 已完成 `wo_cgfm`（直接四相编码）和 `w_cgfm`（CGFM 角度编码）两条流程。
-- 已完成 `kappa`、`E`、`rho`、`delta_alpha`、`delta_T` 五个 objective；优化方向由 `ObjectiveSpec` 统一定义。
-- 已完成 PyTorch FM、FM-to-QUBO、SA 全 reads 可行解筛选、重复候选替换、best-so-far 更新及多 seed 聚合。
-- 已完成 per-trajectory checkpoint、两层恢复一致性校验、`--resume`、manifest、runner/plot 日志、checkpoint schema v6、summary schema v5 和多 summary 合并绘图；旧 schema 或错误 seed scheme 不自动迁移。
-- `figure4_runner.py` 默认使用 `quick`，`test` 用于烟测，`paper` 只作参数参考。
-- 单元测试和烟测流程已通过；现有 `figure4_quick_gamma2/figure4_summary.json` 已按 one-hot penalty `gamma=2.0` 的 canonical `quick` 契约验收通过，报告与图片同目录保存。
 
 ### Figure 4 代码结构
 
@@ -204,7 +245,7 @@ Figure4ExperimentConfig
 | preset | initial samples | iterations | levels | Optuna trials | SA reads | SA sweeps | default seeds | 用途 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | `test` | 10 | 2 | 8 | 0 | 32 | 12 | 1 | 烟测 |
-| `quick` | 100 | 100 | 10 | 3 | 100 | 500 | 3 | 小规模项目验收；不承担论文 50-level SA 难度 |
+| `quick` | 50 | 100 | 25 | 3 | 250 | 1000 | 3 | 小规模项目验收 |
 | `paper` | 100 | 600 | 50 | 20 | 1000 | 3000 | 20 | 参数参考，不验收 |
 
 - 配置先由 `preset_config` 解析，再由 `resolve_experiment_config` 应用 CLI 显式覆盖；未覆盖字段保留 preset 值。
@@ -216,7 +257,7 @@ Figure4ExperimentConfig
 - 请求 `--device cuda` 但 CUDA 不可用时，会在实验开始前失败，不静默回退到 CPU。
 - canonical `quick` 验收要求表中精确配置、3 个默认 seed、全部 setting 和 objective；任何数值或 seed 覆盖都可运行，但不属于 canonical 验收结果。
 - validator 不再维护第二套 objective、setting 或 quick 数值；验收规模由 `preset_config("quick")` 和 `FIGURE4_PRESET_NUM_SEEDS` 派生。
-- 旧 schema 的 50-level `quick` checkpoint 不再读取或迁移；50-level 开发运行仍可通过新输出目录显式传 `--num-levels 50` 重跑。若它在某一确定性 SA 批次失败，保持同一 config 和 seed 恢复不会改变该批次。
+- 旧 schema checkpoint 不读取或迁移；旧 10-level quick 与当前 25-level quick 的 config 身份不同，不能混用输出目录恢复。50-level 开发运行仍可通过新输出目录显式传 `--num-levels 50`；若它在某一确定性 SA 批次失败，保持同一 config 和 seed 恢复不会改变该批次。
 
 ### Figure 4 运行方法
 
@@ -298,15 +339,6 @@ Figure 4 canonical `quick` 严格检查：
 只有 canonical quick 规模不匹配、而其余结构和数值证据有效时，仍会生成开发配置 diagnostics；数据完整性失败时 diagnostics 写入 `skipped_reason`。`w_cgfm` 是否表现出论文报告的优势只写入 `diagnostics.cgfm_paper_direction`，不影响验收结果。
 
 ## 第二部分：Figure 5 复现
-
-### Figure 5 当前状态
-
-- 已完成 `w_ddts` 和 `wo_ddts`（weighted-sum baseline）两条多目标流程。
-- 已完成最大化 `kappa`、最大化 `E`、最小化 `rho` 的统一方向处理、可复现 preference weights、DDTS 人工目标、三 FM QUBO 合并和 Pareto front。
-- 已完成每轮 proposed solution 与实际 added solution 的分别记录；重复 proposed solution 会保留，random replacement 不进入 Pareto front。
-- 已完成 SA 全 reads 可行解筛选、候选 rank 诊断、checkpoint schema v5、summary schema v5、两层恢复一致性校验、`--resume`、manifest 和 runner/plot 日志；旧 schema 或错误 seed scheme 不自动迁移。
-- 已完成单/双 setting 绘图、3D 总览、迭代窗口及多 seed 显式选择；canonical `quick` 要求两个 setting 完整对比。
-- 单元测试和烟测流程已通过；现有 `figure5_quick_gamma2/figure5_summary.json` 已按 one-hot penalty `gamma=2.0` 的 canonical `quick` 契约验收通过，报告与图片同目录保存。
 
 ### Figure 5 代码结构
 
